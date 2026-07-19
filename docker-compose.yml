@@ -1,0 +1,122 @@
+networks:
+  sentinelai:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  # redpanda-data:
+  # qdrant-data:
+
+services:
+  # Primary relational store: cases, users, evidence metadata, chain-of-custody records.
+  # Each module in apps/server/modules/* owns its own schema/table namespace within
+  # this one database — see apps/server/README.md "Module boundary rules".
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinelai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sentinelai
+      POSTGRES_PASSWORD: sentinelai
+      POSTGRES_DB: sentinelai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - sentinelai
+
+  # Cache, session store, and queue backend for background jobs.
+  redis:
+    image: redis:7-alpine
+    container_name: sentinelai-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - sentinelai
+
+  # S3-compatible object storage for evidence artifacts (forensic images, documents,
+  # media captured from OSINT/social sources) requiring durable, addressable storage.
+  minio:
+    image: minio/minio:latest
+    container_name: sentinelai-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: sentinelai
+      MINIO_ROOT_PASSWORD: sentinelai123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - sentinelai
+
+  # --------------------------------------------------------------------------
+  # Deferred for Phase 1: the modular monolith (apps/server) uses an in-process
+  # event bus (see apps/server/platform/README.md), so a real broker isn't
+  # needed yet. Uncomment when a module is extracted into its own service per
+  # apps/server/README.md's extraction path (or when async ingestion volume
+  # genuinely needs a durable queue before then).
+  #
+  # redpanda:
+  #   image: redpandadata/redpanda:v24.1.9
+  #   container_name: sentinelai-redpanda
+  #   restart: unless-stopped
+  #   command:
+  #     - redpanda
+  #     - start
+  #     - --smp=1
+  #     - --memory=512M
+  #     - --overprovisioned
+  #     - --node-id=0
+  #     - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+  #     - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+  #   ports:
+  #     - "9092:9092"
+  #   volumes:
+  #     - redpanda-data:/var/lib/redpanda/data
+  #   networks:
+  #     - sentinelai
+  # --------------------------------------------------------------------------
+
+  # --------------------------------------------------------------------------
+  # Deferred until modules/investigation does AI/RAG work (Phase 3) — no
+  # semantic search need before then.
+  #
+  # qdrant:
+  #   image: qdrant/qdrant:latest
+  #   container_name: sentinelai-qdrant
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6333:6333"
+  #   volumes:
+  #     - qdrant-data:/qdrant/storage
+  #   networks:
+  #     - sentinelai
+  # --------------------------------------------------------------------------
+
+  # --------------------------------------------------------------------------
+  # apps/server is one codebase/one image with two entrypoints (see
+  # apps/server/README.md) — not yet defined here, added once it has a
+  # Dockerfile:
+  #
+  # server-http:
+  #   build: ./apps/server
+  #   command: ["http"]
+  #   depends_on: [postgres, redis, minio]
+  #   ports: ["8080:8080"]
+  #   networks: [sentinelai]
+  #
+  # server-worker:
+  #   build: ./apps/server
+  #   command: ["worker"]
+  #   depends_on: [postgres, redis, minio]
+  #   networks: [sentinelai]
+  # --------------------------------------------------------------------------

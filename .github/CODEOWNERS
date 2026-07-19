@@ -1,0 +1,45 @@
+# CODEOWNERS
+#
+# This is currently a team of one developer, so nothing here is enforced yet —
+# GitHub's "require review from Code Owners" branch protection needs a second
+# reviewer to mean anything. This file is kept up to date anyway so that
+# turning it on later is a config flip, not a rewrite. Team handles below are
+# PLACEHOLDERS (@sentinelai/*) — replace with real GitHub teams when the team
+# actually grows. Ownership is grouped into a handful of squads that each own
+# a cluster of related modules, not one team per module — see
+# docs/architecture.md ("Team Ownership") for the rationale.
+
+# Architecturally significant / cross-cutting — changes here affect everyone
+/docs/                                 @sentinelai/architecture-guild
+/CLAUDE.md                             @sentinelai/architecture-guild
+/CONTRIBUTING.md                       @sentinelai/architecture-guild
+/.github/CODEOWNERS                    @sentinelai/architecture-guild
+
+# Product & platform squad — user-facing surface + shared libraries
+/apps/web/                             @sentinelai/product-platform-team
+/apps/server/entrypoints/              @sentinelai/product-platform-team
+/apps/server/modules/notification/     @sentinelai/product-platform-team
+/packages/ui-components/               @sentinelai/product-platform-team
+/packages/sdk/                         @sentinelai/product-platform-team
+/packages/shared-types/                @sentinelai/product-platform-team
+/packages/shared-utils/                @sentinelai/product-platform-team
+
+# Collection squad — everything that pulls data in from the outside world
+/apps/server/modules/ingestion/        @sentinelai/collection-team
+/apps/server/modules/osint/            @sentinelai/collection-team
+/apps/server/modules/threat-intel/     @sentinelai/collection-team
+/apps/server/modules/social-media/     @sentinelai/collection-team
+
+# Casework squad — chain-of-custody and legal/compliance-sensitive surface
+/apps/server/modules/forensics/        @sentinelai/casework-team
+/apps/server/modules/case-management/  @sentinelai/casework-team
+
+# AI investigation squad — cross-domain correlation and the shared evidence contract
+/apps/server/modules/investigation/    @sentinelai/ai-investigation-team
+/packages/evidence-schema/             @sentinelai/ai-investigation-team
+
+# Platform & infrastructure squad
+/apps/server/platform/                 @sentinelai/platform-infra-team
+/infra/                                @sentinelai/platform-infra-team
+/.github/                              @sentinelai/platform-infra-team
+/docker-compose.yml                    @sentinelai/platform-infra-team
