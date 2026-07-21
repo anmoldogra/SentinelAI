@@ -1,5 +1,7 @@
 # Vision
 
+> For detailed requirements (personas, functional/non-functional/security requirements, compliance, MVP scope), see the [PRD](prd.md).
+
 ## Problem
 
 Investigators — in security operations, fraud, compliance, and corporate investigation teams — work across a fragmented toolchain: forensic imaging tools, OSINT scraping scripts, threat intel platforms, social media monitoring dashboards, and a case management system that ties none of it together. Correlating evidence across these sources is manual, slow, and hard to audit. Analysts spend more time collecting and cross-referencing data than actually investigating.

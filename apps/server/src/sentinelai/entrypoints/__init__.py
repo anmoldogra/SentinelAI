@@ -1,0 +1,1 @@
+"""SentinelAI — entrypoints package."""

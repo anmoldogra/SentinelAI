@@ -1,6 +1,6 @@
 # Roadmap
 
-Dates are intentionally omitted — phases are sequenced, not scheduled, until Phase 1 kicks off and real estimates can be made.
+Dates are intentionally omitted — phases are sequenced, not scheduled, until Phase 1 kicks off and real estimates can be made. Phases 1–3 together constitute the MVP as defined in the [PRD](prd.md#11-mvp-scope); Phases 4–5 map to the PRD's [Future Roadmap](prd.md#12-future-roadmap).
 
 ## Phase 0 — Scaffold (current)
 

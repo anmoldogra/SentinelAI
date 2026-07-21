@@ -1,0 +1,1 @@
+"""SentinelAI — platform/auth package."""

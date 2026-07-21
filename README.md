@@ -26,7 +26,18 @@ This is a monorepo. Each top-level folder — and every app/module/package withi
 ## Documentation
 
 - [Vision](docs/vision.md) — what SentinelAI is and why it exists
-- [Architecture](docs/architecture.md) — system design, principles, team ownership, and tech stack
+- [Product Requirements Document](docs/prd.md) — the canonical requirements: personas, functional/non-functional/security requirements, compliance, MVP scope, success metrics
+- [Architecture](docs/architecture.md) — architectural style, principles, team ownership, and tech stack
+- [System Design](docs/system-design.md) — the technical deep-dive: data flow, event contracts, scalability, fault tolerance, observability, deployment topology, and diagrams
+- [Canonical Evidence Model](docs/canonical-evidence-model.md) — the single data shape every evidence source normalizes into: core object, chain of custody, categories, entities/relationships, validation rules
+- [Database Design](docs/database-design.md) — the PostgreSQL data model: schema ownership, tables, keys, indexing, partitioning, versioning, audit, migration, and backup strategy
+- [API Design](docs/api-design.md) — the complete REST API contract: every endpoint per module, conventions (pagination, errors, idempotency, versioning), and the Evidence/Investigation/Report/Notification/Auth API deep-dives
+- [Event-Driven Architecture](docs/event-driven-architecture.md) — the complete asynchronous messaging spec: the Outbox/Inbox patterns, the event envelope, correlation/causation/trace IDs, retry/DLQ/replay strategy, and the full per-module event catalog
+- [Security Architecture](docs/security-architecture.md) — the authoritative security reference: threat model, zero trust, auth/authz, encryption/key management, evidence integrity, application security, air-gapped deployment, supply chain, and incident response
+- [Frontend Architecture](docs/frontend-architecture.md) — the authoritative `apps/web` reference: feature-based structure, routing, state/React Query, forms, the Investigation/Evidence Explorer/Entity Graph UIs, accessibility, and performance
+- [Backend Implementation Guide](docs/backend-implementation-guide.md) — **the implementation authority for `apps/server`**: Python/FastAPI/SQLAlchemy/Alembic/Pydantic v2 coding standards, the Unit of Work and Outbox/Inbox patterns in code, testing strategy, AI coding rules, and 76 named anti-patterns. Architecture explains WHAT; this explains HOW — no implementation may violate it.
+- [Deployment Architecture](docs/deployment-architecture.md) — **the authoritative deployment reference**: Kubernetes/container/networking/storage architecture with real manifests, database HA and migration ordering, secrets/config management, HA and disaster recovery, scaling, monitoring (Prometheus/Grafana/Loki/Tempo), air-gapped deployment, the four deployment profiles (state/local, central agency, single-tenant, future SaaS), and hardware sizing tiers
+- [Engineering Roadmap](docs/engineering-roadmap.md) — **the master execution plan**: converts the entire architecture series into a scheduled, task-by-task build plan — team structure, phase-by-phase workstreams, every API endpoint/module/event/migration/page/component broken into tasks with priority/complexity/dependencies/owner/acceptance criteria, critical path, milestones, and the technical debt/risk/open-ADR registers. Architecture explains WHAT; this explains WHEN and BY WHOM.
 - [Roadmap](docs/roadmap.md) — phased delivery plan
 - [CLAUDE.md](CLAUDE.md) — guidance for AI coding agents working in this repo
 - [CONTRIBUTING.md](CONTRIBUTING.md) — branching, commit, and review process

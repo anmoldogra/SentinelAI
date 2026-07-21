@@ -1,0 +1,1 @@
+"""SentinelAI — tests/contract package."""

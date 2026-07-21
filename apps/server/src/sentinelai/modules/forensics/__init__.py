@@ -1,0 +1,1 @@
+"""SentinelAI — modules/forensics package."""

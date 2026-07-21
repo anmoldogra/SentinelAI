@@ -14,7 +14,7 @@ services:
   # Each module in apps/server/modules/* owns its own schema/table namespace within
   # this one database — see apps/server/README.md "Module boundary rules".
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16
     container_name: sentinelai-postgres
     restart: unless-stopped
     environment:
@@ -30,7 +30,7 @@ services:
 
   # Cache, session store, and queue backend for background jobs.
   redis:
-    image: redis:7-alpine
+    image: redis:7
     container_name: sentinelai-redis
     restart: unless-stopped
     ports:

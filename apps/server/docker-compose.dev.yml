@@ -1,0 +1,68 @@
+# Local dev stack for the SentinelAI backend only (postgres + redis + the two
+# entrypoints built from one image). The repo-root docker-compose.yml provisions
+# the broader infra baseline (object storage, event stream, vector store); this
+# file is the fast inner-loop for apps/server.
+
+name: sentinelai-server-dev
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: sentinelai
+      POSTGRES_PASSWORD: sentinelai
+      POSTGRES_DB: sentinelai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinelai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-bookworm
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "sentinelai.entrypoints.http.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: .env.example
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinelai:sentinelai@postgres:5432/sentinelai
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["arq", "sentinelai.entrypoints.worker.main.WorkerSettings"]
+    env_file: .env.example
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinelai:sentinelai@postgres:5432/sentinelai
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:

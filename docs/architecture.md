@@ -1,6 +1,6 @@
 # Architecture
 
-> This document describes the intended system architecture for SentinelAI. The repository is currently in its scaffold phase — the structure below is the target shape, not yet-implemented fact. Update this document as real architectural decisions are made (and record significant ones in `docs/adr/`).
+> This document describes the intended system architecture for SentinelAI. The repository is currently in its scaffold phase — the structure below is the target shape, not yet-implemented fact. Update this document as real architectural decisions are made (and record significant ones in `docs/adr/`). For the detailed technical design (data flow, event contracts, scalability, fault tolerance, observability, deployment, diagrams), see [System Design](system-design.md).
 
 ## Architectural Style
 

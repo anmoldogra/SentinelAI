@@ -48,6 +48,25 @@ Every module in `modules/` can become an independent service this way:
 
 Module-specific extraction notes are in each module's own `README.md`.
 
+## Database migrations
+
+Each module owns its **own Alembic environment** (`<module>/migrations/env.py`) and
+history, scoped to its own Postgres schema with its own `alembic_version` table
+*inside that schema* — never a shared migration history (`database-design.md` §11).
+The `platform` schema has its own environment under `platform/migrations/`.
+
+- Config: the single [`alembic.ini`](alembic.ini) has one named section per schema
+  (`-n <schema>`); each `env.py` reads the DB URL from `platform/config.py` settings
+  and pins its `version_table_schema`.
+- Run all schemas in dependency order (`platform → ingestion → domain → investigation
+  → notification`, `database-design.md` §5) with [`scripts/migrate.sh`](scripts/migrate.sh)
+  (also `make migrate`). Each env creates its schema before the version table.
+- The `outbox_events` / `inbox_events` tables (per `event-driven-architecture.md` §9/§17)
+  are created by each module's initial migration via the shared
+  `platform/migrations/_event_tables.py` helper.
+
 ## Status
 
-Placeholder. No code yet — see `docs/roadmap.md`.
+Backend skeleton + database layer implemented (models, per-schema migrations, platform
+infrastructure, module scaffolding); business logic is still stubbed. See
+`docs/roadmap.md` for phase status.
