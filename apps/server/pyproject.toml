@@ -25,12 +25,16 @@ dependencies = [
     "arq>=0.26",
     "redis>=5.0",
     "argon2-cffi>=23.1",
+    "cryptography>=43",
     "pyjwt[crypto]>=2.8",
     "prometheus-client>=0.20",
     "prometheus-fastapi-instrumentator>=7.0",
     "httpx>=0.27",
     "python-multipart>=0.0.9",
     "orjson>=3.10",
+    # S3-compatible object storage client (MinIO/S3) — the client named by
+    # backend-implementation-guide.md Part 9's ObjectStorage sketch (ADR-0008).
+    "aioboto3>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +67,26 @@ select = ["E", "F", "I", "UP", "B", "C4", "SIM", "TID", "RUF"]
 [tool.ruff.lint.isort]
 known-first-party = ["sentinelai"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection callables are immutable sentinels intended to be used as
+# argument defaults (guide Part 2). Without this, B008 fires on every `= Depends(...)` /
+# `= Query(...)` — the standard FastAPI ruff configuration, not a rule relaxation.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Body",
+    "fastapi.Form",
+    "fastapi.File",
+    "fastapi.Security",
+    # Project dependency-marker factories (return a Depends-compatible callable — the same
+    # deferred-evaluation contract as FastAPI's own, so safe as an argument default).
+    "sentinelai.platform.auth.dependencies.require_role",
+    "sentinelai.platform.auth.dependencies.require_case_access",
+]
+
 # ---------------------------------------------------------------------------
 # mypy — strict typing (docs/backend-implementation-guide.md Part 1)
 # ---------------------------------------------------------------------------
@@ -76,6 +100,12 @@ explicit_package_bases = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 disallow_untyped_defs = true
+
+# The aioboto3/botocore S3 client (guide Part 9) ships no type information; treat it as untyped
+# so the storage adapter can use it under strict mypy without per-call ignores.
+[[tool.mypy.overrides]]
+module = ["aioboto3.*", "aiobotocore.*", "botocore.*", "boto3.*"]
+ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
 # pytest
@@ -98,7 +128,7 @@ addopts = "-ra --strict-markers"
 root_package = "sentinelai"
 
 [[tool.importlinter.contracts]]
-name = "Module dependency DAG (database-design.md §5)"
+name = "Module dependency DAG (database-design.md section 5)"
 type = "layers"
 layers = [
     "sentinelai.entrypoints",

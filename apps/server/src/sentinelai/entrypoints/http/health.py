@@ -14,10 +14,11 @@ from __future__ import annotations
 from typing import Any
 
 import redis.asyncio as redis_asyncio
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Request, Response
 from sqlalchemy import text
 
 from sentinelai.platform.config import settings
+from sentinelai.platform.crypto import HealthState
 from sentinelai.platform.db.session import engine
 from sentinelai.platform.logging import log
 
@@ -41,7 +42,7 @@ async def _check_postgres() -> str:
 
 
 async def _check_redis() -> str:
-    client = redis_asyncio.from_url(settings.redis_url)
+    client = redis_asyncio.Redis.from_url(settings.redis_url)
     try:
         await client.ping()
         return "ok"
@@ -52,12 +53,25 @@ async def _check_redis() -> str:
         await client.aclose()
 
 
+async def _check_kms(request: Request) -> str:
+    kms = getattr(request.app.state, "kms", None)
+    if kms is None:
+        return "uninitialized"
+    try:
+        status = await kms.health()
+    except Exception:  # readiness reports, never raises
+        log.warning("readyz_kms_health_failed")
+        return "unavailable"
+    return "ok" if status.state == HealthState.READY else status.state.value
+
+
 @router.get("/readyz")
-async def readyz(response: Response) -> dict[str, Any]:
+async def readyz(request: Request, response: Response) -> dict[str, Any]:
     """Readiness probe — 200 only if every checked dependency is reachable, else 503."""
     checks = {
         "postgres": await _check_postgres(),
         "redis": await _check_redis(),
+        "kms": await _check_kms(request),
     }
     if all(state == "ok" for state in checks.values()):
         return {"status": "ok", "checks": checks}

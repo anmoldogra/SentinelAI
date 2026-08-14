@@ -37,7 +37,9 @@ def register_middleware(app: FastAPI) -> None:
             try:
                 response = await call_next(request)
             except Exception:
-                log.exception("request_unhandled_exception", method=request.method, path=request.url.path)
+                log.exception(
+                    "request_unhandled_exception", method=request.method, path=request.url.path
+                )
                 raise
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
             log.info(

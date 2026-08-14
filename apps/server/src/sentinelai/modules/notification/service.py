@@ -26,13 +26,17 @@ class NotificationService:
     def __init__(self, uow: NotificationUnitOfWork) -> None:
         self._uow = uow
 
-    async def list_notifications(self, actor: CurrentUser, page: PageParams) -> Sequence[Notification]:
+    async def list_notifications(
+        self, actor: CurrentUser, page: PageParams
+    ) -> Sequence[Notification]:
         raise NotImplementedError
 
     async def mark_read(self, notification_id: UUID, actor: CurrentUser) -> Notification:
         raise NotImplementedError
 
-    async def redeliver(self, notification_id: UUID, actor: CurrentUser, correlation_id: str) -> None:
+    async def redeliver(
+        self, notification_id: UUID, actor: CurrentUser, correlation_id: str
+    ) -> None:
         raise NotImplementedError
 
     async def list_rules(self, actor: CurrentUser) -> Sequence[NotificationRule]:

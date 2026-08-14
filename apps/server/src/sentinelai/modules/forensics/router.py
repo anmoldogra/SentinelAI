@@ -34,7 +34,9 @@ async def list_artifacts(
     )
 
 
-@router.post("/artifacts", response_model=Envelope[ArtifactRead], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/artifacts", response_model=Envelope[ArtifactRead], status_code=status.HTTP_201_CREATED
+)
 async def register_artifact(
     payload: ArtifactCreate,
     request: Request,
@@ -63,5 +65,7 @@ async def publish_artifact(
     current_user: CurrentUser = Depends(require_role("investigator", "system")),
     service: ForensicsService = Depends(get_forensics_service),
 ) -> Envelope[ArtifactRead]:
-    artifact = await service.publish_artifact(artifact_id, current_user, request.state.correlation_id)
+    artifact = await service.publish_artifact(
+        artifact_id, current_user, request.state.correlation_id
+    )
     return Envelope(data=ArtifactRead.model_validate(artifact), meta=_meta(request))

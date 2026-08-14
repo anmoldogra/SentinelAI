@@ -5,4 +5,4 @@ from __future__ import annotations
 from sentinelai.modules.notification.schemas import NotificationRead
 from sentinelai.modules.notification.service import NotificationService
 
-__all__ = ["NotificationService", "NotificationRead"]
+__all__ = ["NotificationRead", "NotificationService"]

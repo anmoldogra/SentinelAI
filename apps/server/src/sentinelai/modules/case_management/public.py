@@ -11,4 +11,4 @@ from __future__ import annotations
 from sentinelai.modules.case_management.schemas import CaseRead, CaseReportRead
 from sentinelai.modules.case_management.service import CaseService
 
-__all__ = ["CaseService", "CaseRead", "CaseReportRead"]
+__all__ = ["CaseRead", "CaseReportRead", "CaseService"]

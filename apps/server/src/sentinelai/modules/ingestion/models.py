@@ -114,7 +114,9 @@ class ConnectorRegistry(Base):
     __tablename__ = "connector_registry"
     __table_args__ = ({"schema": _SCHEMA},)
 
-    connector_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    connector_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     owning_module: Mapped[str] = mapped_column(Text, nullable=False)
     mapping_profile_version: Mapped[str] = mapped_column(Text, nullable=False)

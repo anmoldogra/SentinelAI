@@ -59,7 +59,9 @@ async def on_evidence_linked_to_case(event: EventEnvelope, uow: InvestigationUni
     await _claim_and_ack(event, uow, _H_ELIGIBLE)
 
 
-async def on_evidence_unlinked_from_case(event: EventEnvelope, uow: InvestigationUnitOfWork) -> None:
+async def on_evidence_unlinked_from_case(
+    event: EventEnvelope, uow: InvestigationUnitOfWork
+) -> None:
     """Mark evidence ineligible (deferred no-op; dedup real)."""
     await _claim_and_ack(event, uow, _H_INELIGIBLE)
 
@@ -71,18 +73,26 @@ async def on_ioc_matched(event: EventEnvelope, uow: InvestigationUnitOfWork) -> 
 
 def register_consumers(dispatcher: EventDispatcher) -> None:
     dispatcher.register(
-        EVENT_EVIDENCE_INGESTED, on_evidence_ingested,
-        inbox_schema=SCHEMA, uow_factory=InvestigationUnitOfWork,
+        EVENT_EVIDENCE_INGESTED,
+        on_evidence_ingested,
+        inbox_schema=SCHEMA,
+        uow_factory=InvestigationUnitOfWork,
     )
     dispatcher.register(
-        EVENT_EVIDENCE_LINKED_TO_CASE, on_evidence_linked_to_case,
-        inbox_schema=SCHEMA, uow_factory=InvestigationUnitOfWork,
+        EVENT_EVIDENCE_LINKED_TO_CASE,
+        on_evidence_linked_to_case,
+        inbox_schema=SCHEMA,
+        uow_factory=InvestigationUnitOfWork,
     )
     dispatcher.register(
-        EVENT_EVIDENCE_UNLINKED_FROM_CASE, on_evidence_unlinked_from_case,
-        inbox_schema=SCHEMA, uow_factory=InvestigationUnitOfWork,
+        EVENT_EVIDENCE_UNLINKED_FROM_CASE,
+        on_evidence_unlinked_from_case,
+        inbox_schema=SCHEMA,
+        uow_factory=InvestigationUnitOfWork,
     )
     dispatcher.register(
-        EVENT_IOC_MATCHED, on_ioc_matched,
-        inbox_schema=SCHEMA, uow_factory=InvestigationUnitOfWork,
+        EVENT_IOC_MATCHED,
+        on_ioc_matched,
+        inbox_schema=SCHEMA,
+        uow_factory=InvestigationUnitOfWork,
     )

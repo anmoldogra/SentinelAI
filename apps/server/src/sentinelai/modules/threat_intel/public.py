@@ -5,4 +5,4 @@ from __future__ import annotations
 from sentinelai.modules.threat_intel.schemas import IocRead
 from sentinelai.modules.threat_intel.service import ThreatIntelService
 
-__all__ = ["ThreatIntelService", "IocRead"]
+__all__ = ["IocRead", "ThreatIntelService"]

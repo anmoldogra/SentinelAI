@@ -35,7 +35,9 @@ async def test_create_case_opens_publishes_and_commits(uow, actor) -> None:
 async def test_change_status_open_to_closed(uow, actor) -> None:
     svc = CaseService(uow)
     case = await svc.create_case(CaseCreate(title="X"), actor, "c")
-    updated = await svc.change_status(case.case_id, CaseStatusUpdate(new_status="closed"), actor, "c")
+    updated = await svc.change_status(
+        case.case_id, CaseStatusUpdate(new_status="closed"), actor, "c"
+    )
     assert updated.status == "closed"
     assert updated.closed_at is not None
     assert any(e["event_type"] == "case.status_changed" for e in uow.outbox.published)
@@ -65,7 +67,9 @@ async def test_link_evidence_dedup(uow, actor) -> None:
     evidence_id = uuid4()
     await svc.link_evidence(case.case_id, EvidenceLinkCreate(evidence_id=evidence_id), actor, "c")
     with pytest.raises(EvidenceAlreadyLinkedError):
-        await svc.link_evidence(case.case_id, EvidenceLinkCreate(evidence_id=evidence_id), actor, "c")
+        await svc.link_evidence(
+            case.case_id, EvidenceLinkCreate(evidence_id=evidence_id), actor, "c"
+        )
     assert any(e["event_type"] == "evidence.linked_to_case" for e in uow.outbox.published)
 
 

@@ -52,5 +52,7 @@ class SocialMediaUnitOfWork(UnitOfWork):
         self.outbox = OutboxWriter(session, schema=_SCHEMA)
 
 
-async def get_social_media_uow(session: AsyncSession = Depends(get_session)) -> SocialMediaUnitOfWork:
+async def get_social_media_uow(
+    session: AsyncSession = Depends(get_session),
+) -> SocialMediaUnitOfWork:
     return SocialMediaUnitOfWork(session)

@@ -1,7 +1,7 @@
 """Cursor pagination primitives — guide Part 19, api-design.md §2.5.
 
 Opaque, base64-encoded cursors carrying the sort value + tie-break id, aligned
-with database-design.md §6–7's BRIN-indexed, append-ordered tables (never offset
+with database-design.md §6-7's BRIN-indexed, append-ordered tables (never offset
 pagination on a large append-heavy resource — guide anti-pattern #48). Implemented
 once here and reused by every list endpoint.
 """

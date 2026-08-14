@@ -50,10 +50,15 @@ def upgrade() -> None:
         schema=_SCHEMA,
     )
     op.create_index("ix_osint_findings_source_id", "osint_findings", ["source_id"], schema=_SCHEMA)
-    op.create_index("ix_osint_findings_evidence_id", "osint_findings", ["evidence_id"], schema=_SCHEMA)
     op.create_index(
-        "brin_osint_findings_collected_at", "osint_findings", ["collected_at"],
-        schema=_SCHEMA, postgresql_using="brin",
+        "ix_osint_findings_evidence_id", "osint_findings", ["evidence_id"], schema=_SCHEMA
+    )
+    op.create_index(
+        "brin_osint_findings_collected_at",
+        "osint_findings",
+        ["collected_at"],
+        schema=_SCHEMA,
+        postgresql_using="brin",
     )
     op.create_table(
         "osint_connector_state",

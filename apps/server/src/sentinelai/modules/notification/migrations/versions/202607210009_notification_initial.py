@@ -64,13 +64,14 @@ def upgrade() -> None:
         sa.Column("delivery_status", sa.String(30), nullable=False),
         sa.Column("attempted_at", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("delivered_at", sa.TIMESTAMP(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(
-            ["notification_id"], [f"{_SCHEMA}.notifications.notification_id"]
-        ),
+        sa.ForeignKeyConstraint(["notification_id"], [f"{_SCHEMA}.notifications.notification_id"]),
         schema=_SCHEMA,
     )
     op.create_index(
-        "ix_deliveries_notification_id", "notification_deliveries", ["notification_id"], schema=_SCHEMA
+        "ix_deliveries_notification_id",
+        "notification_deliveries",
+        ["notification_id"],
+        schema=_SCHEMA,
     )
     create_outbox_events(_SCHEMA)
     create_inbox_events(_SCHEMA)
@@ -79,7 +80,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     drop_inbox_events(_SCHEMA)
     drop_outbox_events(_SCHEMA)
-    op.drop_index("ix_deliveries_notification_id", table_name="notification_deliveries", schema=_SCHEMA)
+    op.drop_index(
+        "ix_deliveries_notification_id", table_name="notification_deliveries", schema=_SCHEMA
+    )
     op.drop_table("notification_deliveries", schema=_SCHEMA)
     op.drop_index("ix_notifications_recipient", table_name="notifications", schema=_SCHEMA)
     op.drop_table("notifications", schema=_SCHEMA)

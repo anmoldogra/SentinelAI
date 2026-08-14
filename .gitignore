@@ -10,6 +10,11 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# KMS dev provider keystore — local software private keys, NEVER commit (ADR-0009)
+.kms-dev-keystore/
+**/.kms-dev-keystore/
+*.kms-keystore
 *.pem
 *.key
 !**/keys/*.example

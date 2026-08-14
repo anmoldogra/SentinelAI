@@ -384,6 +384,16 @@ The `postgres-ro` service is the distinctly-named read pool `database-design.md`
 
 ## Migration Ordering & Alembic Execution
 
+### PostgreSQL role provisioning (ADR-0004 Part 1) — a prerequisite, run before any migration
+
+The three database roles from ADR-0004 (`sentinel_migrator`, `sentinel_app`, `sentinel_append`) are **cluster-administration state, provisioned outside Alembic** by the idempotent script [`infra/postgres/bootstrap/001_roles.sql`](../infra/postgres/bootstrap/001_roles.sql).
+
+- **When it runs:** once per cluster, at database creation — **before** the PreSync migration Job below (the Part 2 privilege migrations `GRANT`/`REVOKE` to these roles, so the roles must already exist). It is idempotent, so re-running it on every reconcile is safe.
+- **Who runs it:** a privileged operator/DBA or the managed-Postgres provisioning step — CloudNativePG's `bootstrap`/`postInitSQL` (or a one-shot privileged `Job`) in production; the Postgres container's `docker-entrypoint-initdb.d` on first init for local dev. **Never** the application, **never** Alembic, **never** application startup.
+- **Why it is outside Alembic:** `CREATE ROLE` is a **cluster-global** operation requiring a privileged role, whereas `sentinel_migrator` — the role that runs migrations — is deliberately **`NOCREATEROLE`** (least privilege). A non-privileged migrator cannot create roles, and granting it that power would defeat ADR-0004's containment; role administration stays with the cluster operator.
+- **How it fits ADR-0004:** Part 1 (this script) creates the roles + membership + least-privilege attributes (no SUPERUSER / CREATEDB / CREATEROLE / REPLICATION / BYPASSRLS). Part 2 (Alembic migrations, run by `sentinel_migrator`) applies the table-level `GRANT INSERT, SELECT` / `REVOKE UPDATE, DELETE, TRUNCATE` on the evidentiary tables. Part 3 (append-only triggers) is the backstop.
+- **Credentials:** the three roles are **`NOLOGIN` privilege sets, not login identities** — the script sets no passwords and creates no users (no secrets in the repo). Vault's database secrets engine (Part 11) issues short-lived dynamic **login users** that are *members* of these roles; a `sentinel_app` member identity inherits `sentinel_append`'s evidentiary `INSERT`/`SELECT` via membership — no runtime `SET ROLE` switching. Full details in [`infra/postgres/README.md`](../infra/postgres/README.md).
+
 A `Job`, run once per deployment as a pre-sync hook (ArgoCD `PreSync`, Part 18), applies every module's Alembic migrations in `database-design.md` §5's DAG order:
 
 ```yaml

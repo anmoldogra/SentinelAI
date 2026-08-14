@@ -1,4 +1,4 @@
-"""In-process event dispatcher — event-driven-architecture.md §2, §14–15.
+"""In-process event dispatcher — event-driven-architecture.md §2, §14-15.
 
 Phase 1 transport: a single in-process poller that relays each module's
 ``outbox_events`` rows to registered handlers. Phase 3+ replaces this relay half
@@ -25,6 +25,7 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import cast
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -88,21 +89,29 @@ class EventDispatcher:
         self._shutdown = asyncio.Event()
 
     # -- registration -------------------------------------------------------
-    def register(
+    def register[U: UnitOfWork](
         self,
         event_type: str,
-        handler: EventHandler,
+        handler: Callable[[EventEnvelope, U], Awaitable[None]],
         *,
         inbox_schema: str,
-        uow_factory: UowFactory = UnitOfWork,
+        uow_factory: Callable[[AsyncSession], U] | None = None,
         policy: RetryPolicy | None = None,
     ) -> None:
-        """Subscribe a handler to an event type. Called from the composition root."""
+        """Subscribe a handler to an event type. Called from the composition root.
+
+        Generic over the module's concrete ``UnitOfWork`` subtype: the handler and the
+        ``uow_factory`` that produces its argument are bound to the same ``U`` so a module can
+        register a handler typed on its own UoW. Registrations are stored under the base types
+        (they are invoked uniformly by the poll loop), hence the internal casts.
+        """
         self._handlers[event_type].append(
             _Registration(
-                handler=handler,
+                handler=cast(EventHandler, handler),
                 inbox_schema=inbox_schema,
-                uow_factory=uow_factory,
+                uow_factory=cast(UowFactory, uow_factory)
+                if uow_factory is not None
+                else UnitOfWork,
                 policy=policy or RetryPolicy(),
             )
         )
@@ -172,7 +181,9 @@ class EventDispatcher:
         max_attempts = max((r.policy.max_attempts for r in registrations), default=1)
         if next_attempt >= max_attempts:
             await self._mark(schema, event, status="dead_letter", attempt_count=next_attempt)
-            log.error("event_dead_lettered", event_id=str(event.event_id), event_type=event.event_type)
+            log.error(
+                "event_dead_lettered", event_id=str(event.event_id), event_type=event.event_type
+            )
         else:
             await self._mark(schema, event, status="pending", attempt_count=next_attempt)
 

@@ -16,12 +16,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import Depends
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.modules.investigation.events import (
     EVENT_CORRELATION_GENERATED,
@@ -49,7 +48,6 @@ from sentinelai.modules.investigation.repository import (
 from sentinelai.modules.investigation.schemas import EntityCreate
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CurrentUser
-from sentinelai.platform.db.session import get_session
 from sentinelai.platform.tasks import TaskQueue
 from sentinelai.shared.exceptions import PreconditionFailedError, ValidationFailedError
 from sentinelai.shared.pagination import PageParams, decode_cursor, encode_cursor
@@ -212,7 +210,12 @@ class InvestigationService:
         (CEM §13, ≥1) and announce it. Called by the correlation job (deferred)."""
         if not evidence_ids:
             raise ValidationFailedError(
-                [{"field": "evidence_ids", "message": "a relationship requires ≥1 supporting evidence"}]
+                [
+                    {
+                        "field": "evidence_ids",
+                        "message": "a relationship requires ≥1 supporting evidence",
+                    }
+                ]
             )
         relationship = Relationship(
             type=rel_type,
@@ -358,7 +361,12 @@ class InvestigationService:
 def _require_disposition(disposition: str) -> None:
     if disposition not in _REVIEW_DISPOSITIONS:
         raise ValidationFailedError(
-            [{"field": "status", "message": f"disposition must be one of {sorted(_REVIEW_DISPOSITIONS)}"}]
+            [
+                {
+                    "field": "status",
+                    "message": f"disposition must be one of {sorted(_REVIEW_DISPOSITIONS)}",
+                }
+            ]
         )
 
 
@@ -369,10 +377,12 @@ def _decode_id_cursor(cursor: str | None) -> UUID | None:
     return id_value
 
 
-def _paginate(rows, limit, id_getter):  # type: ignore[no-untyped-def]
+def _paginate[T](
+    rows: Sequence[T], limit: int, id_getter: Callable[[T], UUID]
+) -> tuple[list[T], str | None, bool]:
     has_more = len(rows) > limit
     items = list(rows[:limit])
-    next_cursor = None
+    next_cursor: str | None = None
     if has_more and items:
         last_id = id_getter(items[-1])
         next_cursor = encode_cursor(str(last_id), last_id)
@@ -388,6 +398,6 @@ def get_investigation_service(
 __all__ = [
     "InvestigationService",
     "entity_etag",
-    "relationship_etag",
     "get_investigation_service",
+    "relationship_etag",
 ]

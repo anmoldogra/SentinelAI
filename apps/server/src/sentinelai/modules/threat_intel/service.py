@@ -52,11 +52,15 @@ class ThreatIntelService:
     ) -> FeedSubscription:
         raise NotImplementedError
 
-    async def sync_feed(self, subscription_id: UUID, actor: CurrentUser, correlation_id: str) -> None:
+    async def sync_feed(
+        self, subscription_id: UUID, actor: CurrentUser, correlation_id: str
+    ) -> None:
         """Enqueue an on-demand feed sync job (async, §25.4)."""
         raise NotImplementedError
 
-    async def scan_evidence_for_matches(self, evidence_id: UUID, category: str, correlation_id: str) -> None:
+    async def scan_evidence_for_matches(
+        self, evidence_id: UUID, category: str, correlation_id: str
+    ) -> None:
         """Consumer path: scan new evidence against active IOCs; publish a match per hit."""
         raise NotImplementedError
 

@@ -55,7 +55,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["entity_id"], [f"{_SCHEMA}.entities.entity_id"]),
         schema=_SCHEMA,
     )
-    op.create_index("ix_entity_revisions_entity_id", "entity_revisions", ["entity_id"], schema=_SCHEMA)
+    op.create_index(
+        "ix_entity_revisions_entity_id", "entity_revisions", ["entity_id"], schema=_SCHEMA
+    )
     op.create_table(
         "relationships",
         sa.Column("relationship_id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -73,7 +75,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["to_entity_id"], [f"{_SCHEMA}.entities.entity_id"]),
         schema=_SCHEMA,
     )
-    op.create_index("ix_relationships_from_entity", "relationships", ["from_entity_id"], schema=_SCHEMA)
+    op.create_index(
+        "ix_relationships_from_entity", "relationships", ["from_entity_id"], schema=_SCHEMA
+    )
     op.create_index("ix_relationships_to_entity", "relationships", ["to_entity_id"], schema=_SCHEMA)
     op.create_table(
         "relationship_revisions",
@@ -81,9 +85,7 @@ def upgrade() -> None:
         sa.Column("relationship_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("previous_status", sa.String(20), nullable=False),
         sa.Column("new_status", sa.String(20), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["relationship_id"], [f"{_SCHEMA}.relationships.relationship_id"]
-        ),
+        sa.ForeignKeyConstraint(["relationship_id"], [f"{_SCHEMA}.relationships.relationship_id"]),
         schema=_SCHEMA,
     )
     op.create_table(
@@ -91,9 +93,7 @@ def upgrade() -> None:
         sa.Column("relationship_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("evidence_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.PrimaryKeyConstraint("relationship_id", "evidence_id"),
-        sa.ForeignKeyConstraint(
-            ["relationship_id"], [f"{_SCHEMA}.relationships.relationship_id"]
-        ),
+        sa.ForeignKeyConstraint(["relationship_id"], [f"{_SCHEMA}.relationships.relationship_id"]),
         schema=_SCHEMA,
     )
     op.create_index(
@@ -111,7 +111,10 @@ def upgrade() -> None:
         "ix_entity_mentions_entity_id", "entity_evidence_mentions", ["entity_id"], schema=_SCHEMA
     )
     op.create_index(
-        "ix_entity_mentions_evidence_id", "entity_evidence_mentions", ["evidence_id"], schema=_SCHEMA
+        "ix_entity_mentions_evidence_id",
+        "entity_evidence_mentions",
+        ["evidence_id"],
+        schema=_SCHEMA,
     )
     op.create_table(
         "correlation_runs",
@@ -134,8 +137,12 @@ def downgrade() -> None:
     drop_outbox_events(_SCHEMA)
     op.drop_index("ix_correlation_runs_case_id", table_name="correlation_runs", schema=_SCHEMA)
     op.drop_table("correlation_runs", schema=_SCHEMA)
-    op.drop_index("ix_entity_mentions_evidence_id", table_name="entity_evidence_mentions", schema=_SCHEMA)
-    op.drop_index("ix_entity_mentions_entity_id", table_name="entity_evidence_mentions", schema=_SCHEMA)
+    op.drop_index(
+        "ix_entity_mentions_evidence_id", table_name="entity_evidence_mentions", schema=_SCHEMA
+    )
+    op.drop_index(
+        "ix_entity_mentions_entity_id", table_name="entity_evidence_mentions", schema=_SCHEMA
+    )
     op.drop_table("entity_evidence_mentions", schema=_SCHEMA)
     op.drop_index("ix_rel_evidence_evidence_id", table_name="relationship_evidence", schema=_SCHEMA)
     op.drop_table("relationship_evidence", schema=_SCHEMA)

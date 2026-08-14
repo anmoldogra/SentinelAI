@@ -144,6 +144,123 @@ def _no_audit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "sentinelai.modules.investigation.service.record_audit_event", _noop, raising=False
     )
+    monkeypatch.setattr(
+        "sentinelai.modules.ingestion.service.record_audit_event", _noop, raising=False
+    )
+
+
+# --- ingestion fakes --------------------------------------------------------
+class _FakeEvidenceRepo:
+    def __init__(self) -> None:
+        self.store: dict[UUID, Any] = {}
+
+    async def get_by_id(self, evidence_id: UUID) -> Any:
+        return self.store.get(evidence_id)
+
+    async def add(self, evidence: Any) -> None:
+        if getattr(evidence, "evidence_id", None) is None:
+            evidence.evidence_id = uuid4()
+        self.store[evidence.evidence_id] = evidence
+
+    async def exists(self, evidence_id: UUID) -> bool:
+        return evidence_id in self.store
+
+    async def list_(
+        self,
+        *,
+        category,
+        artifact_type,
+        status,
+        text,
+        limit,
+        cursor_ingested_at,
+        cursor_evidence_id,
+    ):  # type: ignore[no-untyped-def]
+        rows = list(self.store.values())
+        if category is not None:
+            rows = [e for e in rows if e.category == category]
+        if status is not None:
+            rows = [e for e in rows if e.status == status]
+        rows.sort(key=lambda e: (e.ingested_at, e.evidence_id), reverse=True)
+        return rows[: limit + 1]
+
+
+class _FakeCustodyRepo:
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+
+    async def add(self, event: Any) -> None:
+        self.items.append(event)
+
+    async def list_for_evidence(self, evidence_id: UUID) -> Sequence[Any]:
+        return sorted(
+            [e for e in self.items if e.evidence_id == evidence_id],
+            key=lambda e: e.sequence_number,
+        )
+
+    async def last_entry(self, evidence_id: UUID) -> Any:
+        evs = [e for e in self.items if e.evidence_id == evidence_id]
+        return max(evs, key=lambda e: e.sequence_number) if evs else None
+
+
+class _FakeIntakeRepo:
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+
+    async def add(self, record: Any) -> None:
+        if getattr(record, "intake_id", None) is None:
+            record.intake_id = uuid4()
+        self.items.append(record)
+
+
+class _FakeConnectorRepo:
+    def __init__(self) -> None:
+        self.store: dict[UUID, Any] = {}
+
+    async def add(self, connector: Any) -> None:
+        if getattr(connector, "connector_id", None) is None:
+            connector.connector_id = uuid4()
+        self.store[connector.connector_id] = connector
+
+    async def get_by_id(self, connector_id: UUID) -> Any:
+        return self.store.get(connector_id)
+
+    async def list_(self) -> Sequence[Any]:
+        return list(self.store.values())
+
+
+class _FakeAttrSchemaRepo:
+    def __init__(self) -> None:
+        self.registered: set[tuple[str, str, str]] = set()
+
+    async def list_(self) -> Sequence[Any]:
+        return []
+
+    async def is_registered(self, schema_version: str, category: str, artifact_type: str) -> bool:
+        return (schema_version, category, artifact_type) in self.registered
+
+
+class FakeIngestionUnitOfWork:
+    def __init__(self) -> None:
+        self.session = SimpleNamespace()
+        self.evidence = _FakeEvidenceRepo()
+        self.custody = _FakeCustodyRepo()
+        self.intake = _FakeIntakeRepo()
+        self.connectors = _FakeConnectorRepo()
+        self.attribute_schemas = _FakeAttrSchemaRepo()
+        self.outbox = _FakeOutbox()
+        self.commits = 0
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def rollback(self) -> None:  # pragma: no cover
+        pass
+
+
+@pytest.fixture
+def ing_uow() -> FakeIngestionUnitOfWork:
+    return FakeIngestionUnitOfWork()
 
 
 # --- investigation fakes ----------------------------------------------------
@@ -160,7 +277,9 @@ class _FakeByIdRepo:
             setattr(obj, self._pk, uuid4())
         self.store[getattr(obj, self._pk)] = obj
 
-    async def list_(self, *, status: str | None, limit: int, cursor_id: UUID | None) -> Sequence[Any]:
+    async def list_(
+        self, *, status: str | None, limit: int, cursor_id: UUID | None
+    ) -> Sequence[Any]:
         rows = list(self.store.values())
         if status is not None:
             rows = [r for r in rows if r.status == status]
@@ -173,7 +292,8 @@ class _FakeByIdRepo:
 class _FakeRelRepo(_FakeByIdRepo):
     async def list_for_entity(self, entity_id: UUID) -> Sequence[Any]:
         return [
-            r for r in self.store.values()
+            r
+            for r in self.store.values()
             if r.from_entity_id == entity_id or r.to_entity_id == entity_id
         ]
 

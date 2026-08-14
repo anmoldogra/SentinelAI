@@ -70,5 +70,7 @@ class NotificationUnitOfWork(UnitOfWork):
         self.outbox = OutboxWriter(session, schema=_SCHEMA)
 
 
-async def get_notification_uow(session: AsyncSession = Depends(get_session)) -> NotificationUnitOfWork:
+async def get_notification_uow(
+    session: AsyncSession = Depends(get_session),
+) -> NotificationUnitOfWork:
     return NotificationUnitOfWork(session)

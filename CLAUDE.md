@@ -30,6 +30,8 @@ SentinelAI is an AI-powered Investigation Intelligence Platform spanning five do
 
 `docs/deployment-architecture.md` is **the authoritative deployment reference** — Kubernetes manifests, container/networking/storage architecture, database HA, secrets management (Vault + External Secrets Operator), HA/DR, scaling, monitoring, and the four deployment profiles (state/local police, central agency, single-tenant enterprise, future SaaS). It commits to specific infrastructure tooling (CloudNativePG, Harbor, cosign, ArgoCD, the Prometheus/Grafana/Loki/Tempo stack) the same way `docs/backend-implementation-guide.md` commits to Python/FastAPI — treat those as decided, not open, when working on `infra/` or CI/CD. See "Mandatory Deployment Rules" below.
 
+`docs/engineering-governance.md` is **the engineering constitution** — the meta-layer *above* every document listed so far. It governs process, not domain design: the gated SDLC, ADR governance, the mandatory Architecture Quality Gates, code/security/forensics/AI/frontend/API/data/CI-CD standards, the review boards, the universal Definition of Done, and the 5-year roadmap. **It must be consulted before implementing any ADR** — a change is not "done" unless it satisfies its Quality Gates (§3) and the Definition of Done (§13). Where a domain doc says *what* to build it wins on that subject; this manual wins on *how work is governed*.
+
 - Do not add application code, dependencies, or framework boilerplate to `apps/` or `packages/` unless the user explicitly asks for it.
 - If a task implies writing code in a module/app that is currently a placeholder, confirm scope with the user first — check `docs/roadmap.md` to see what phase the repo is meant to be in before jumping ahead.
 

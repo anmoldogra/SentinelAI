@@ -4,6 +4,12 @@
 .DEFAULT_GOAL := help
 PY := python
 
+# Force UTF-8 I/O for all tooling. Without this, import-linter's rich spinner (a non-ASCII
+# emoji) crashes under a legacy Windows codepage (cp1252) whenever output is piped or redirected
+# — e.g. CI log capture or pre-commit. No-op on already-UTF-8 platforms (Linux CI).
+export PYTHONUTF8 := 1
+export PYTHONIOENCODING := utf-8
+
 .PHONY: help install lint format typecheck lint-imports test check \
         run-api run-worker migrate compose-up compose-down
 

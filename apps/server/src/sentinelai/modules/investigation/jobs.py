@@ -25,6 +25,5 @@ async def run_correlation(ctx: dict[str, Any], run_id: UUID) -> None:
     trigger) is fully implemented.
     """
     raise NotImplementedError(
-        "correlation is AI/LLM-driven (roadmap Phase 3) — no inference client yet; "
-        "Phase 8 report"
+        "correlation is AI/LLM-driven (roadmap Phase 3) — no inference client yet; Phase 8 report"
     )

@@ -132,7 +132,12 @@ class CaseService:
         )
 
     async def _apply_transition(
-        self, case: Case, new_status: str, notes: str | None, actor: CurrentUser, correlation_id: str
+        self,
+        case: Case,
+        new_status: str,
+        notes: str | None,
+        actor: CurrentUser,
+        correlation_id: str,
     ) -> None:
         if new_status not in VALID_STATUSES:
             raise ValidationFailedError(
@@ -174,7 +179,9 @@ class CaseService:
             actor_ref=actor.user_id,
         )
         await self._audit(
-            actor, EVENT_CASE_STATUS_CHANGED, case.case_id,
+            actor,
+            EVENT_CASE_STATUS_CHANGED,
+            case.case_id,
             {"previous_status": previous, "new_status": new_status},
         )
 
@@ -425,11 +432,11 @@ def provide_case_access_checker(session: AsyncSession = Depends(get_session)) ->
 
 
 __all__ = [
-    "CaseService",
     "CaseSearchFilters",
+    "CaseService",
     "DbCaseAccessChecker",
     "case_etag",
     "get_case_service",
-    "provide_case_access_checker",
     "get_task_queue",
+    "provide_case_access_checker",
 ]

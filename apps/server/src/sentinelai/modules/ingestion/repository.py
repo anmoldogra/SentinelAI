@@ -1,16 +1,18 @@
 """ingestion persistence + Unit of Work (guide Part 3). Persistence only.
 
-The custody ledger is append-only and hash-chained per ``evidence_id`` — the
-repository exposes the primitives (next sequence number, last hash) the service
-needs to extend a chain, but never mutates a prior row.
+The custody ledger is append-only and hash-chained per ``evidence_id`` (CEM §4);
+the repository exposes the primitives the service needs to extend a chain (last
+entry → prev hash + next sequence number) but never mutates a prior row.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import Depends
+from sqlalchemy import or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.modules.ingestion.models import (
@@ -32,16 +34,51 @@ class EvidenceRepository:
         self._session = session
 
     async def get_by_id(self, evidence_id: UUID) -> Evidence | None:
-        raise NotImplementedError
+        result = await self._session.execute(
+            select(Evidence).where(Evidence.evidence_id == evidence_id)
+        )
+        return result.scalar_one_or_none()
 
     async def add(self, evidence: Evidence) -> None:
-        raise NotImplementedError
+        self._session.add(evidence)
+        await self._session.flush()
 
     async def exists(self, evidence_id: UUID) -> bool:
-        raise NotImplementedError
+        result = await self._session.execute(
+            select(Evidence.evidence_id).where(Evidence.evidence_id == evidence_id)
+        )
+        return result.scalar_one_or_none() is not None
 
-    async def list_(self, *, limit: int, cursor: str | None) -> Sequence[Evidence]:
-        raise NotImplementedError
+    async def list_(
+        self,
+        *,
+        category: str | None,
+        artifact_type: str | None,
+        status: str | None,
+        text: str | None,
+        limit: int,
+        cursor_ingested_at: datetime | None,
+        cursor_evidence_id: UUID | None,
+    ) -> Sequence[Evidence]:
+        stmt = select(Evidence)
+        if category is not None:
+            stmt = stmt.where(Evidence.category == category)
+        if artifact_type is not None:
+            stmt = stmt.where(Evidence.artifact_type == artifact_type)
+        if status is not None:
+            stmt = stmt.where(Evidence.status == status)
+        if text:
+            like = f"%{text}%"
+            stmt = stmt.where(or_(Evidence.title.ilike(like), Evidence.description.ilike(like)))
+        if cursor_ingested_at is not None and cursor_evidence_id is not None:
+            stmt = stmt.where(
+                tuple_(Evidence.ingested_at, Evidence.evidence_id)
+                < (cursor_ingested_at, cursor_evidence_id)
+            )
+        stmt = stmt.order_by(Evidence.ingested_at.desc(), Evidence.evidence_id.desc()).limit(
+            limit + 1
+        )
+        return (await self._session.execute(stmt)).scalars().all()
 
 
 class CustodyEventRepository:
@@ -49,13 +86,25 @@ class CustodyEventRepository:
         self._session = session
 
     async def add(self, event: EvidenceCustodyEvent) -> None:
-        raise NotImplementedError
+        self._session.add(event)
+        await self._session.flush()
 
     async def list_for_evidence(self, evidence_id: UUID) -> Sequence[EvidenceCustodyEvent]:
-        raise NotImplementedError
+        result = await self._session.execute(
+            select(EvidenceCustodyEvent)
+            .where(EvidenceCustodyEvent.evidence_id == evidence_id)
+            .order_by(EvidenceCustodyEvent.sequence_number.asc())
+        )
+        return result.scalars().all()
 
     async def last_entry(self, evidence_id: UUID) -> EvidenceCustodyEvent | None:
-        raise NotImplementedError
+        result = await self._session.execute(
+            select(EvidenceCustodyEvent)
+            .where(EvidenceCustodyEvent.evidence_id == evidence_id)
+            .order_by(EvidenceCustodyEvent.sequence_number.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
 
 class IntakeRepository:
@@ -63,7 +112,8 @@ class IntakeRepository:
         self._session = session
 
     async def add(self, record: IntakeRecord) -> None:
-        raise NotImplementedError
+        self._session.add(record)
+        await self._session.flush()
 
 
 class ConnectorRepository:
@@ -71,13 +121,20 @@ class ConnectorRepository:
         self._session = session
 
     async def add(self, connector: ConnectorRegistry) -> None:
-        raise NotImplementedError
+        self._session.add(connector)
+        await self._session.flush()
 
     async def get_by_id(self, connector_id: UUID) -> ConnectorRegistry | None:
-        raise NotImplementedError
+        result = await self._session.execute(
+            select(ConnectorRegistry).where(ConnectorRegistry.connector_id == connector_id)
+        )
+        return result.scalar_one_or_none()
 
     async def list_(self) -> Sequence[ConnectorRegistry]:
-        raise NotImplementedError
+        result = await self._session.execute(
+            select(ConnectorRegistry).order_by(ConnectorRegistry.name)
+        )
+        return result.scalars().all()
 
 
 class AttributeSchemaRepository:
@@ -85,7 +142,18 @@ class AttributeSchemaRepository:
         self._session = session
 
     async def list_(self) -> Sequence[AttributeSchemaRegistry]:
-        raise NotImplementedError
+        result = await self._session.execute(select(AttributeSchemaRegistry))
+        return result.scalars().all()
+
+    async def is_registered(self, schema_version: str, category: str, artifact_type: str) -> bool:
+        result = await self._session.execute(
+            select(AttributeSchemaRegistry.registry_id).where(
+                AttributeSchemaRegistry.schema_version == schema_version,
+                AttributeSchemaRegistry.category == category,
+                AttributeSchemaRegistry.artifact_type == artifact_type,
+            )
+        )
+        return result.scalar_one_or_none() is not None
 
 
 class IngestionUnitOfWork(UnitOfWork):

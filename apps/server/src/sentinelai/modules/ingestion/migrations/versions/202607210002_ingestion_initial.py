@@ -67,14 +67,21 @@ def upgrade() -> None:
         schema=_SCHEMA,
     )
     op.create_index(
-        "brin_evidence_ingested_at", "evidence", ["ingested_at"],
-        schema=_SCHEMA, postgresql_using="brin",
+        "brin_evidence_ingested_at",
+        "evidence",
+        ["ingested_at"],
+        schema=_SCHEMA,
+        postgresql_using="brin",
     )
     op.create_index(
-        "ix_evidence_category_artifact_type", "evidence", ["category", "artifact_type"],
+        "ix_evidence_category_artifact_type",
+        "evidence",
+        ["category", "artifact_type"],
         schema=_SCHEMA,
     )
-    op.create_index("ix_evidence_collector_user_id", "evidence", ["collector_user_id"], schema=_SCHEMA)
+    op.create_index(
+        "ix_evidence_collector_user_id", "evidence", ["collector_user_id"], schema=_SCHEMA
+    )
 
     op.create_table(
         "evidence_custody_events",
@@ -94,8 +101,11 @@ def upgrade() -> None:
         schema=_SCHEMA,
     )
     op.create_index(
-        "brin_custody_occurred_at", "evidence_custody_events", ["occurred_at"],
-        schema=_SCHEMA, postgresql_using="brin",
+        "brin_custody_occurred_at",
+        "evidence_custody_events",
+        ["occurred_at"],
+        schema=_SCHEMA,
+        postgresql_using="brin",
     )
     op.create_index(
         "ix_custody_evidence_id", "evidence_custody_events", ["evidence_id"], schema=_SCHEMA

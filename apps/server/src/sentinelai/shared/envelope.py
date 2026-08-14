@@ -8,11 +8,7 @@ A route always declares ``response_model=Envelope[SomeReadModel]`` — never an 
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
-
 from pydantic import BaseModel
-
-T = TypeVar("T")
 
 
 class Meta(BaseModel):
@@ -22,7 +18,7 @@ class Meta(BaseModel):
     correlation_id: str
 
 
-class Envelope(BaseModel, Generic[T]):
+class Envelope[T](BaseModel):
     """Single-resource success envelope."""
 
     data: T
@@ -37,7 +33,7 @@ class Pagination(BaseModel):
     limit: int
 
 
-class ListEnvelope(BaseModel, Generic[T]):
+class ListEnvelope[T](BaseModel):
     """List success envelope."""
 
     data: list[T]

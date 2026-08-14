@@ -5,4 +5,4 @@ from __future__ import annotations
 from sentinelai.modules.osint.schemas import FindingRead
 from sentinelai.modules.osint.service import OsintService
 
-__all__ = ["OsintService", "FindingRead"]
+__all__ = ["FindingRead", "OsintService"]

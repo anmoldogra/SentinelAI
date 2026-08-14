@@ -22,7 +22,7 @@ class TaskQueue(Protocol):
 
 def get_task_queue(request: Request) -> TaskQueue:
     """FastAPI dependency returning the process-wide task queue."""
-    queue = getattr(request.app.state, "task_queue", None)
+    queue: TaskQueue | None = getattr(request.app.state, "task_queue", None)
     if queue is None:  # pragma: no cover - only when Redis was unavailable at startup
         raise RuntimeError("task queue is unavailable (Redis not connected at startup)")
     return queue

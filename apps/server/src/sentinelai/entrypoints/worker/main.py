@@ -11,7 +11,7 @@ not here, to avoid double-dispatch in Phase 1.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 from arq.connections import RedisSettings
 
@@ -21,20 +21,27 @@ from sentinelai.modules.ingestion.jobs import scan_uploaded_evidence
 from sentinelai.modules.investigation.jobs import run_correlation
 from sentinelai.modules.threat_intel.jobs import sync_feed_subscription
 from sentinelai.platform.config import settings
+from sentinelai.platform.crypto import create_kms
 from sentinelai.platform.db.session import async_session_factory, dispose_engine, engine
 from sentinelai.platform.logging import configure_logging, log
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
     """Configure logging and share the engine/session factory with job functions."""
+    settings.validate_for_profile()  # fail closed on misconfig BEFORE opening any connection
     configure_logging(settings.log_level, json_logs=settings.app_env != "development")
     ctx["engine"] = engine
     ctx["session_factory"] = async_session_factory
+    ctx["kms"] = create_kms(settings)  # ADR-0009: jobs sign/verify/encrypt via the KMS facade
+    await ctx["kms"].start()
     log.info("worker_startup", env=settings.app_env)
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
-    """Dispose the database connection pool on graceful shutdown."""
+    """Dispose the database connection pool + KMS resources on graceful shutdown."""
+    kms = ctx.get("kms")
+    if kms is not None:
+        await kms.aclose()
     await dispose_engine()
     log.info("worker_shutdown")
 
@@ -42,7 +49,7 @@ async def on_shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """arq worker configuration (guide Part 12 "Retries & Progress")."""
 
-    functions: list[Any] = [
+    functions: ClassVar[list[Any]] = [
         scan_uploaded_evidence,
         generate_case_report,
         sync_feed_subscription,

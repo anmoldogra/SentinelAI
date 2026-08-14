@@ -10,4 +10,4 @@ from __future__ import annotations
 from sentinelai.modules.ingestion.schemas import EvidenceRead
 from sentinelai.modules.ingestion.service import EvidenceService
 
-__all__ = ["EvidenceService", "EvidenceRead"]
+__all__ = ["EvidenceRead", "EvidenceService"]

@@ -38,4 +38,6 @@ class SocialAccountObserved(Base):
     platform: Mapped[str] = mapped_column(Text, nullable=False)
     handle: Mapped[str] = mapped_column(Text, nullable=False)
     first_observed_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
-    last_observed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_observed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )

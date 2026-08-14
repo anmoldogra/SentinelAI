@@ -88,5 +88,7 @@ class ThreatIntelUnitOfWork(UnitOfWork):
         self.outbox = OutboxWriter(session, schema=_SCHEMA)
 
 
-async def get_threat_intel_uow(session: AsyncSession = Depends(get_session)) -> ThreatIntelUnitOfWork:
+async def get_threat_intel_uow(
+    session: AsyncSession = Depends(get_session),
+) -> ThreatIntelUnitOfWork:
     return ThreatIntelUnitOfWork(session)

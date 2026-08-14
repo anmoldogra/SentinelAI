@@ -96,8 +96,14 @@ async def test_create_relationship_requires_supporting_evidence(inv_uow, actor) 
     svc = InvestigationService(inv_uow)
     with pytest.raises(ValidationFailedError):
         await svc.create_relationship(
-            case_id=uuid4(), rel_type="x", from_entity_id=uuid4(), to_entity_id=uuid4(),
-            directional=True, confidence=0.5, evidence_ids=[], created_by_ref=uuid4(),
+            case_id=uuid4(),
+            rel_type="x",
+            from_entity_id=uuid4(),
+            to_entity_id=uuid4(),
+            directional=True,
+            confidence=0.5,
+            evidence_ids=[],
+            created_by_ref=uuid4(),
             correlation_id="c",
         )
 
@@ -105,8 +111,14 @@ async def test_create_relationship_requires_supporting_evidence(inv_uow, actor) 
 async def test_create_relationship_publishes_correlation_generated(inv_uow, actor) -> None:
     svc = InvestigationService(inv_uow)
     rel = await svc.create_relationship(
-        case_id=uuid4(), rel_type="located_at", from_entity_id=uuid4(), to_entity_id=uuid4(),
-        directional=True, confidence=0.5, evidence_ids=[uuid4()], created_by_ref=uuid4(),
+        case_id=uuid4(),
+        rel_type="located_at",
+        from_entity_id=uuid4(),
+        to_entity_id=uuid4(),
+        directional=True,
+        confidence=0.5,
+        evidence_ids=[uuid4()],
+        created_by_ref=uuid4(),
         correlation_id="c",
     )
     assert rel.status == "proposed"

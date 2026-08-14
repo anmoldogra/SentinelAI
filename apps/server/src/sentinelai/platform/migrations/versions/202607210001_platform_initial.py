@@ -90,8 +90,11 @@ def upgrade() -> None:
     )
     # Append-only, time-ordered → BRIN over B-tree (database-design.md §6).
     op.create_index(
-        "brin_audit_log_occurred_at", "audit_log", ["occurred_at"],
-        schema=_SCHEMA, postgresql_using="brin",
+        "brin_audit_log_occurred_at",
+        "audit_log",
+        ["occurred_at"],
+        schema=_SCHEMA,
+        postgresql_using="brin",
     )
 
 

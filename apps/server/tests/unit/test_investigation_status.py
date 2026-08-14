@@ -5,9 +5,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from sentinelai.modules.investigation.service import (
+    _REVIEW_DISPOSITIONS,
     STATUS_CONFIRMED,
     STATUS_REJECTED,
-    _REVIEW_DISPOSITIONS,
     _normalize_etag,
     entity_etag,
     relationship_etag,
@@ -15,7 +15,7 @@ from sentinelai.modules.investigation.service import (
 
 
 def test_review_dispositions() -> None:
-    assert _REVIEW_DISPOSITIONS == {STATUS_CONFIRMED, STATUS_REJECTED}
+    assert {STATUS_CONFIRMED, STATUS_REJECTED} == _REVIEW_DISPOSITIONS
 
 
 def test_entity_etag_depends_on_content() -> None:

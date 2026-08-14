@@ -29,7 +29,9 @@ class NotificationRule(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     trigger_event_type: Mapped[str] = mapped_column(Text, nullable=False)
     channel: Mapped[str] = mapped_column(Text, nullable=False)
-    target_role_or_user: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)  # app-ref
+    target_role_or_user: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), nullable=False
+    )  # app-ref
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 

@@ -5,18 +5,18 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from sentinelai.modules.case_management.service import (
+    _TRANSITIONS,
     STATUS_ARCHIVED,
     STATUS_CLOSED,
     STATUS_OPEN,
     VALID_STATUSES,
-    _TRANSITIONS,
     _normalize_etag,
     case_etag,
 )
 
 
 def test_documented_states() -> None:
-    assert VALID_STATUSES == {STATUS_OPEN, STATUS_CLOSED, STATUS_ARCHIVED}
+    assert {STATUS_OPEN, STATUS_CLOSED, STATUS_ARCHIVED} == VALID_STATUSES
 
 
 def test_transition_edges() -> None:

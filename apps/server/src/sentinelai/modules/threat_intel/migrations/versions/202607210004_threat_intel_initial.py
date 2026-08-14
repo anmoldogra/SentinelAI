@@ -54,7 +54,9 @@ def upgrade() -> None:
         schema=_SCHEMA,
     )
     op.create_index("ix_iocs_evidence_id", "iocs", ["evidence_id"], schema=_SCHEMA)
-    op.create_index("ix_iocs_indicator_type_value", "iocs", ["indicator_type", "value"], schema=_SCHEMA)
+    op.create_index(
+        "ix_iocs_indicator_type_value", "iocs", ["indicator_type", "value"], schema=_SCHEMA
+    )
     op.create_table(
         "feed_subscriptions",
         sa.Column("subscription_id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -76,7 +78,10 @@ def upgrade() -> None:
         schema=_SCHEMA,
     )
     op.create_index(
-        "ix_ioc_matches_evidence_id", "ioc_evidence_matches", ["matched_evidence_id"], schema=_SCHEMA
+        "ix_ioc_matches_evidence_id",
+        "ioc_evidence_matches",
+        ["matched_evidence_id"],
+        schema=_SCHEMA,
     )
     create_outbox_events(_SCHEMA)
     create_inbox_events(_SCHEMA)

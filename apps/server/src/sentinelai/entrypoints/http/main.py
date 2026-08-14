@@ -21,11 +21,6 @@ from sentinelai import __version__
 from sentinelai.entrypoints.http import health
 from sentinelai.entrypoints.http.exception_handlers import register_exception_handlers
 from sentinelai.entrypoints.http.middleware import register_middleware
-from sentinelai.platform.auth.dependencies import get_case_access_checker
-from sentinelai.platform.config import settings
-from sentinelai.platform.db.session import async_session_factory, dispose_engine
-from sentinelai.platform.events.dispatcher import EventDispatcher
-from sentinelai.platform.logging import configure_logging, log
 
 # Domain module wiring — the composition root is allowed to import modules
 # (entrypoints is the top layer of the import DAG).
@@ -46,6 +41,12 @@ from sentinelai.modules.social_media import events as social_media_events
 from sentinelai.modules.social_media.router import router as social_media_router
 from sentinelai.modules.threat_intel import events as threat_intel_events
 from sentinelai.modules.threat_intel.router import router as threat_intel_router
+from sentinelai.platform.auth.dependencies import get_case_access_checker
+from sentinelai.platform.config import settings
+from sentinelai.platform.crypto import HealthState, KmsUnavailable, create_kms
+from sentinelai.platform.db.session import async_session_factory, dispose_engine
+from sentinelai.platform.events.dispatcher import EventDispatcher
+from sentinelai.platform.logging import configure_logging, log
 
 # Registered in database-design.md §5 DAG order.
 _MODULE_ROUTERS = (
@@ -73,6 +74,7 @@ _CONSUMER_REGISTRARS = (
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Start the event dispatcher on startup; drain it and dispose the pool on shutdown."""
+    settings.validate_for_profile()  # fail closed on misconfig BEFORE opening any connection
     configure_logging(settings.log_level, json_logs=settings.app_env != "development")
     log.info("http_startup", version=__version__, env=settings.app_env)
 
@@ -91,6 +93,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.task_queue = None
         log.warning("task_queue_unavailable_at_startup")
 
+    # KMS (ADR-0009): construct + verify reachability. Fail CLOSED in production — a signing
+    # subsystem that cannot reach its keys must not serve requests that would need to sign.
+    app.state.kms = create_kms(settings)
+    await app.state.kms.start()  # begins provider background work (e.g. Vault lease renewal)
+    kms_health = await app.state.kms.health()
+    if kms_health.state == HealthState.UNAVAILABLE:
+        log.error("kms_unavailable_at_startup", detail=kms_health.detail)
+        if settings.is_production:
+            raise KmsUnavailable(f"KMS unavailable at startup: {kms_health.detail}")
+
     try:
         yield
     finally:
@@ -98,6 +110,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await dispatcher_task  # drains in-flight handler invocations before exit
         if getattr(app.state, "task_queue", None) is not None:
             await app.state.task_queue.aclose()
+        if getattr(app.state, "kms", None) is not None:
+            await app.state.kms.aclose()
         await dispose_engine()
         log.info("http_shutdown")
 

@@ -68,6 +68,8 @@ class IocEvidenceMatch(Base):
     ioc_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey(f"{_SCHEMA}.iocs.ioc_id"), nullable=False
     )
-    matched_evidence_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)  # app-ref
+    matched_evidence_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), nullable=False
+    )  # app-ref
     matched_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     confidence: Mapped[Decimal] = mapped_column(Numeric, nullable=False)

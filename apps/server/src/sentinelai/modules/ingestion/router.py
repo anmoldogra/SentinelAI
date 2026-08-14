@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request, status
+from fastapi import APIRouter, Depends, Header, Query, Request, status
 
 from sentinelai.modules.ingestion.schemas import (
     AttributeSchemaRead,
@@ -47,7 +47,9 @@ async def reserve_upload(
     return Envelope(data=reservation, meta=_meta(request))
 
 
-@router.post("/evidence", response_model=Envelope[EvidenceRead], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/evidence", response_model=Envelope[EvidenceRead], status_code=status.HTTP_201_CREATED
+)
 async def ingest_evidence(
     payload: EvidenceCreate,
     request: Request,
@@ -72,14 +74,20 @@ async def ingest_batch(
 @router.get("/evidence", response_model=ListEnvelope[EvidenceRead])
 async def list_evidence(
     request: Request,
+    category: str | None = Query(None),
+    artifact_type: str | None = Query(None),
+    status_filter: str | None = Query(None, alias="status"),
+    text: str | None = Query(None),
     page: PageParams = Depends(page_params),
     current_user: CurrentUser = Depends(require_role("investigator")),
     service: EvidenceService = Depends(get_evidence_service),
 ) -> ListEnvelope[EvidenceRead]:
-    items = await service.list_evidence(current_user, page)
+    items, next_cursor, has_more = await service.list_evidence(
+        current_user, category, artifact_type, status_filter, text, page
+    )
     return ListEnvelope(
         data=[EvidenceRead.model_validate(i) for i in items],
-        pagination=Pagination(next_cursor=None, has_more=False, limit=page.limit),
+        pagination=Pagination(next_cursor=next_cursor, has_more=has_more, limit=page.limit),
         meta=_meta(request),
     )
 
@@ -182,14 +190,18 @@ async def list_connectors(
     )
 
 
-@router.post("/connectors", response_model=Envelope[ConnectorRead], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/connectors", response_model=Envelope[ConnectorRead], status_code=status.HTTP_201_CREATED
+)
 async def register_connector(
     payload: ConnectorCreate,
     request: Request,
     current_user: CurrentUser = Depends(require_role("admin")),
     service: EvidenceService = Depends(get_evidence_service),
 ) -> Envelope[ConnectorRead]:
-    connector = await service.register_connector(payload, current_user, request.state.correlation_id)
+    connector = await service.register_connector(
+        payload, current_user, request.state.correlation_id
+    )
     return Envelope(data=ConnectorRead.model_validate(connector), meta=_meta(request))
 
 
@@ -209,7 +221,9 @@ async def update_connector(
 @router.get("/attribute-schemas", response_model=ListEnvelope[AttributeSchemaRead])
 async def list_attribute_schemas(
     request: Request,
-    current_user: CurrentUser = Depends(require_role("investigator", "admin", "compliance", "supervisor")),
+    current_user: CurrentUser = Depends(
+        require_role("investigator", "admin", "compliance", "supervisor")
+    ),
     service: EvidenceService = Depends(get_evidence_service),
 ) -> ListEnvelope[AttributeSchemaRead]:
     items = await service.list_attribute_schemas(current_user)

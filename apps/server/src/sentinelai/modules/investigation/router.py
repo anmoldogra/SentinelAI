@@ -140,7 +140,9 @@ async def list_relationships(
     current_user: CurrentUser = Depends(require_role("investigator")),
     service: InvestigationService = Depends(get_investigation_service),
 ) -> ListEnvelope[RelationshipRead]:
-    items, next_cursor, has_more = await service.list_relationships(current_user, status_filter, page)
+    items, next_cursor, has_more = await service.list_relationships(
+        current_user, status_filter, page
+    )
     return ListEnvelope(
         data=[RelationshipRead.model_validate(i) for i in items],
         pagination=Pagination(next_cursor=next_cursor, has_more=has_more, limit=page.limit),
@@ -172,7 +174,12 @@ async def review_relationship_status(
     service: InvestigationService = Depends(get_investigation_service),
 ) -> Envelope[RelationshipRead]:
     relationship = await service.review_relationship_status(
-        relationship_id, payload.status, payload.note, current_user, request.state.correlation_id, if_match
+        relationship_id,
+        payload.status,
+        payload.note,
+        current_user,
+        request.state.correlation_id,
+        if_match,
     )
     response.headers["ETag"] = relationship_etag(relationship)
     return Envelope(data=RelationshipRead.model_validate(relationship), meta=_meta(request))

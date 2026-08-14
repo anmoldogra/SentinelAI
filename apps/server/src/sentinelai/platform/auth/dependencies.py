@@ -1,4 +1,4 @@
-"""Authentication & authorization dependencies — guide Part 8, security §5–9.
+"""Authentication & authorization dependencies — guide Part 8, security §5-9.
 
 RBAC (``require_role``) gates the action class; ABAC (``require_case_access``) gates
 the specific resource. Both are audited (Part 10) regardless of outcome.
@@ -13,6 +13,7 @@ Until then the default provider raises ``NotImplementedError``.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -46,7 +47,7 @@ async def get_current_user(
     return CurrentUser(user_id=session.user_id, roles=tuple(roles))
 
 
-def require_role(*allowed: str):
+def require_role(*allowed: str) -> Callable[..., Awaitable[CurrentUser]]:
     """Dependency factory: allow only principals holding at least one ``allowed`` role."""
 
     async def _dep(current_user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
@@ -71,7 +72,7 @@ async def get_case_access_checker() -> CaseAccessChecker:
     )
 
 
-def require_case_access(param: str = "case_id"):
+def require_case_access(param: str = "case_id") -> Callable[..., Awaitable[CurrentUser]]:
     """Dependency factory: allow only principals with access to the path's case."""
 
     async def _dep(

@@ -2,7 +2,7 @@
 
 Malware scanning runs as a background job after upload confirmation; promotion from
 the ``quarantine`` bucket to the ``evidence`` bucket happens only after a clean scan
-(security §24–25's category-aware policy is enforced in the service, not here).
+(security §24-25's category-aware policy is enforced in the service, not here).
 Bodies deferred (``NotImplementedError``).
 """
 

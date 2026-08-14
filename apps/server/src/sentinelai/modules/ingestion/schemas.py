@@ -23,6 +23,12 @@ class EvidenceCreate(BaseModel):
     reliability_rating: str | None = None
     payload_ref: str | None = None
     inline_payload: dict[str, Any] | None = None
+    # Required for payload-bearing evidence (CEM §13); validated in the service.
+    integrity_algorithm: str | None = None
+    integrity_hash: str | None = None
+    # CEM §13: required for certain categories (or the public-source sentinel).
+    legal_authority_ref: str | None = None
+    retention_policy_ref: str = "default"
 
 
 class EvidenceRead(BaseModel):
