@@ -1,7 +1,11 @@
-# Local dev stack for the SentinelAI backend only (postgres + redis + the two
-# entrypoints built from one image). The repo-root docker-compose.yml provisions
-# the broader infra baseline (object storage, event stream, vector store); this
-# file is the fast inner-loop for apps/server.
+# Local dev stack: postgres + redis + the two backend entrypoints (built from one image) + the
+# Vite dev server for apps/web, so one command brings up the whole system an analyst would use.
+# The repo-root docker-compose.yml provisions the broader infra baseline (object storage, event
+# stream, vector store); this file is the fast inner-loop.
+#
+# It lives under apps/server for historical reasons and because the backend image builds from
+# this directory; the `web` service reaches up to ../web, which Compose resolves relative to this
+# file. Worth relocating to the repo root if a third app ever joins.
 
 name: sentinelai-server-dev
 
@@ -63,6 +67,30 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # Vite dev server for apps/web. Dev-only: no image is built here, the source is bind-mounted
+  # so hot-module reload works against the editor. Production ships static assets with no Node
+  # runtime at all (frontend-architecture.md §2), which is a separate concern from this file.
+  web:
+    image: node:22-bookworm-slim
+    working_dir: /app
+    # `npm ci` (not `install`) so the container reproduces the lockfile exactly, and the host's
+    # node_modules — built for the developer's OS — can never leak in.
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
+    environment:
+      # Inside the compose network `localhost` is this container, not the API. The proxy target
+      # is configurable precisely so it can point at the service name here.
+      VITE_API_PROXY_TARGET: http://api:8000
+    volumes:
+      - ../web:/app
+      # Anonymous volume, and it is load-bearing: without it the bind mount above would shadow
+      # the container's node_modules with the host's, whose esbuild/rollup binaries are compiled
+      # for the host OS and will not run on linux.
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
 
 volumes:
   pgdata:

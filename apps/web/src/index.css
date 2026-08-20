@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+/*
+ * Design-token layer (frontend-architecture.md §18-19, ADR-0016 §4).
+ *
+ * Tokens are SEMANTIC — named by role, never by value. Feature code uses `bg-surface`, never
+ * `bg-white` or `bg-zinc-900`, which is what keeps theming (§18) a change here rather than a
+ * hunt through every component. Light is the default; dark follows the OS preference and can be
+ * forced either way with `data-theme` on <html>, since §18 requires an explicit persisted
+ * per-user override in addition to the OS default.
+ *
+ * A high-contrast variant is a first-class theme per §18; it is not defined yet because no
+ * component consumes tokens yet. It slots in as another block here.
+ */
+
+:root {
+  --sai-canvas: oklch(98.5% 0.002 250);
+  --sai-surface: oklch(100% 0 0);
+  --sai-border: oklch(90% 0.005 250);
+  --sai-text: oklch(23% 0.01 250);
+  --sai-text-muted: oklch(50% 0.01 250);
+  --sai-accent: oklch(55% 0.15 250);
+  --sai-accent-contrast: oklch(100% 0 0);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --sai-canvas: oklch(18% 0.01 250);
+    --sai-surface: oklch(23% 0.012 250);
+    --sai-border: oklch(33% 0.014 250);
+    --sai-text: oklch(96% 0.004 250);
+    --sai-text-muted: oklch(72% 0.012 250);
+    --sai-accent: oklch(72% 0.13 250);
+    --sai-accent-contrast: oklch(18% 0.01 250);
+  }
+}
+
+/* The explicit per-user override wins over the OS preference, in both directions. */
+:root[data-theme="light"] {
+  --sai-canvas: oklch(98.5% 0.002 250);
+  --sai-surface: oklch(100% 0 0);
+  --sai-border: oklch(90% 0.005 250);
+  --sai-text: oklch(23% 0.01 250);
+  --sai-text-muted: oklch(50% 0.01 250);
+  --sai-accent: oklch(55% 0.15 250);
+  --sai-accent-contrast: oklch(100% 0 0);
+}
+
+:root[data-theme="dark"] {
+  --sai-canvas: oklch(18% 0.01 250);
+  --sai-surface: oklch(23% 0.012 250);
+  --sai-border: oklch(33% 0.014 250);
+  --sai-text: oklch(96% 0.004 250);
+  --sai-text-muted: oklch(72% 0.012 250);
+  --sai-accent: oklch(72% 0.13 250);
+  --sai-accent-contrast: oklch(18% 0.01 250);
+}
+
+/* Expose ONLY the semantic roles to Tailwind. Raw palette utilities are deliberately not
+ * introduced here, so `bg-surface` is available and a hardcoded value stands out in review. */
+@theme inline {
+  --color-canvas: var(--sai-canvas);
+  --color-surface: var(--sai-surface);
+  --color-border: var(--sai-border);
+  --color-text: var(--sai-text);
+  --color-text-muted: var(--sai-text-muted);
+  --color-accent: var(--sai-accent);
+  --color-accent-contrast: var(--sai-accent-contrast);
+}
+
+body {
+  background-color: var(--sai-canvas);
+  color: var(--sai-text);
+}

@@ -21,4 +21,7 @@ tests
 docker-compose.dev.yml
 Dockerfile
 Makefile
-README.md
+# README.md is NOT ignored: pyproject.toml declares `readme = "README.md"`, so the build
+# backend needs it present to generate package metadata. Excluding it made
+# `COPY pyproject.toml README.md ./` fail — dropping it from the COPY instead would just move
+# the failure into `pip install .`.

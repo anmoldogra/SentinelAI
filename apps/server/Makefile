@@ -15,7 +15,8 @@ export PYTHONIOENCODING := utf-8
 COVERAGE_FLOOR := 90
 
 .PHONY: help install lint format typecheck lint-imports test test-unit test-integration \
-        test-migrations hooks check run-api run-worker migrate compose-up compose-down
+        test-migrations hooks check run-api run-worker migrate compose-up compose-down \
+        compose-logs
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -63,8 +64,11 @@ run-worker: ## Run the arq worker entrypoint (dev)
 migrate: ## Apply all per-module Alembic migrations in DAG order
 	./scripts/migrate.sh
 
-compose-up: ## Start the local dev stack (postgres, redis, api, worker)
+compose-up: ## Start the full dev stack (postgres, redis, api, worker, web on :5173)
 	docker compose -f docker-compose.dev.yml up -d --build
 
-compose-down: ## Stop the local dev stack
+compose-down: ## Stop the dev stack
 	docker compose -f docker-compose.dev.yml down
+
+compose-logs: ## Tail logs from the dev stack (e.g. make compose-logs SERVICE=web)
+	docker compose -f docker-compose.dev.yml logs -f $(SERVICE)

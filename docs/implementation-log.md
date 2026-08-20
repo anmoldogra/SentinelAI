@@ -826,3 +826,98 @@ this increment. It does leave e.g. `202607280001_platform_append_only.py` declar
 **Trivy.** Reverted `aquasecurity/trivy-action@0.28.0` → `@master` as instructed, since the pinned
 tag did not resolve. Recorded inline as a known tradeoff: an unpinned third-party action is a
 supply-chain risk (governance §43), to be re-pinned once a verified release ref is confirmed.
+
+---
+
+## 2026-08-20 — IC-022: container-build fix + apps/web scaffolding (ADR-0016)
+
+**Type:** CI fix + new frontend app. No backend source changes.
+
+**Container build — the reported fix would have swapped one failure for another.** Root cause
+found: `apps/server/.dockerignore` listed `README.md`, so it was absent from the build context
+and `COPY pyproject.toml README.md ./` failed. But `pyproject.toml:10` declares
+`readme = "README.md"`, so dropping it from the COPY (the proposed fix) breaks `pip install .`
+at metadata generation instead — **verified empirically** by building a minimal hatchling package
+with a declared-but-missing readme, which fails with "Encountered error while generating package
+metadata". Fixed at the actual cause: un-ignored `README.md`, one line, no Dockerfile or
+`pyproject.toml` change, package metadata intact.
+
+**ADR-0016 written first, because the docs require it.** `frontend-architecture.md`'s header note
+and §48 state the stack choice "should be recorded as an ADR before implementation begins", and
+no frontend ADR existed. It records React + React Query (already fixed by the architecture doc)
+and closes what §2 left open: **Vite** (static output, offline-installable, Rollup splitting for
+§39–41), **React Router**, **Tailwind v4 as the implementation of the §19 token layer**, native
+**`fetch`** over Axios, and TS `strict` + `noUncheckedIndexedAccess` +
+`exactOptionalPropertyTypes` to mirror the backend's `mypy --strict`.
+
+**Structure follows §3, not the conventional tree.** The brief proposed
+`components/ pages/ api/ utils/`; §3 explicitly forbids those top-level grab-bags and mandates
+feature folders mirroring `apps/server/modules/*`. Built as `app/` · `shared/` · `features/cases/`.
+
+**Two doc rules encoded as tooling rather than prose.**
+- `security-architecture.md` §35 / §9: the token store is in-memory only, and ESLint bans the
+  `localStorage`/`sessionStorage` globals so a regression fails the build instead of relying on
+  review.
+- §19: only *semantic* tokens are exposed to Tailwind via `@theme` (`bg-surface`, never
+  `bg-zinc-900`), so bypassing the token layer is visible.
+
+**A lint finding worth recording.** `strictTypeChecked` flagged the `crypto.randomUUID` fallback
+as dead code, because the DOM lib types it as always present. It is not dead: `randomUUID`
+requires a **secure context**, and an air-gapped deployment on plain HTTP genuinely lacks it
+(§2's profiles). Resolved by narrowing `globalThis` to an optional shape so the guard is honest
+to the type system — not by suppressing the rule.
+
+**Verified by execution:** `npm install` (195 packages, exit 0), `npm run check`
+(format + lint + typecheck, exit 0), and a real `npm run build` — 91 modules, Tailwind compiled,
+vendor chunks split as configured. Backend gates re-run unchanged: 509 passed, 9 skipped.
+
+**Deliberately not built:** any feature surface (§23–29), the auth context/login flow (§6), the
+theme switcher, error boundaries (§42), or a test runner — the Case Dashboard renders static
+placeholder markup and no server data.
+
+---
+
+## 2026-08-20 — IC-023: apps/web wired into CI and the dev stack
+
+**Type:** CI + local-dev integration. No application source touched.
+
+**CI.** Added `frontend-checks` to `ci.yml`: checkout → `setup-node@v4` → `npm ci` →
+`npm run check` → `npm run build`, running in parallel with the backend jobs (the two apps share
+no toolchain, so neither should wait on the other). **Added to `ci-passed`'s `needs`** — a gate
+that is not aggregated does not gate anything.
+
+**Three details that would otherwise have broken it silently.**
+1. The workflow sets `defaults.run.working-directory: apps/server` for *every* job, so the
+   frontend job carries a job-level override to `apps/web`. Without it, `npm ci` would have run
+   against the backend directory.
+2. **Node 22, deliberately not 24.** npm 11 (shipped with Node 24) gates lifecycle scripts behind
+   an `allow-scripts` approval, which esbuild's postinstall trips — observed locally in IC-022.
+   Node 22 ships npm 10, so `npm ci` installs esbuild's platform binary with no flag or
+   suppression needed.
+3. `npm ci` rather than `npm install`: it fails when `package.json` and the lockfile disagree, so
+   a dependency added without committing the lockfile is caught here instead of drifting.
+
+**Dev stack.** Added a `web` service to `apps/server/docker-compose.dev.yml` (the file
+`make compose-up` drives; the repo-root compose is datastores only). `node:22-bookworm-slim` to
+match the bookworm images already in the stack, `../web:/app` bind mount for HMR, port 5173,
+`npm ci && npm run dev -- --host 0.0.0.0`.
+
+**Two of those settings are load-bearing, not incidental.**
+- **An anonymous `/app/node_modules` volume.** Without it the bind mount shadows the container's
+  modules with the *host's*, whose esbuild/rollup binaries are compiled for the developer's OS
+  and cannot run on linux. This is the classic Node-in-Compose failure.
+- **`VITE_API_PROXY_TARGET: http://api:8000`.** Inside the compose network `localhost` is the web
+  container, not the API. IC-022 made the proxy target configurable for exactly this.
+
+**Makefile.** No root Makefile exists, and `apps/server/Makefile` is backend-scoped — so rather
+than adding Node targets there, `compose-up`'s help text was corrected (it now starts `web` too
+and said otherwise) and a `compose-logs` target added for tailing a single service.
+
+**Verified by execution, not just YAML parsing:** all three YAML files parse; a structural script
+asserts the working-directory override, the ci-passed aggregation, the lockfile's existence, that
+every npm script CI/compose invokes is defined, and that `../web` resolves to a real package. Then
+the exact CI commands were run — `npm ci` (195 packages), `npm run check`, `npm run build` — all
+exit 0. Backend suite unchanged at 509 passed.
+
+**Not verified:** the compose `web` service has never been started (no Docker daemon available
+here); it is reasoned from the file, not observed.

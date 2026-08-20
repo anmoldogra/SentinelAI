@@ -47,6 +47,40 @@ jobs:
       - name: ruff check
         run: ruff check src tests
 
+  # 2b — Frontend gates for apps/web (ADR-0016). Runs in parallel with the backend jobs; the two
+  # apps share no toolchain, so neither should wait on the other.
+  frontend-checks:
+    name: Frontend checks (apps/web)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Overrides the workflow-level apps/server default — job-level defaults win.
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Node 22 LTS. Deliberately not 24: npm 11 gates lifecycle scripts behind an
+          # approval prompt (`allow-scripts`), which esbuild's postinstall trips. Node 22
+          # ships npm 10, so `npm ci` installs esbuild's platform binary without a flag.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      # `ci`, not `install`: fails if package.json and the lockfile disagree, so a dependency
+      # added without committing the lockfile is caught here rather than drifting.
+      - name: Install (locked)
+        run: npm ci
+
+      # format:check + lint + typecheck — the same gate `make check` is for the backend.
+      - name: Static checks
+        run: npm run check
+
+      # The build is the real proof: it is the only step that exercises Tailwind compilation,
+      # the manual chunk splitting, and that every import actually resolves.
+      - name: Production build
+        run: npm run build
+
   # 3 — Types. mypy runs in strict mode (configured in pyproject.toml).
   typecheck:
     name: Typecheck
@@ -405,6 +439,7 @@ jobs:
     if: always()
     needs:
       - format-and-lint
+      - frontend-checks
       - typecheck
       - architecture
       - unit
