@@ -744,3 +744,85 @@ API is using. Honest boundary, stated in the test's docstring: this covers the s
 client observes, NOT the job wrapper's own transaction/rollback/retry handling, which has its own
 unit tests. Invoking the real job function was rejected because it constructs its own
 `CaseManagementUnitOfWork` from a session factory, which the fake UoW cannot supply.
+
+---
+
+## 2026-08-20 — IC-020: CI pipeline fixes (roles, SAST, SBOM, container build)
+
+**Type:** CI configuration only. No `src/`, no tests, no schema.
+
+**1. `test_privileges_db.py` skipped in CI.** The test skips when the ADR-0004 role
+`sentinel_append` is absent, and a fresh Postgres service container has no such role. Fixed by
+applying **the repository's own** `infra/postgres/bootstrap/001_roles.sql` before pytest, rather
+than re-typing `CREATE ROLE` in YAML — CI now provisions exactly what production does, so the two
+cannot drift. The script is idempotent, database-name-agnostic (`current_database()`), and
+self-contained (roles + attributes + membership + database-scoped grants; no table dependencies),
+verified by reading it end to end. A follow-up `psql` query prints the provisioned roles so the
+log shows what CI actually created.
+
+**2. Security scan (SAST) — root cause: bandit exits 1 on findings, not a missing install.**
+Verified locally: `bandit -r src -ll` reports **5 MEDIUM** issues — four B608 (DDL assembled from
+module-constant identifiers in `db/privileges.py` and the report migration; never user input) and
+one B104 (binding `0.0.0.0`, correct for a containerised service). The job was therefore
+permanently red-but-ignored (`continue-on-error: true`). Restructured into two passes: a full
+MEDIUM+ report (`--exit-zero`, uploaded as an artifact) and a **real gate on HIGH only**
+(`-lll`), which exits 0 today and will fail on any new HIGH finding. `continue-on-error` removed,
+since the job's status is now meaningful.
+
+**3. Dependency scan & SBOM — root cause verified, not guessed:** `cyclonedx-py` v7 has no
+`--outfile` flag; it rejects it with `unrecognized arguments` (reproduced locally). Changed to
+`-o`. Ran the corrected command against this repo's venv: exit 0, valid CycloneDX **1.6**, 133
+components. Added a validation step that parses the SBOM and fails if it is not a populated
+CycloneDX document — an empty SBOM looks like provenance without being it.
+
+**4. Container build.** Replaced the bare `docker build .` with
+`docker/build-push-action@v6` naming `context: apps/server` and `file: apps/server/Dockerfile`
+explicitly. The workflow-level `defaults.run.working-directory` applies to `run:` steps **only**,
+never to actions, so the previous form depended on an implicit and easily-broken assumption.
+Added Buildx + GHA layer caching and pinned `trivy-action` to `0.28.0` instead of `@master`
+(an unpinned third-party action at HEAD is both a supply-chain and a reproducibility risk).
+
+**Honesty note.** GitHub Actions cannot run locally. Causes (2) and (3) were **reproduced and
+verified** on this machine; (1) is proven by reading the test's skip condition against the
+bootstrap SQL. For (4) the 8-second failure was **not** reproduced — Docker is unavailable here —
+so that change hardens the job against the plausible causes (implicit context resolution, an
+unpinned action) rather than confirming a diagnosis. The first real pipeline run settles it.
+
+---
+
+## 2026-08-20 — IC-021: Alembic revision IDs shortened to fit VARCHAR(32); Trivy ref reverted
+
+**Type:** CI fix. No schema DDL, no application code.
+
+**Root cause.** Alembic's `alembic_version.version_num` is `VARCHAR(32)`; any revision id longer
+than that fails on `upgrade`, which is what broke the migration round-trip job.
+
+**Scope correction — five ids were over the limit, not one.** The reported failure named
+`202607280001_platform_append_only` (actually 33 chars, not 35). An audit of every revision id in
+the repository found four more that would have failed the moment the first was fixed:
+
+| old id | len | new id | len |
+|---|---|---|---|
+| `202607300002_ingestion_evidentiary_privileges` | 45 | `202607300002_ingestion_privs` | 28 |
+| `202607300001_platform_evidentiary_privileges` | 44 | `202607300001_platform_privs` | 27 |
+| `202608200001_case_reports_job_state` | 35 | `202608200001_case_reports_job` | 29 |
+| `202607280002_ingestion_append_only` | 34 | `202607280002_ingestion_append` | 29 |
+| `202607280001_platform_append_only` | 33 | `202607280001_platform_append` | 28 |
+
+Fixing only the named one would have moved the failure, not removed it. Longest id is now 29.
+
+**Applied to** `revision`, `down_revision`, and the `Revision ID:` / `Revises:` docstring headers
+(leaving those stale would make the files lie about their own identity). Verified by AST after
+rewriting: 14 revisions, all ≤32; every `down_revision` resolves to a known revision; exactly
+9 heads — one per module schema, as the per-module history model requires; no stale references to
+the old ids anywhere in the repo. `test_migration_currency.py`'s existing one-head-per-schema
+assertions pass unchanged, independently confirming the chains.
+
+**Filenames deliberately unchanged.** Alembic resolves revisions by the `revision` variable, not
+the filename, so the rename is complete as-is; renaming the five files is cosmetic churn outside
+this increment. It does leave e.g. `202607280001_platform_append_only.py` declaring
+`revision = "202607280001_platform_append"` — worth a tidy-up pass later.
+
+**Trivy.** Reverted `aquasecurity/trivy-action@0.28.0` → `@master` as instructed, since the pinned
+tag did not resolve. Recorded inline as a known tradeoff: an unpinned third-party action is a
+supply-chain risk (governance §43), to be re-pinned once a verified release ref is confirmed.

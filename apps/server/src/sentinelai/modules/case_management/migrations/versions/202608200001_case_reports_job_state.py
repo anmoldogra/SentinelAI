@@ -9,7 +9,7 @@ Backfill: existing rows (if any) predate async generation and are, by definition
 are stamped ``completed`` with ``requested_at`` seeded from ``generated_at`` before the NOT NULL
 constraint on ``requested_at`` is applied, so the migration is safe on a populated table.
 
-Revision ID: 202608200001_case_reports_job_state
+Revision ID: 202608200001_case_reports_job
 Revises: 202607210007_case_management
 """
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "202608200001_case_reports_job_state"
+revision = "202608200001_case_reports_job"
 down_revision = "202607210007_case_management"
 branch_labels = None
 depends_on = None
