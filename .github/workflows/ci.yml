@@ -205,6 +205,20 @@ jobs:
             -d '{"type":"transit"}' \
             http://localhost:8200/v1/sys/mounts/transit
 
+      # ADR-0004's three privilege roles are a cluster-level deployment prerequisite, so a fresh
+      # service container does not have them and `test_privileges_db.py` skips itself. Applying
+      # the repository's own bootstrap script (rather than re-typing CREATE ROLE here) means CI
+      # provisions exactly what production does, and drift between the two is impossible.
+      # The script is idempotent and database-name-agnostic (`current_database()`).
+      - name: Provision ADR-0004 database roles
+        env:
+          PGPASSWORD: sentinelai
+        run: |
+          psql -h localhost -U sentinelai -d sentinelai -v ON_ERROR_STOP=1 \
+            -f ../../infra/postgres/bootstrap/001_roles.sql
+          psql -h localhost -U sentinelai -d sentinelai -tAc \
+            "SELECT rolname FROM pg_roles WHERE rolname LIKE 'sentinel\_%' ORDER BY rolname"
+
       # test_migrations.py is owned by the `migrations` job below — excluded here so the
       # round-trip runs once, not twice.
       - name: pytest (integration)
@@ -227,16 +241,33 @@ jobs:
   security-scan:
     name: Security scan (SAST)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install bandit
-        run: python -m pip install bandit[toml]
-      - name: bandit (SAST)
-        run: bandit -r src -ll
+        run: python -m pip install "bandit[toml]"
+
+      # Two passes, because `bandit -ll` exits 1 on any MEDIUM finding and this repository has
+      # five known-benign ones: four B608 (DDL built from module-constant identifiers in the
+      # migration/privilege helpers — never user input) and one B104 (binding 0.0.0.0, which is
+      # correct for a containerised service). A permanently-red advisory job teaches everyone to
+      # ignore it, so: report everything, gate on HIGH.
+      - name: bandit — full report (advisory, MEDIUM and above)
+        run: bandit -r src -ll -f txt -o bandit-report.txt --exit-zero
+
+      # The real gate. Zero HIGH findings today; a new one fails this job.
+      - name: bandit — gate on HIGH severity
+        run: bandit -r src -lll -q
+
+      - name: Upload bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: apps/server/bandit-report.txt
+          if-no-files-found: warn
 
   # 8 — Dependency vulnerabilities + CycloneDX SBOM, stored as a build artifact.
   dependency-scan-and-sbom:
@@ -248,13 +279,36 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+      # The project is installed so the SBOM describes its REAL resolved dependency set; the
+      # tools are installed alongside it in the same environment, which is what
+      # `cyclonedx-py environment` inspects.
       - name: Install project + tooling
-        run: python -m pip install -e "." pip-audit cyclonedx-bom
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "." pip-audit cyclonedx-bom
       - name: pip-audit (advisory until the policy is ratified)
         continue-on-error: true
         run: pip-audit --strict --progress-spinner off
+
+      # `-o`, not `--outfile`: cyclonedx-py (v7) rejects `--outfile` outright with
+      # "unrecognized arguments", which is what broke this job.
       - name: Generate CycloneDX SBOM
-        run: cyclonedx-py environment --output-format JSON --outfile sbom.json
+        run: cyclonedx-py environment --output-format JSON -o sbom.json
+
+      # An empty or malformed SBOM is worse than none — it looks like provenance and isn't.
+      - name: Verify the SBOM is valid, non-empty CycloneDX
+        run: |
+          python - <<'PY'
+          import json, sys
+          with open("sbom.json", encoding="utf-8") as fh:
+              doc = json.load(fh)
+          components = doc.get("components", [])
+          print(f"bomFormat={doc.get('bomFormat')} specVersion={doc.get('specVersion')} "
+                f"components={len(components)}")
+          if doc.get("bomFormat") != "CycloneDX" or not components:
+              sys.exit("SBOM is not a populated CycloneDX document")
+          PY
+
       - name: Upload SBOM
         uses: actions/upload-artifact@v4
         with:
@@ -274,10 +328,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Context and Dockerfile are named explicitly rather than relying on the workflow-level
+      # `defaults.run.working-directory` (which applies to `run:` steps only, not to actions),
+      # so the build cannot resolve against the wrong directory. `load: true` puts the image in
+      # the local daemon where Trivy can scan it by tag; nothing is pushed.
       - name: Build image
-        run: docker build -t sentinelai-server:${{ github.sha }} .
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/server
+          file: apps/server/Dockerfile
+          tags: sentinelai-server:${{ github.sha }}
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Trivy CVE scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: sentinelai-server:${{ github.sha }}
           severity: HIGH,CRITICAL
