@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
+from sentinelai.platform.storage.exceptions import ObjectNotFound
 from sentinelai.platform.storage.port import ObjectStorage
 
 _FIVE_MIB = 5 * 1024 * 1024
@@ -30,6 +31,9 @@ async def check_object_storage(storage: ObjectStorage, *, bucket: str) -> None:
     await storage.ensure_bucket(bucket)
     await storage.ensure_bucket(bucket)  # idempotent
 
+    # absent before it is written
+    assert await storage.exists(bucket, "obj/a") is False
+
     # put_stream (chunked) → head → get_stream round-trip
     payload = b"hello-evidence-" * 1000
     await storage.put_stream(
@@ -38,6 +42,7 @@ async def check_object_storage(storage: ObjectStorage, *, bucket: str) -> None:
     head = await storage.head(bucket, "obj/a")
     assert head.size == len(payload)
     assert await _drain(storage.get_stream(bucket, "obj/a")) == payload
+    assert await storage.exists(bucket, "obj/a") is True
 
     # presigned URLs are non-empty http(s) URLs
     assert (await storage.presigned_upload_url(bucket, "obj/a")).startswith("http")
@@ -50,12 +55,23 @@ async def check_object_storage(storage: ObjectStorage, *, bucket: str) -> None:
     await storage.complete_multipart_upload(bucket, "obj/b", upload_id, [part1, part2])
     assert await _drain(storage.get_stream(bucket, "obj/b")) == b"A" * _FIVE_MIB + b"B" * 17
 
-    # delete → head raises KeyError; delete is idempotent
+    # server-side copy: destination gets the bytes, source is untouched (ADR-0008 §2 promotion)
+    await storage.copy_object(bucket, "obj/a", bucket, "obj/copied")
+    assert await _drain(storage.get_stream(bucket, "obj/copied")) == payload
+    assert await storage.exists(bucket, "obj/a") is True
+    with pytest.raises(ObjectNotFound):  # copying a missing source is an error, not a no-op
+        await storage.copy_object(bucket, "obj/absent", bucket, "obj/nope")
+    await storage.delete(bucket, "obj/copied")
+
+    # delete → head/get raise ObjectNotFound (which is also a KeyError); delete is idempotent
     await storage.delete(bucket, "obj/a")
     await storage.delete(bucket, "obj/a")  # missing key is not an error
-    with pytest.raises(KeyError):
+    assert await storage.exists(bucket, "obj/a") is False
+    with pytest.raises(ObjectNotFound):
         await storage.head(bucket, "obj/a")
-    with pytest.raises(KeyError):
+    with pytest.raises(ObjectNotFound):
         await _drain(storage.get_stream(bucket, "obj/a"))
+    with pytest.raises(KeyError):  # the port's documented absence behaviour still holds
+        await storage.head(bucket, "obj/a")
 
     await storage.delete(bucket, "obj/b")

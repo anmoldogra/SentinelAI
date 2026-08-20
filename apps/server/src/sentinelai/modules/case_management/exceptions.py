@@ -18,6 +18,10 @@ class ReportNotFoundError(NotFoundError):
     """No report with the given id exists for the case."""
 
 
+class ReportNotReadyError(ConflictError):
+    """The report exists but has not finished generating, so it has no object to download."""
+
+
 class EvidenceLinkNotFoundError(NotFoundError):
     """The evidence is not linked to this case."""
 

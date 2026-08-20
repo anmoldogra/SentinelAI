@@ -1,0 +1,346 @@
+name: CI
+
+# The governance pipeline for apps/server (implementation-wave-1.md §17). A change that would
+# fail this workflow is not done. Stages are hard gates in the documented order; each runs as its
+# own job so a red gate names itself in the checks list rather than hiding inside one long log.
+#
+# Secret scanning and docker-compose validation live in pr-validation.yml — they have no
+# dependency on application code and run on their own cadence. This workflow is the app pipeline.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  # import-linter's progress spinner is non-ASCII; force UTF-8 so piped/captured output
+  # cannot fail on a legacy codepage (the same reason apps/server/Makefile exports these).
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+defaults:
+  run:
+    working-directory: apps/server
+
+jobs:
+  # 1 + 2 — Format and Lint (ruff). Cheapest gates first: a formatting failure should not
+  # wait behind a five-minute test run.
+  format-and-lint:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: ruff format --check
+        run: ruff format --check src tests
+      - name: ruff check
+        run: ruff check src tests
+
+  # 3 — Types. mypy runs in strict mode (configured in pyproject.toml).
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: mypy --strict
+        run: mypy src
+
+  # 4 — Architecture validation. import-linter enforces the module dependency DAG and
+  # platform's domain-agnosticism (database-design.md §5).
+  architecture:
+    name: Architecture validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: import-linter (module DAG + platform boundary)
+        run: lint-imports
+
+  # 5 — Unit tests + coverage floor on platform.
+  unit:
+    name: Unit tests & coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      # Selection is by PATH, not by marker: this repository's suites are separated by
+      # directory (tests/unit, tests/integration, ...) and no test carries a pytest marker,
+      # so `pytest -m unit` would silently collect zero tests and report a false green.
+      #
+      # wave-1 §17's Tier-0 mandate: ≥90% on platform. Met and enforced — this is a hard gate,
+      # not a ratchet. Keep in step with COVERAGE_FLOOR in apps/server/Makefile.
+      - name: pytest (unit) + coverage floor on platform
+        run: |
+          pytest tests/unit \
+            --cov=sentinelai.platform \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=90
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: apps/server/coverage.xml
+          if-no-files-found: warn
+
+  # 6 — Integration tests against real dependencies.
+  #
+  # Postgres and Redis run as `services:` — they need no command arguments. MinIO and Vault
+  # do (`minio server /data`, `vault server -dev`), and a GitHub Actions service container
+  # cannot be given a command, so they are started with `docker run` instead. Both approaches
+  # publish on localhost, so the test env vars are uniform either way.
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sentinelai
+          POSTGRES_PASSWORD: sentinelai
+          POSTGRES_DB: sentinelai
+        ports: ["5432:5432"]
+        # The migration round-trip CREATEs and DROPs a throwaway database, so readiness must
+        # mean "accepting connections", not just "process started".
+        options: >-
+          --health-cmd "pg_isready -U sentinelai"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Consumed by tests/integration/* and by platform/config.py's Settings.
+      TEST_DATABASE_URL: postgresql+asyncpg://sentinelai:sentinelai@localhost:5432/sentinelai
+      DATABASE_URL: postgresql+asyncpg://sentinelai:sentinelai@localhost:5432/sentinelai
+      REDIS_URL: redis://localhost:6379/0
+      STORAGE_ENDPOINT_URL: http://localhost:9000
+      STORAGE_ACCESS_KEY: minioadmin
+      STORAGE_SECRET_KEY: minioadmin
+      STORAGE_BUCKET: sentinelai-evidence
+      STORAGE_QUARANTINE_BUCKET: sentinelai-quarantine
+      VAULT_TEST_ADDR: http://localhost:8200
+      VAULT_TEST_TOKEN: ci-root-token
+      VAULT_TEST_MOUNT: transit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+
+      - name: Start Vault (dev mode)
+        run: |
+          docker run -d --name vault \
+            -p 8200:8200 \
+            --cap-add IPC_LOCK \
+            -e VAULT_DEV_ROOT_TOKEN_ID=ci-root-token \
+            -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+            hashicorp/vault:latest
+
+      # Fail loudly here rather than letting a test skip with "not reachable" — a skipped
+      # integration test in CI is indistinguishable from a passing one, which is the exact
+      # false-green this job exists to prevent.
+      - name: Wait for MinIO and Vault
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            [ "$i" = "30" ] && { echo "MinIO never became ready"; docker logs minio; exit 1; }
+            sleep 2
+          done
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8200/v1/sys/health >/dev/null && break
+            [ "$i" = "30" ] && { echo "Vault never became ready"; docker logs vault; exit 1; }
+            sleep 2
+          done
+
+      - name: Enable Vault transit engine
+        run: |
+          curl -sf -X POST \
+            -H "X-Vault-Token: ci-root-token" \
+            -d '{"type":"transit"}' \
+            http://localhost:8200/v1/sys/mounts/transit
+
+      # test_migrations.py is owned by the `migrations` job below — excluded here so the
+      # round-trip runs once, not twice.
+      - name: pytest (integration)
+        run: pytest tests/integration --ignore=tests/integration/test_migrations.py -v
+
+      # A skipped integration test in CI means a service container did not come up. Surface it
+      # as a failure: the whole point of provisioning services is that these tests actually run.
+      - name: Assert no integration test was skipped
+        run: |
+          pytest tests/integration --ignore=tests/integration/test_migrations.py \
+            -q -rs --no-header | tee result.txt
+          ! grep -q "SKIPPED" result.txt
+
+      - name: Service logs on failure
+        if: failure()
+        run: docker logs minio || true; docker logs vault || true
+
+  # 7 — Security scan. Advisory while the tooling beds in (wave-1 §17: "advisory -> gating as it
+  # matures"); secret scanning itself is gating in pr-validation.yml.
+  security-scan:
+    name: Security scan (SAST)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install bandit
+        run: python -m pip install bandit[toml]
+      - name: bandit (SAST)
+        run: bandit -r src -ll
+
+  # 8 — Dependency vulnerabilities + CycloneDX SBOM, stored as a build artifact.
+  dependency-scan-and-sbom:
+    name: Dependency scan & SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install project + tooling
+        run: python -m pip install -e "." pip-audit cyclonedx-bom
+      - name: pip-audit (advisory until the policy is ratified)
+        continue-on-error: true
+        run: pip-audit --strict --progress-spinner off
+      - name: Generate CycloneDX SBOM
+        run: cyclonedx-py environment --output-format JSON --outfile sbom.json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: apps/server/sbom.json
+
+  # 9 — Container build + scan + sign.
+  #
+  # NOT IMPLEMENTED: signing is deliberately absent, not forgotten. deployment-architecture.md
+  # Part 5 requires every deployable image to be cosign-signed from an approved base before it
+  # may be deployed, and that needs signing-key infrastructure that is not bootstrapped yet.
+  # This job builds and CVE-scans the image so the Dockerfile stays verified; it does not push
+  # and does not sign, so nothing it produces is deployable. Adding cosign here without real
+  # keys would create a signed-looking artifact backed by nothing, which is worse than no job.
+  container-build:
+    name: Container build & scan (no push, no sign)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t sentinelai-server:${{ github.sha }} .
+      - name: Trivy CVE scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: sentinelai-server:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "0" # advisory until the base-image policy is enforced
+          format: table
+
+  # 10 — Migration reversibility on a clean database (W1-16).
+  migrations:
+    name: Migration round-trip
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sentinelai
+          POSTGRES_PASSWORD: sentinelai
+          POSTGRES_DB: sentinelai
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sentinelai"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://sentinelai:sentinelai@localhost:5432/sentinelai
+      DATABASE_URL: postgresql+asyncpg://sentinelai:sentinelai@localhost:5432/sentinelai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      # Invoked via `bash`, not `./`: scripts/migrate.sh is committed mode 100644, so executing
+      # it directly would fail with "Permission denied" on a fresh checkout.
+      - name: Validate the DAG-ordered migration runner
+        run: bash scripts/migrate.sh upgrade head
+      - name: upgrade head -> downgrade base (all nine schemas)
+        run: pytest tests/integration/test_migrations.py -v
+      - name: Assert the round-trip actually ran
+        run: |
+          pytest tests/integration/test_migrations.py -q -rs --no-header | tee m.txt
+          ! grep -q "SKIPPED" m.txt
+
+  # Single required status check for branch protection: green only if every hard gate is green.
+  # `needs` alone is not enough — a skipped or cancelled dependency would otherwise pass.
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - format-and-lint
+      - typecheck
+      - architecture
+      - unit
+      - integration
+      - dependency-scan-and-sbom
+      - container-build
+      - migrations
+    steps:
+      - name: Verify every required gate succeeded
+        run: |
+          echo '${{ toJSON(needs) }}'
+          [ -z "$(echo '${{ toJSON(needs) }}' | grep -o '"result": "[^"]*"' | grep -v '"result": "success"')" ] \
+            || { echo "One or more required gates did not succeed."; exit 1; }

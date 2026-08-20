@@ -69,6 +69,15 @@ Two schemas carry a sanctioned, narrow exception to "no cross-schema access," bo
 
 ### 3.2 `ingestion`
 
+> **Derived-state rule (ADR-0015).** `ingestion.evidence` is append-only (ADR-0004), so
+> `status`, `legal_hold`, and `integrity_verification_status` store their **INSERT-time
+> (genesis) values only** and are never UPDATEd. Current state is derived at read time:
+> `status` is `superseded` iff a row exists with `supersedes_evidence_id` pointing at the
+> item; `legal_hold` is the latest `legal_hold_applied`/`legal_hold_released` custody event;
+> `integrity_verification_status` is `verified`/`failed` by comparing the latest
+> `integrity_reverified` custody event's `integrity_hash_at_event` against `integrity_hash`.
+> Direct-SQL consumers must apply the same derivation.
+
 | Table | Column | Type | Null? | Notes |
 |---|---|---|---|---|
 | `evidence` | `evidence_id` | uuid | PK | |
@@ -151,8 +160,17 @@ Additional module-specific tables:
 | | `changed_at`, `notes` | timestamptz/text | mixed | see Section 5 note on `investigation` |
 | `case_reports` | `report_id` | uuid | PK | |
 | | `case_id` | uuid | FK → `cases` | |
-| | `report_type`, `storage_ref` | text | no | |
-| | `generated_by_user_id`, `generated_at` | uuid/timestamptz | no | |
+| | `report_type` | text | no | |
+| | `status` | text | no | `queued`\|`running`\|`completed`\|`failed` (api-design.md §7) |
+| | `storage_ref` | text | **yes** | NULL until the job completes — a queued report has no object |
+| | `generated_by_user_id`, `requested_at` | uuid/timestamptz | no | who asked, and when |
+| | `generated_at` | timestamptz | **yes** | NULL until the job completes |
+| | `failure_reason` | text | yes | set with `status='failed'` so a poller learns why |
+
+> **`case_reports` is a job-state row.** `POST /cases/{case_id}/reports` inserts it immediately in
+> `queued` state so the client has something to poll at `GET /reports/{report_id}`; the background
+> job fills `storage_ref`/`generated_at` and flips `status` on completion. That is why the two
+> completion columns are nullable — a report that has not run yet cannot have them.
 
 ### 3.5 `investigation`
 

@@ -75,6 +75,11 @@ class CaseReportRead(BaseModel):
     report_id: UUID
     case_id: UUID
     report_type: str
-    storage_ref: str
+    # api-design.md §7's polling shape: a queued/running report has no object and no
+    # completion time yet, and `status` is what the client polls on.
+    status: str
+    storage_ref: str | None
     generated_by_user_id: UUID
-    generated_at: datetime
+    requested_at: datetime
+    generated_at: datetime | None
+    failure_reason: str | None

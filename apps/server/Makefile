@@ -10,8 +10,12 @@ PY := python
 export PYTHONUTF8 := 1
 export PYTHONIOENCODING := utf-8
 
-.PHONY: help install lint format typecheck lint-imports test check \
-        run-api run-worker migrate compose-up compose-down
+# Platform coverage floor — wave-1 §17's Tier-0 mandate, now met and enforced. Kept in one
+# place so the Makefile and .github/workflows/ci.yml agree.
+COVERAGE_FLOOR := 90
+
+.PHONY: help install lint format typecheck lint-imports test test-unit test-integration \
+        test-migrations hooks check run-api run-worker migrate compose-up compose-down
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -35,6 +39,18 @@ lint-imports: ## Enforce the module dependency DAG
 
 test: ## Run the test suite
 	pytest
+
+test-migrations: ## Prove every migration is reversible (upgrade head -> downgrade base)
+	pytest tests/integration/test_migrations.py -v
+
+test-unit: ## Unit suite + the platform coverage floor CI enforces
+	pytest tests/unit --cov=sentinelai.platform --cov-report=term-missing --cov-fail-under=$(COVERAGE_FLOOR)
+
+test-integration: ## Integration suite (needs Postgres/Redis/MinIO/Vault reachable)
+	pytest tests/integration -v
+
+hooks: ## Install the pre-commit hooks that mirror the CI gates
+	cd ../.. && pre-commit install
 
 check: lint typecheck lint-imports test ## All CI gates — a change is not done until this passes
 

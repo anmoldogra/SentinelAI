@@ -89,6 +89,8 @@ class _FakeReportRepo:
         self.store: dict[UUID, Any] = {}
 
     async def add(self, report: Any) -> None:
+        if getattr(report, "report_id", None) is None:  # mirror the real flush assigning the PK
+            report.report_id = uuid4()
         self.store[report.report_id] = report
 
     async def get_by_id(self, report_id: UUID) -> Any:
@@ -165,6 +167,11 @@ class _FakeEvidenceRepo:
     async def exists(self, evidence_id: UUID) -> bool:
         return evidence_id in self.store
 
+    async def has_replacement(self, evidence_id: UUID) -> bool:
+        return any(
+            getattr(e, "supersedes_evidence_id", None) == evidence_id for e in self.store.values()
+        )
+
     async def list_(
         self,
         *,
@@ -200,6 +207,12 @@ class _FakeCustodyRepo:
 
     async def last_entry(self, evidence_id: UUID) -> Any:
         evs = [e for e in self.items if e.evidence_id == evidence_id]
+        return max(evs, key=lambda e: e.sequence_number) if evs else None
+
+    async def last_of_types(self, evidence_id: UUID, event_types: Sequence[str]) -> Any:
+        evs = [
+            e for e in self.items if e.evidence_id == evidence_id and e.event_type in event_types
+        ]
         return max(evs, key=lambda e: e.sequence_number) if evs else None
 
 

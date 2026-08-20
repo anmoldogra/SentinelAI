@@ -3,8 +3,9 @@
 All business rules live here: the case lifecycle state machine, optimistic-concurrency
 ETag checks, evidence-link dedup, and report orchestration. Every mutation writes its
 outbox event in the SAME transaction as the business write (event-driven §16) and an
-audit entry (security §22), then commits once. Reads enforce ownership (defense in
-depth behind the HTTP ABAC guard).
+audit entry (security §22). **The service never commits** (ADR-0005): the entrypoint —
+router or job — owns the transaction and commits once on success. Reads enforce
+ownership (defense in depth behind the HTTP ABAC guard).
 
 Documented lifecycle (database-design.md §8 / api-design.md): ``open | closed |
 archived``, initial ``open``. Transition edges (``archived`` terminal, ``open↔closed``
@@ -15,9 +16,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 from fastapi import Depends
@@ -25,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.modules.case_management.events import (
     EVENT_CASE_CREATED,
+    EVENT_CASE_REPORT_GENERATED,
     EVENT_CASE_STATUS_CHANGED,
     EVENT_EVIDENCE_LINKED_TO_CASE,
     EVENT_EVIDENCE_UNLINKED_FROM_CASE,
@@ -33,10 +36,17 @@ from sentinelai.modules.case_management.exceptions import (
     CaseNotFoundError,
     EvidenceAlreadyLinkedError,
     EvidenceLinkNotFoundError,
-    InvalidCaseStatusTransitionError,
     ReportNotFoundError,
+    ReportNotReadyError,
 )
 from sentinelai.modules.case_management.models import (
+    REPORT_COMPLETED,
+    REPORT_FAILED,
+    REPORT_QUEUED,
+    REPORT_RUNNING,
+    STATUS_CLOSED,
+    STATUS_OPEN,
+    TRANSITIONS,
     Case,
     CaseEvidenceLink,
     CaseReport,
@@ -55,25 +65,24 @@ from sentinelai.modules.case_management.schemas import (
 )
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CaseAccessChecker, CurrentUser
+from sentinelai.platform.config import settings
 from sentinelai.platform.db.session import get_session
+from sentinelai.platform.storage import (
+    ObjectStorage,
+    build_object_uri,
+    get_object_storage,
+    parse_object_uri,
+)
 from sentinelai.platform.tasks import TaskQueue, get_task_queue
 from sentinelai.shared.exceptions import (
     ForbiddenError,
     PreconditionFailedError,
-    ValidationFailedError,
 )
 from sentinelai.shared.pagination import PageParams, decode_cursor, encode_cursor
 
-STATUS_OPEN = "open"
-STATUS_CLOSED = "closed"
-STATUS_ARCHIVED = "archived"
-VALID_STATUSES = frozenset({STATUS_OPEN, STATUS_CLOSED, STATUS_ARCHIVED})
-# Allowed transitions (see module docstring). archived is terminal.
-_TRANSITIONS: dict[str, frozenset[str]] = {
-    STATUS_OPEN: frozenset({STATUS_CLOSED, STATUS_ARCHIVED}),
-    STATUS_CLOSED: frozenset({STATUS_OPEN, STATUS_ARCHIVED}),
-    STATUS_ARCHIVED: frozenset(),
-}
+# The status vocabulary and machine belong to the Case aggregate (ADR-0011 §1, models.py);
+# re-exported here because they are part of this service's public vocabulary too.
+_TRANSITIONS = TRANSITIONS
 
 
 def case_etag(case: Case) -> str:
@@ -97,6 +106,11 @@ class CaseSearchFilters:
     text: str | None = None
 
 
+# Presigned URLs are short-lived bearer credentials (ADR-0008 §6, api-design.md §7's
+# "short-lived presigned URL"). Matches the evidence-download TTL.
+_PRESIGN_TTL_SECONDS = 900
+
+
 def _actor_role(actor: CurrentUser) -> str:
     return actor.roles[0] if actor.roles else "unknown"
 
@@ -104,8 +118,9 @@ def _actor_role(actor: CurrentUser) -> str:
 class CaseService:
     """Case lifecycle, evidence linking, status history, and report orchestration."""
 
-    def __init__(self, uow: CaseManagementUnitOfWork) -> None:
+    def __init__(self, uow: CaseManagementUnitOfWork, *, storage: ObjectStorage) -> None:
         self._uow = uow
+        self._storage = storage
 
     # -- internal helpers ---------------------------------------------------
     async def _load_owned(self, case_id: UUID, actor: CurrentUser) -> Case:
@@ -139,21 +154,10 @@ class CaseService:
         actor: CurrentUser,
         correlation_id: str,
     ) -> None:
-        if new_status not in VALID_STATUSES:
-            raise ValidationFailedError(
-                [{"field": "new_status", "message": f"unknown status '{new_status}'"}]
-            )
-        if new_status not in _TRANSITIONS[case.status]:
-            raise InvalidCaseStatusTransitionError(
-                f"cannot transition case from '{case.status}' to '{new_status}'"
-            )
-        previous = case.status
+        # The aggregate enforces the machine (ADR-0011 §1) — an illegal transition raises
+        # before any orchestration side effect below can run.
         now = datetime.now(UTC)
-        case.status = new_status
-        if new_status == STATUS_CLOSED:
-            case.closed_at = now
-        elif new_status == STATUS_OPEN:
-            case.closed_at = None
+        previous = case.transition_to(new_status, at=now)
 
         await self._uow.status_history.add(
             CaseStatusHistory(
@@ -173,6 +177,9 @@ class CaseService:
                 "case_id": str(case.case_id),
                 "previous_status": previous,
                 "new_status": new_status,
+                # The case's investigator — the recipient `notification` needs to act on this
+                # fact without a follow-up call (§18's thin-event rule, §25.7 catalog).
+                "owning_user_id": str(case.owning_user_id),
             },
             correlation_id=correlation_id,
             actor_type="user",
@@ -206,7 +213,6 @@ class CaseService:
             actor_ref=actor.user_id,
         )
         await self._audit(actor, EVENT_CASE_CREATED, case.case_id, {"title": case.title})
-        await self._uow.commit()
         return case
 
     async def update_case(
@@ -221,7 +227,6 @@ class CaseService:
         await self._uow.cases.add(case)  # flush the update
         # No `case.updated` event exists in the catalog (§25.7) — audit only.
         await self._audit(actor, "case.updated", case.case_id, {"fields": sorted(changes)})
-        await self._uow.commit()
         return case
 
     async def change_status(
@@ -229,21 +234,18 @@ class CaseService:
     ) -> Case:
         case = await self._load_owned(case_id, actor)
         await self._apply_transition(case, data.new_status, data.notes, actor, correlation_id)
-        await self._uow.commit()
         return case
 
     async def close_case(self, case_id: UUID, actor: CurrentUser, correlation_id: str) -> Case:
         """Convenience transition to ``closed`` (no dedicated endpoint — POST /status)."""
         case = await self._load_owned(case_id, actor)
         await self._apply_transition(case, STATUS_CLOSED, None, actor, correlation_id)
-        await self._uow.commit()
         return case
 
     async def reopen_case(self, case_id: UUID, actor: CurrentUser, correlation_id: str) -> Case:
         """Convenience transition back to ``open`` (only valid from ``closed``)."""
         case = await self._load_owned(case_id, actor)
         await self._apply_transition(case, STATUS_OPEN, None, actor, correlation_id)
-        await self._uow.commit()
         return case
 
     async def link_evidence(
@@ -276,7 +278,6 @@ class CaseService:
         await self._audit(
             actor, EVENT_EVIDENCE_LINKED_TO_CASE, case_id, {"evidence_id": str(data.evidence_id)}
         )
-        await self._uow.commit()
         return link
 
     async def unlink_evidence(
@@ -301,7 +302,6 @@ class CaseService:
         await self._audit(
             actor, EVENT_EVIDENCE_UNLINKED_FROM_CASE, case_id, {"evidence_id": str(evidence_id)}
         )
-        await self._uow.commit()
 
     async def generate_report(
         self,
@@ -310,20 +310,135 @@ class CaseService:
         actor: CurrentUser,
         correlation_id: str,
         task_queue: TaskQueue,
-    ) -> str:
-        """Enqueue async report generation (api-design.md §7/§2.12). Returns the job id.
+    ) -> CaseReport:
+        """Create the ``queued`` report row and enqueue its job (api-design.md §7/§2.12).
 
-        The ``case_reports`` row is written by the job on completion (its schema requires
-        a ``storage_ref``); this trigger only enqueues. The job itself is storage-blocked
-        (platform/storage.py not built) — flagged in the phase report.
+        The row IS the job's state (guide Part 12), so it is written *now* — not on completion —
+        giving the client something to poll at ``GET /reports/{report_id}`` immediately. The
+        enqueue happens after the insert so the job can never observe a row that does not exist
+        yet; it rides the same transaction the entrypoint commits (ADR-0005).
         """
         await self._load_owned(case_id, actor)
-        job = await task_queue.enqueue_job("generate_case_report", case_id)
-        await self._audit(
-            actor, "case.report_requested", case_id, {"report_type": data.report_type}
+        report = CaseReport(
+            case_id=case_id,
+            report_type=data.report_type,
+            storage_ref=None,
+            generated_by_user_id=actor.user_id,
+            generated_at=None,
+            status=REPORT_QUEUED,
+            requested_at=datetime.now(UTC),
+            failure_reason=None,
         )
-        await self._uow.commit()
-        return getattr(job, "job_id", "") if job is not None else ""
+        await self._uow.reports.add(report)
+        await task_queue.enqueue_job("generate_case_report", case_id, report.report_id)
+        await self._audit(
+            actor,
+            "case.report_requested",
+            case_id,
+            {"report_type": data.report_type, "report_id": str(report.report_id)},
+        )
+        return report
+
+    async def complete_report(
+        self, report_id: UUID, storage: ObjectStorage, correlation_id: str
+    ) -> CaseReport:
+        """Render the report, store it, and mark the row completed. Invoked by the worker job.
+
+        Phase 1 renders a JSON dump of the case, its evidence links, and its status history —
+        deliberately not a PDF. The object is streamed through the ``ObjectStorage`` port, so this
+        module never imports an S3 client, and the row is only marked ``completed`` after the
+        upload returns: a crash mid-upload leaves it ``running`` for arq to retry rather than
+        advertising a report that is not there.
+
+        Idempotent: an already-completed report is returned untouched, so a job redelivery neither
+        re-uploads nor re-publishes. Never commits (ADR-0005) — the job wrapper owns the
+        transaction.
+        """
+        report = await self._uow.reports.get_by_id(report_id)
+        if report is None:
+            raise ReportNotFoundError()
+        if report.status == REPORT_COMPLETED:
+            return report  # a retry of a finished job
+
+        case = await self._uow.cases.get_by_id(report.case_id)
+        if case is None:
+            raise CaseNotFoundError()
+
+        report.status = REPORT_RUNNING
+        document = await self._render_report(case, report)
+        payload = json.dumps(document, indent=2, sort_keys=True).encode()
+        bucket = settings.storage_bucket
+        key = f"reports/{report.case_id}/{report.report_id}.json"
+
+        async def _stream() -> AsyncIterator[bytes]:
+            yield payload
+
+        await storage.put_stream(bucket, key, _stream(), content_type="application/json")
+
+        report.storage_ref = build_object_uri(bucket, key)
+        report.generated_at = datetime.now(UTC)
+        report.status = REPORT_COMPLETED
+        report.failure_reason = None
+
+        await self._uow.outbox.publish(
+            event_type=EVENT_CASE_REPORT_GENERATED,
+            aggregate_type="case_report",
+            aggregate_id=report.report_id,
+            payload={
+                "case_id": str(report.case_id),
+                "report_id": str(report.report_id),
+                # The requester — the recipient `notification` alerts (§25.7).
+                "requested_by_user_id": str(report.generated_by_user_id),
+            },
+            correlation_id=correlation_id,
+            actor_type="system",
+        )
+        return report
+
+    async def _render_report(self, case: Case, report: CaseReport) -> dict[str, Any]:
+        """Assemble the Phase-1 JSON document: the case, its evidence links, its status history."""
+        links = await self._uow.evidence_links.list_for_case(case.case_id)
+        history = await self._uow.status_history.list_for_case(case.case_id)
+        return {
+            "report": {
+                "report_id": str(report.report_id),
+                "report_type": report.report_type,
+                "generated_at": datetime.now(UTC).isoformat(),
+            },
+            "case": {
+                "case_id": str(case.case_id),
+                "title": case.title,
+                "description": case.description,
+                "status": case.status,
+                "owning_user_id": str(case.owning_user_id),
+                "created_at": case.created_at.isoformat(),
+                "closed_at": case.closed_at.isoformat() if case.closed_at else None,
+            },
+            "evidence": [
+                {
+                    "evidence_id": str(link.evidence_id),
+                    "linked_by_user_id": str(link.linked_by_user_id),
+                    "linked_at": link.linked_at.isoformat(),
+                }
+                for link in links
+            ],
+            "status_history": [
+                {
+                    "previous_status": entry.previous_status,
+                    "new_status": entry.new_status,
+                    "changed_at": entry.changed_at.isoformat(),
+                    "notes": entry.notes,
+                }
+                for entry in history
+            ],
+        }
+
+    async def fail_report(self, report_id: UUID, reason: str) -> None:
+        """Record that generation failed, so a client polling the row learns why (§7)."""
+        report = await self._uow.reports.get_by_id(report_id)
+        if report is not None and report.status != REPORT_COMPLETED:
+            report.status = REPORT_FAILED
+            report.failure_reason = reason
 
     # -- queries ------------------------------------------------------------
     async def get_case(self, case_id: UUID, actor: CurrentUser) -> Case:
@@ -389,10 +504,34 @@ class CaseService:
         return report
 
     async def get_report_download_url(self, report_id: UUID, actor: CurrentUser) -> str:
-        """Return the report's object-storage reference. Presigning requires the storage
-        client (platform/storage.py, not yet built) — flagged in the phase report."""
+        """Return a short-lived presigned GET URL for a completed report (api-design.md §7).
+
+        A report leaving the system is disclosure-significant, so generating the URL writes a
+        ``platform.audit_log`` entry — the audit records the *intent to disclose* at the moment
+        the credential is minted, which is the only moment the platform can observe; the
+        subsequent fetch goes straight to object storage and never touches this process.
+
+        Presigning happens before the audit write: if the audit write fails the transaction rolls
+        back and the URL is never returned to the caller, so no un-audited credential escapes.
+        The URL itself is never logged or audited — it is a bearer credential (ADR-0008 §6).
+
+        A report that has not finished has no object to point at and is refused (409).
+        """
         report = await self.get_report(report_id, actor)
-        return report.storage_ref
+        if report.status != REPORT_COMPLETED or not report.storage_ref:
+            raise ReportNotReadyError(f"report is '{report.status}', not completed")
+
+        bucket, key = parse_object_uri(report.storage_ref)
+        url = await self._storage.presigned_download_url(
+            bucket, key, expires_in=_PRESIGN_TTL_SECONDS
+        )
+        await self._audit(
+            actor,
+            "case.report_downloaded",
+            report_id,
+            {"report_type": report.report_type, "case_id": str(report.case_id)},
+        )
+        return url
 
 
 def _normalize_etag(value: str) -> str:
@@ -421,9 +560,10 @@ class DbCaseAccessChecker:
 
 def get_case_service(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
+    storage: ObjectStorage = Depends(get_object_storage),
 ) -> CaseService:
     """FastAPI dependency constructing a ``CaseService`` on a request-scoped UoW."""
-    return CaseService(uow)
+    return CaseService(uow, storage=storage)
 
 
 def provide_case_access_checker(session: AsyncSession = Depends(get_session)) -> CaseAccessChecker:

@@ -44,9 +44,12 @@ from sentinelai.modules.threat_intel.router import router as threat_intel_router
 from sentinelai.platform.auth.dependencies import get_case_access_checker
 from sentinelai.platform.config import settings
 from sentinelai.platform.crypto import HealthState, KmsUnavailable, create_kms
-from sentinelai.platform.db.session import async_session_factory, dispose_engine
+from sentinelai.platform.db.session import async_session_factory, dispose_engine, engine
 from sentinelai.platform.events.dispatcher import EventDispatcher
 from sentinelai.platform.logging import configure_logging, log
+from sentinelai.platform.migrations.currency import check_migrations_current
+from sentinelai.platform.security.scanner import build_malware_scanner
+from sentinelai.platform.storage import build_object_storage
 
 # Registered in database-design.md §5 DAG order.
 _MODULE_ROUTERS = (
@@ -93,6 +96,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.task_queue = None
         log.warning("task_queue_unavailable_at_startup")
 
+    # Object storage (ADR-0008) + the §25 malware scanner: built once for the process.
+    # Construction is local (a session + credentials) and opens no connection, so it cannot fail
+    # on an unreachable endpoint; errors surface on the paths that actually use them.
+    app.state.object_storage = build_object_storage(settings)
+    app.state.malware_scanner = build_malware_scanner(settings)
+
+    # Bucket bootstrap (ADR-0008 §2, wave-1 W1-07): both buckets must exist before an upload is
+    # reserved into quarantine or an object is promoted. `ensure_bucket` is idempotent. Fails
+    # CLOSED in production — same posture as the KMS check below; outside production the process
+    # still serves, but `/startupz` keeps reporting 503 so the degraded start is never silent.
+    buckets_ready = False
+    try:
+        for bucket in (settings.storage_quarantine_bucket, settings.storage_bucket):
+            await app.state.object_storage.ensure_bucket(bucket)
+        buckets_ready = True
+    except Exception as exc:
+        log.error("object_storage_bucket_bootstrap_failed", error=type(exc).__name__)
+        if settings.is_production:
+            raise
+
     # KMS (ADR-0009): construct + verify reachability. Fail CLOSED in production — a signing
     # subsystem that cannot reach its keys must not serve requests that would need to sign.
     app.state.kms = create_kms(settings)
@@ -102,6 +125,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.error("kms_unavailable_at_startup", detail=kms_health.detail)
         if settings.is_production:
             raise KmsUnavailable(f"KMS unavailable at startup: {kms_health.detail}")
+
+    # Migration currency (wave-1 §9, W1-11): serving against a schema the code does not match is
+    # a correctness hazard, so it gates `/startupz`. Never fatal — migrations are applied by the
+    # ArgoCD PreSync job, and during a rolling deploy a new pod can legitimately start moments
+    # before that job finishes; failing the startup probe holds traffic until it catches up.
+    migrations_current = False
+    try:
+        migration_status = await check_migrations_current(engine)
+        migrations_current = migration_status.is_current
+        if not migrations_current:
+            log.error("database_schema_stale", schemas=migration_status.summary())
+    except Exception as exc:
+        log.error("migration_currency_check_failed", error=type(exc).__name__)
+
+    # Startup gate (wave-1 W1-11): `/startupz` reports 503 until every critical step actually
+    # succeeded. Reaching this line means config validated and the process is running; the gate
+    # additionally requires KMS reachability, the buckets, and a current schema, so a degraded
+    # start is visible to Kubernetes rather than silently admitted.
+    kms_started = kms_health.state != HealthState.UNAVAILABLE
+    app.state.startup = {
+        "config_validated": True,
+        "kms_started": kms_started,
+        "buckets_ready": buckets_ready,
+        "migrations_current": migrations_current,
+        "complete": kms_started and buckets_ready and migrations_current,
+    }
+    log.info("http_startup_complete", **app.state.startup)
 
     try:
         yield

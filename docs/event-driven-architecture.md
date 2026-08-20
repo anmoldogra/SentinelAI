@@ -178,7 +178,7 @@ Every event type carries its own `event_version` (semver), independent of the CE
 |---|---|---|
 | `evidence.ingested` | `category`, `artifact_type`, `title`, `collected_at` — enough for a consumer to decide *whether* it cares | `attributes` (may be large/sensitive) — a consumer that needs it calls `GET /evidence/{evidence_id}` |
 | `investigation.finding_reviewed` | `relationship_id`, `disposition`, `reviewed_by` | The full relationship object and its `supporting_evidence_ids[]` — fetched via `GET /relationships/{id}` if needed |
-| `case.status_changed` | `case_id`, `previous_status`, `new_status` | Case title/description — irrelevant to most consumers, which only need to know a transition happened |
+| `case.status_changed` | `case_id`, `previous_status`, `new_status`, `owning_user_id` (the recipient `notification` alerts) | Case title/description — irrelevant to most consumers, which only need to know a transition happened |
 
 ## 9. Event Envelope Format
 
@@ -545,6 +545,7 @@ The complete published/consumed event inventory per module. "Idempotency Key" in
 | `evidence.ingested` | `POST /evidence` commits (CEM §13 validation passes) | `evidence_id`, `category`, `artifact_type`, `collected_at`, `collector_user_id` | `threat_intel`, `investigation` | Standard |
 | `evidence.superseded` | `POST /evidence/{id}/supersede` commits | `evidence_id` (original), `supersedes_by_evidence_id` | `investigation` | Standard |
 | `evidence.validation_failed` | A submitted evidence object fails CEM §13 validation | `intake_id`, `errors[]` | none registered today (dashboard/ops use) | Best-effort |
+| `evidence.scanned` | The `scan_uploaded_evidence` job completes a malware scan of a quarantined payload — published on **every** outcome (clean, blocked, or promoted under §25's forensic exception), never only on failure (§25: "every scan result — clean or not — is logged") | `evidence_id`, `category`, `is_clean`, `detection_name` (null when clean), `promoted`, `forensic_exception`, `engine`, `collector_user_id` (the uploading analyst — the recipient a consumer needs, §18) | `notification` | Standard |
 
 **Consumed:** none — `ingestion` is a pure publisher in Phase 1, triggered by direct API/interface calls, not by other modules' events.
 
@@ -603,10 +604,10 @@ The complete published/consumed event inventory per module. "Idempotency Key" in
 | Event | Trigger | Payload (key fields) | Consumers | Retry Policy |
 |---|---|---|---|---|
 | `case.created` | `POST /cases` commits | `case_id`, `owning_user_id` | none registered today | Standard |
-| `case.status_changed` | `POST /cases/{id}/status` commits | `case_id`, `previous_status`, `new_status` | `notification` | Standard |
+| `case.status_changed` | `POST /cases/{id}/status` commits | `case_id`, `previous_status`, `new_status`, `owning_user_id` | `notification` | Standard |
 | `evidence.linked_to_case` | `POST /cases/{id}/evidence` commits | `case_id`, `evidence_id` | `investigation` | Standard |
 | `evidence.unlinked_from_case` | `DELETE /cases/{id}/evidence/{evidence_id}` commits | `case_id`, `evidence_id` | `investigation` | Standard |
-| `case.report_generated` | Report generation job (`api-design.md` §7) completes | `case_id`, `report_id` | `notification` | Critical-fast |
+| `case.report_generated` | Report generation job (`api-design.md` §7) completes | `case_id`, `report_id`, `requested_by_user_id` (the recipient; the job — still deferred — must supply it) | `notification` | Critical-fast |
 
 **Consumed**
 
@@ -621,7 +622,7 @@ The complete published/consumed event inventory per module. "Idempotency Key" in
 | Event | Trigger | Payload (key fields) | Consumers | Retry Policy |
 |---|---|---|---|---|
 | `investigation.correlation_run_completed` / `_failed` | An AI correlation run finishes | `run_id`, `case_id`, `findings_generated_count` | `notification` | Standard |
-| `investigation.correlation_generated` | A new proposed entity/relationship is created | `case_id`, `relationship_id` or `entity_id`, `confidence` | `notification` | Standard |
+| `investigation.correlation_generated` | A new proposed entity/relationship is created | `case_id`, `relationship_id` or `entity_id`, `confidence`, `recipient_user_id` (the case owner, supplied by the correlation job) | `notification` | Standard |
 | `investigation.finding_reviewed` | An analyst confirms/rejects a proposed finding | `case_id`, `relationship_id`, `disposition`, `reviewed_by` | `case_management` | Standard |
 
 **Consumed**
@@ -649,6 +650,7 @@ The complete published/consumed event inventory per module. "Idempotency Key" in
 | `investigation.correlation_generated` | `investigation` | Create and dispatch a notification to the case's assigned investigator(s) | `(recipient_user_id, source_module='investigation', source_reference_id=relationship_id)` — **the tightest idempotency key in the catalog**, since a replayed event must never re-send an email the analyst already received (Section 19) | Critical-fast |
 | `case.status_changed` | `case_management` | Notify assigned investigator(s) of the transition | `(recipient_user_id, source_reference_id=case_id, new_status)` | Critical-fast |
 | `case.report_generated` | `case_management` | Notify the requester the report is ready for download | `(recipient_user_id, source_reference_id=report_id)` | Critical-fast |
+| `evidence.scanned` | `ingestion` | Notify the uploading analyst that a malware detection **blocked** promotion (security-architecture §25). Clean scans and forensic-exception promotions are consumed and ignored — no notification | `(recipient_user_id, source_module='ingestion', source_reference_id=evidence_id)` | Critical-fast |
 
 ## 26. Complete Event Lifecycle
 

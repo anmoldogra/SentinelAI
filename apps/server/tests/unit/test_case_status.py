@@ -4,15 +4,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from sentinelai.modules.case_management.service import (
-    _TRANSITIONS,
+from sentinelai.modules.case_management.models import (
     STATUS_ARCHIVED,
     STATUS_CLOSED,
     STATUS_OPEN,
     VALID_STATUSES,
-    _normalize_etag,
-    case_etag,
 )
+from sentinelai.modules.case_management.models import (
+    TRANSITIONS as _TRANSITIONS,
+)
+from sentinelai.modules.case_management.service import _normalize_etag, case_etag
 
 
 def test_documented_states() -> None:

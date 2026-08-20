@@ -23,6 +23,9 @@ _PROD_OK: dict[str, object] = {
     "storage_access_key": "a-real-injected-access-key",
     "storage_secret_key": "a-real-injected-secret-key",
     "vault_token": "a-real-injected-vault-token",
+    # security-architecture §25: a production profile must name a real scan engine — the
+    # dummy scanner would satisfy the promotion gate while scanning nothing.
+    "malware_scanner_provider": "clamav",
 }
 
 
@@ -103,6 +106,16 @@ def test_classified_rejects_non_hardware_kms() -> None:
         _settings(
             **{**_PROD_OK, "app_env": "classified", "kms_provider": "dev"}
         ).validate_for_profile()
+
+
+def test_production_rejects_the_dummy_malware_scanner() -> None:
+    # A no-op scanner in production would silently satisfy §25's promotion gate.
+    with pytest.raises(ConfigurationError, match="MALWARE_SCANNER_PROVIDER"):
+        _settings(**{**_PROD_OK, "malware_scanner_provider": "dummy"}).validate_for_profile()
+
+
+def test_development_permits_the_dummy_malware_scanner() -> None:
+    _settings(app_env="development", malware_scanner_provider="dummy").validate_for_profile()
 
 
 def test_classified_accepts_pkcs11() -> None:

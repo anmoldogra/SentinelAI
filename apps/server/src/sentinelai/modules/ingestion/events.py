@@ -15,6 +15,7 @@ SCHEMA = "ingestion"
 EVENT_EVIDENCE_INGESTED = "evidence.ingested"
 EVENT_EVIDENCE_SUPERSEDED = "evidence.superseded"
 EVENT_EVIDENCE_VALIDATION_FAILED = "evidence.validation_failed"
+EVENT_EVIDENCE_SCANNED = "evidence.scanned"
 
 
 def register_consumers(dispatcher: EventDispatcher) -> None:

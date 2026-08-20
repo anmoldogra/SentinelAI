@@ -14,6 +14,7 @@ from uuid import UUID
 from fastapi import Depends
 from sqlalchemy import or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from sentinelai.modules.ingestion.models import (
     AttributeSchemaRegistry,
@@ -49,6 +50,15 @@ class EvidenceRepository:
         )
         return result.scalar_one_or_none() is not None
 
+    async def has_replacement(self, evidence_id: UUID) -> bool:
+        """Whether a replacement row supersedes ``evidence_id`` (derived `status`, ADR-0015)."""
+        result = await self._session.execute(
+            select(Evidence.evidence_id)
+            .where(Evidence.supersedes_evidence_id == evidence_id)
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     async def list_(
         self,
         *,
@@ -66,7 +76,18 @@ class EvidenceRepository:
         if artifact_type is not None:
             stmt = stmt.where(Evidence.artifact_type == artifact_type)
         if status is not None:
-            stmt = stmt.where(Evidence.status == status)
+            # `status` is derived, not stored (ADR-0015): `superseded` means a replacement row
+            # exists; the genesis column only distinguishes the remaining values.
+            replacement = aliased(Evidence)
+            superseded = (
+                select(replacement.evidence_id)
+                .where(replacement.supersedes_evidence_id == Evidence.evidence_id)
+                .exists()
+            )
+            if status == "superseded":
+                stmt = stmt.where(superseded)
+            else:
+                stmt = stmt.where(Evidence.status == status, ~superseded)
         if text:
             like = f"%{text}%"
             stmt = stmt.where(or_(Evidence.title.ilike(like), Evidence.description.ilike(like)))
@@ -101,6 +122,22 @@ class CustodyEventRepository:
         result = await self._session.execute(
             select(EvidenceCustodyEvent)
             .where(EvidenceCustodyEvent.evidence_id == evidence_id)
+            .order_by(EvidenceCustodyEvent.sequence_number.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def last_of_types(
+        self, evidence_id: UUID, event_types: Sequence[str]
+    ) -> EvidenceCustodyEvent | None:
+        """Latest ledger entry of the given types — the derivation primitive for ADR-0015
+        (`legal_hold` from hold events, `integrity_verification_status` from reverifications)."""
+        result = await self._session.execute(
+            select(EvidenceCustodyEvent)
+            .where(
+                EvidenceCustodyEvent.evidence_id == evidence_id,
+                EvidenceCustodyEvent.event_type.in_(event_types),
+            )
             .order_by(EvidenceCustodyEvent.sequence_number.desc())
             .limit(1)
         )

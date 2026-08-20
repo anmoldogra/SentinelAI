@@ -38,7 +38,7 @@ async def test_create_entity_is_confirmed_by_analyst(inv_uow, actor) -> None:
     )
     assert entity.status == "confirmed"
     assert entity.created_by_type == "analyst"
-    assert inv_uow.commits == 1
+    assert inv_uow.commits == 0  # ADR-0005: the entrypoint, not the service, commits
 
 
 async def test_review_relationship_confirm(inv_uow, actor) -> None:

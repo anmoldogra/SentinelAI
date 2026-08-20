@@ -1,0 +1,72 @@
+# Local fast-fail mirror of the CI gates (implementation-wave-1.md §18).
+#
+# Every hook here corresponds to a gate in .github/workflows/ci.yml, so a failure surfaces at
+# commit time instead of ten minutes into a PR run. Hooks that need the project's own
+# dependencies (mypy, import-linter) run with `language: system` against the developer's
+# virtualenv rather than an isolated pre-commit env — an isolated env would need the whole
+# dependency tree reinstalled and would drift from what CI actually type-checks.
+#
+# Install once:  pre-commit install
+# Run manually:  pre-commit run --all-files
+
+default_language_version:
+  python: python3.13
+
+exclude: '^apps/server/\.venv/'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      # Evidence payloads and forensic images belong in object storage, never in git.
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+
+  # ruff replaces black here: `ruff format` is the formatter (wave-1 §18 — this is the frozen
+  # stack's decision, not a new one), so there is no separate black dependency.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^apps/server/(src|tests)/
+      - id: ruff-format
+        files: ^apps/server/(src|tests)/
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: [--baseline, .secrets.baseline]
+        # .env.example carries deliberate placeholder credentials (minioadmin, dev tokens);
+        # they are documentation, not secrets, and must not trip the scanner.
+        exclude: '\.env\.example$|^apps/server/\.venv/'
+
+  # Project-dependency hooks: system language, run from apps/server so they see pyproject.toml.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict)
+        entry: bash -c 'cd apps/server && mypy src'
+        language: system
+        types: [python]
+        files: ^apps/server/src/
+        pass_filenames: false
+
+      - id: import-linter
+        name: import-linter (module DAG + platform boundary)
+        entry: bash -c 'cd apps/server && lint-imports'
+        language: system
+        types: [python]
+        files: ^apps/server/src/
+        pass_filenames: false

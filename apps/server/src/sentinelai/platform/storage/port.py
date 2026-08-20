@@ -5,6 +5,9 @@ deployment can move MinIO ↔ S3 by configuration alone. Everything here is **st
 object is never fully buffered in memory — uploads take an async byte stream (chunked internally as
 a multipart upload), downloads yield an async byte stream.
 
+Failures surface as the provider-neutral taxonomy in ``storage/exceptions.py`` (``StorageError`` and
+friends) — never as a botocore exception, so no consumer has to import an S3 client to handle one.
+
 This foundation deliberately contains only generic blob operations. The evidence-specific flow
 (quarantine → scan → promote → WORM, envelope encryption, integrity hashing) is layered *on top* of
 this port by later increments (ADR-0008 §2-5, ADR-0009, ADR-0003) — not here.
@@ -62,11 +65,28 @@ class ObjectStorage(Protocol):
         ...
 
     def get_stream(self, bucket: str, key: str) -> AsyncIterator[bytes]:
-        """Return an async byte-stream of ``bucket/key`` (consumed lazily, never fully buffered)."""
+        """Return an async byte-stream of ``bucket/key`` (consumed lazily, never fully buffered).
+
+        Raises ``ObjectNotFound`` when the stream is first consumed, not when it is created.
+        """
         ...
 
     async def head(self, bucket: str, key: str) -> ObjectHead:
-        """Return object metadata; raises ``KeyError`` if the object does not exist."""
+        """Return object metadata; raises ``ObjectNotFound`` if the object does not exist."""
+        ...
+
+    async def exists(self, bucket: str, key: str) -> bool:
+        """Return whether ``bucket/key`` exists, without transferring the object's bytes."""
+        ...
+
+    async def copy_object(
+        self, source_bucket: str, source_key: str, dest_bucket: str, dest_key: str
+    ) -> None:
+        """Copy an object **server-side** — the bytes never transit this process.
+
+        Used to promote an object between buckets (ADR-0008 §2). Raises ``ObjectNotFound`` if the
+        source does not exist. Overwrites the destination if present.
+        """
         ...
 
     async def delete(self, bucket: str, key: str) -> None:

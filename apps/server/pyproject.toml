@@ -18,6 +18,9 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29",
+    # Alembic runs synchronously: migrations/env.py rewrites the app's `+asyncpg` URL to
+    # `+psycopg`, so the sync driver is required wherever migrations are applied.
+    "psycopg[binary]>=3.1",
     "alembic>=1.13",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
@@ -47,6 +50,9 @@ dev = [
     "import-linter>=2.0",
     "factory-boy>=3.3",
     "asgi-lifespan>=2.1",
+    # Runs the CI gates locally at commit time (.pre-commit-config.yaml, wave-1 §18).
+    "pre-commit>=3.7",
+    "detect-secrets>=1.5",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -110,6 +116,17 @@ ignore_missing_imports = true
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------
+[tool.coverage.run]
+# Alembic environment scripts and revision files are executed by Alembic's own runtime, not
+# imported by the application: env.py runs module-level side effects against a live migration
+# context, and revisions are exercised end-to-end by tests/integration/test_migrations.py's
+# upgrade-head -> downgrade-base round trip. Measuring them as library code would report
+# coverage the unit suite structurally cannot provide.
+omit = [
+    "*/migrations/env.py",
+    "*/migrations/versions/*",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

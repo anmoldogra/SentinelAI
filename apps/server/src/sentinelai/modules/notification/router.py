@@ -1,4 +1,9 @@
-"""notification HTTP routes — api-design.md §8. Parse and delegate only."""
+"""notification HTTP routes — api-design.md §8. Parse and delegate only.
+
+The entrypoint owns the transaction (ADR-0005): mutating endpoints commit the request-scoped
+UnitOfWork once after the service returns — the SAME instance the service was built on, via
+FastAPI's per-request dependency cache.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Request, status
 
+from sentinelai.modules.notification.repository import (
+    NotificationUnitOfWork,
+    get_notification_uow,
+)
 from sentinelai.modules.notification.schemas import (
     NotificationRead,
     NotificationRuleCreate,
@@ -31,10 +40,10 @@ async def list_notifications(
     current_user: CurrentUser = Depends(get_current_user),
     service: NotificationService = Depends(get_notification_service),
 ) -> ListEnvelope[NotificationRead]:
-    items = await service.list_notifications(current_user, page)
+    items, next_cursor, has_more = await service.list_notifications(current_user, page)
     return ListEnvelope(
         data=[NotificationRead.model_validate(i) for i in items],
-        pagination=Pagination(next_cursor=None, has_more=False, limit=page.limit),
+        pagination=Pagination(next_cursor=next_cursor, has_more=has_more, limit=page.limit),
         meta=_meta(request),
     )
 
@@ -45,8 +54,10 @@ async def mark_notification_read(
     request: Request,
     current_user: CurrentUser = Depends(get_current_user),
     service: NotificationService = Depends(get_notification_service),
+    uow: NotificationUnitOfWork = Depends(get_notification_uow),
 ) -> Envelope[NotificationRead]:
     notification = await service.mark_read(notification_id, current_user)
+    await uow.commit()  # ADR-0005: the entrypoint owns the transaction
     return Envelope(data=NotificationRead.model_validate(notification), meta=_meta(request))
 
 

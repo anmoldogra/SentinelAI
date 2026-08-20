@@ -12,6 +12,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 
+from sentinelai.modules.investigation.repository import (
+    InvestigationUnitOfWork,
+    get_investigation_uow,
+)
 from sentinelai.modules.investigation.schemas import (
     CorrelationRunRead,
     EntityCreate,
@@ -65,8 +69,10 @@ async def create_entity(
     response: Response,
     current_user: CurrentUser = Depends(require_role("investigator")),
     service: InvestigationService = Depends(get_investigation_service),
+    uow: InvestigationUnitOfWork = Depends(get_investigation_uow),
 ) -> Envelope[EntityRead]:
     entity = await service.create_entity(payload, current_user, request.state.correlation_id)
+    await uow.commit()  # ADR-0005: the entrypoint owns the transaction
     response.headers["ETag"] = entity_etag(entity)
     return Envelope(data=EntityRead.model_validate(entity), meta=_meta(request))
 
@@ -93,10 +99,12 @@ async def review_entity_status(
     if_match: str = Header(..., alias="If-Match"),
     current_user: CurrentUser = Depends(require_role("investigator")),
     service: InvestigationService = Depends(get_investigation_service),
+    uow: InvestigationUnitOfWork = Depends(get_investigation_uow),
 ) -> Envelope[EntityRead]:
     entity = await service.review_entity_status(
         entity_id, payload.status, current_user, request.state.correlation_id, if_match
     )
+    await uow.commit()
     response.headers["ETag"] = entity_etag(entity)
     return Envelope(data=EntityRead.model_validate(entity), meta=_meta(request))
 
@@ -172,6 +180,7 @@ async def review_relationship_status(
     if_match: str = Header(..., alias="If-Match"),
     current_user: CurrentUser = Depends(require_role("investigator")),
     service: InvestigationService = Depends(get_investigation_service),
+    uow: InvestigationUnitOfWork = Depends(get_investigation_uow),
 ) -> Envelope[RelationshipRead]:
     relationship = await service.review_relationship_status(
         relationship_id,
@@ -181,6 +190,7 @@ async def review_relationship_status(
         request.state.correlation_id,
         if_match,
     )
+    await uow.commit()
     response.headers["ETag"] = relationship_etag(relationship)
     return Envelope(data=RelationshipRead.model_validate(relationship), meta=_meta(request))
 
@@ -215,10 +225,12 @@ async def trigger_correlation_run(
     current_user: CurrentUser = Depends(require_case_access()),
     service: InvestigationService = Depends(get_investigation_service),
     task_queue: TaskQueue = Depends(get_task_queue),
+    uow: InvestigationUnitOfWork = Depends(get_investigation_uow),
 ) -> Envelope[CorrelationRunRead]:
     run = await service.trigger_correlation_run(
         case_id, current_user, request.state.correlation_id, task_queue
     )
+    await uow.commit()
     return Envelope(data=CorrelationRunRead.model_validate(run), meta=_meta(request))
 
 

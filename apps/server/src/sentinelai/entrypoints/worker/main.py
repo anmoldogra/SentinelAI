@@ -24,6 +24,8 @@ from sentinelai.platform.config import settings
 from sentinelai.platform.crypto import create_kms
 from sentinelai.platform.db.session import async_session_factory, dispose_engine, engine
 from sentinelai.platform.logging import configure_logging, log
+from sentinelai.platform.security.scanner import build_malware_scanner
+from sentinelai.platform.storage import build_object_storage
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
@@ -34,6 +36,9 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     ctx["session_factory"] = async_session_factory
     ctx["kms"] = create_kms(settings)  # ADR-0009: jobs sign/verify/encrypt via the KMS facade
     await ctx["kms"].start()
+    # ADR-0008: object storage + the §25 malware scanner, built once per worker process.
+    ctx["object_storage"] = build_object_storage(settings)
+    ctx["malware_scanner"] = build_malware_scanner(settings)
     log.info("worker_startup", env=settings.app_env)
 
 

@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 from sentinelai.entrypoints.http.main import create_app
 from sentinelai.modules.ingestion.service import EvidenceService, get_evidence_service
 from sentinelai.platform.auth.dependencies import CurrentUser, get_current_user
+from tests.fixtures.fake_object_storage import FakeObjectStorage
 
 
 def _app(ing_uow) -> object:
@@ -16,7 +17,9 @@ def _app(ing_uow) -> object:
     app = create_app()
     user = CurrentUser(user_id=uuid4(), roles=("investigator",))
     app.dependency_overrides[get_current_user] = lambda: user
-    app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(ing_uow)
+    app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(
+        ing_uow, storage=FakeObjectStorage()
+    )
     return app
 
 
@@ -48,7 +51,9 @@ async def test_ingest_unregistered_schema_returns_422(ing_uow) -> None:
     app = create_app()  # registry NOT seeded
     user = CurrentUser(user_id=uuid4(), roles=("investigator",))
     app.dependency_overrides[get_current_user] = lambda: user
-    app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(ing_uow)
+    app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(
+        ing_uow, storage=FakeObjectStorage()
+    )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post("/api/v1/evidence", json=_BODY)
     assert resp.status_code == 422

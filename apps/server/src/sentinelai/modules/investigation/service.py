@@ -130,7 +130,6 @@ class InvestigationService:
         )
         await self._uow.entities.add(entity)
         await self._audit(actor, "entity.created", entity.entity_id, {"type": data.entity_type})
-        await self._uow.commit()
         return entity
 
     async def get_entity(self, entity_id: UUID, actor: CurrentUser) -> Entity:
@@ -177,7 +176,6 @@ class InvestigationService:
         # No entity-review event is documented (§25.8's finding_reviewed is relationship-
         # specific); audit only.
         await self._audit(actor, "entity.reviewed", entity_id, {"disposition": disposition})
-        await self._uow.commit()
         return entity
 
     async def list_entity_relationships(
@@ -205,9 +203,17 @@ class InvestigationService:
         evidence_ids: Sequence[UUID],
         created_by_ref: UUID,
         correlation_id: str,
+        case_owner_user_id: UUID | None = None,
     ) -> Relationship:
         """Persist an AI-proposed relationship + its mandatory supporting evidence
-        (CEM §13, ≥1) and announce it. Called by the correlation job (deferred)."""
+        (CEM §13, ≥1) and announce it. Called by the correlation job (deferred).
+
+        ``case_owner_user_id`` is the investigator to notify (§25.8's ``recipient_user_id``).
+        It is a parameter rather than a lookup because this module must not reach into
+        ``case_management`` on a write path; the correlation job already loads the case to
+        select its eligible evidence, so it has the owner to hand. Omitting it publishes the
+        event without a recipient, and the notification consumer ignores it rather than failing.
+        """
         if not evidence_ids:
             raise ValidationFailedError(
                 [
@@ -242,6 +248,9 @@ class InvestigationService:
                 "case_id": str(case_id),
                 "relationship_id": str(relationship.relationship_id),
                 "confidence": str(confidence),
+                "recipient_user_id": (
+                    str(case_owner_user_id) if case_owner_user_id is not None else None
+                ),
             },
             correlation_id=correlation_id,
             actor_type="system",
@@ -311,7 +320,6 @@ class InvestigationService:
         await self._audit(
             actor, EVENT_FINDING_REVIEWED, relationship_id, {"disposition": disposition}
         )
-        await self._uow.commit()
         return relationship
 
     async def list_relationship_evidence(
@@ -335,7 +343,6 @@ class InvestigationService:
         await self._uow.correlation_runs.add(run)
         await task_queue.enqueue_job("run_correlation", run.run_id)
         await self._audit(actor, "correlation.requested", run.run_id, {"case_id": str(case_id)})
-        await self._uow.commit()
         return run
 
     async def get_correlation_run(self, run_id: UUID, actor: CurrentUser) -> CorrelationRun:

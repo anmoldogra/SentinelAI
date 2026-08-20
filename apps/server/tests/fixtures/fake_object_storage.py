@@ -11,6 +11,7 @@ import hashlib
 from collections.abc import AsyncIterator, Sequence
 from uuid import uuid4
 
+from sentinelai.platform.storage.exceptions import ObjectNotFound
 from sentinelai.platform.storage.port import CompletedPart, ObjectHead
 
 
@@ -37,20 +38,33 @@ class FakeObjectStorage:
 
     async def get_stream(self, bucket: str, key: str) -> AsyncIterator[bytes]:
         if (bucket, key) not in self._objects:
-            raise KeyError(f"{bucket}/{key}")
+            raise ObjectNotFound(f"{bucket}/{key}")
         blob = self._objects[(bucket, key)]
         for i in range(0, max(len(blob), 1), 1024):
             yield blob[i : i + 1024]
 
     async def head(self, bucket: str, key: str) -> ObjectHead:
         if (bucket, key) not in self._objects:
-            raise KeyError(f"{bucket}/{key}")
+            raise ObjectNotFound(f"{bucket}/{key}")
         blob = self._objects[(bucket, key)]
         return ObjectHead(
             size=len(blob),
             etag=hashlib.md5(blob).hexdigest(),
             content_type=self._content_types.get((bucket, key)),
             last_modified=None,
+        )
+
+    async def exists(self, bucket: str, key: str) -> bool:
+        return (bucket, key) in self._objects
+
+    async def copy_object(
+        self, source_bucket: str, source_key: str, dest_bucket: str, dest_key: str
+    ) -> None:
+        if (source_bucket, source_key) not in self._objects:
+            raise ObjectNotFound(f"{source_bucket}/{source_key}")
+        self._objects[(dest_bucket, dest_key)] = self._objects[(source_bucket, source_key)]
+        self._content_types[(dest_bucket, dest_key)] = self._content_types.get(
+            (source_bucket, source_key)
         )
 
     async def delete(self, bucket: str, key: str) -> None:

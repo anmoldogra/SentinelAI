@@ -74,8 +74,29 @@ class Settings(BaseSettings):
     # --- object storage (evidence blobs) ---
     storage_endpoint_url: str = "http://localhost:9000"
     storage_bucket: str = "sentinelai-evidence"
+    # Uploads land here first and are never served (ADR-0008 §2). Promotion into
+    # ``storage_bucket`` happens only after a clean scan — a later increment.
+    storage_quarantine_bucket: str = "sentinelai-quarantine"
     storage_access_key: SecretStr = SecretStr("minioadmin")
     storage_secret_key: SecretStr = SecretStr("minioadmin")
+    # SigV4 requires a region even on MinIO, which ignores its value (ADR-0008).
+    storage_region: str = "us-east-1"
+
+    # --- notification delivery (security-architecture §25) ---
+    # log (Phase 1: the in-app notification row is the durable delivery) | smtp | slack, later.
+    notification_sender_provider: str = "log"
+
+    # --- malware scanning (security-architecture §25) ---
+    # dummy (dev/test only) | clamav
+    malware_scanner_provider: str = "dummy"
+    # clamd endpoint: a UNIX socket path takes precedence over host/port when set.
+    clamav_host: str = "localhost"
+    clamav_port: int = 3310
+    clamav_socket_path: str | None = None
+    clamav_timeout_seconds: float = 300.0
+    # §25: a scanner running stale signatures gives false confidence. Beyond this age the
+    # scanner reports DEGRADED health.
+    clamav_max_signature_age_hours: int = 48
 
     # --- key management (KMS) — ADR-0009. Provider-agnostic; selected by config. ---
     kms_provider: str = "dev"  # dev | vault_transit | aws_kms | azure_key_vault | gcp_kms | pkcs11
@@ -147,6 +168,12 @@ class Settings(BaseSettings):
             problems.append(
                 f"KMS_PROVIDER must be HSM/managed for a classified deployment "
                 f"(one of {sorted(_CLASSIFIED_KMS)})"
+            )
+
+        if self.malware_scanner_provider == "dummy":
+            # A no-op scanner would silently satisfy §25's gate while scanning nothing.
+            problems.append(
+                "MALWARE_SCANNER_PROVIDER must not be 'dummy' in a production-grade profile"
             )
 
         if "+asyncpg" not in self.database_url:
