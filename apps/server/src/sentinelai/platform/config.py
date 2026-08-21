@@ -71,6 +71,13 @@ class Settings(BaseSettings):
     access_token_ttl_seconds: int = 900
     refresh_token_ttl_seconds: int = 1_209_600
 
+    # ACTIVE. Absolute lifetime of an opaque session (security-architecture.md §9), deliberately
+    # deployment-configurable — §9 expects government/high-sensitivity profiles to default
+    # shorter than enterprise. This is the absolute cap only; the idle timeout §9 also calls for
+    # arrives with the sliding-expiry refresh flow (POST /api/v1/auth/refresh), which is not
+    # built yet — so a session currently lives exactly this long regardless of activity.
+    session_ttl_seconds: int = 28_800  # 8h — one working shift.
+
     # --- object storage (evidence blobs) ---
     storage_endpoint_url: str = "http://localhost:9000"
     storage_bucket: str = "sentinelai-evidence"

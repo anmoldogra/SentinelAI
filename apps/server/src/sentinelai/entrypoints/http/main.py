@@ -42,6 +42,7 @@ from sentinelai.modules.social_media.router import router as social_media_router
 from sentinelai.modules.threat_intel import events as threat_intel_events
 from sentinelai.modules.threat_intel.router import router as threat_intel_router
 from sentinelai.platform.auth.dependencies import get_case_access_checker
+from sentinelai.platform.auth.router import router as auth_router
 from sentinelai.platform.config import settings
 from sentinelai.platform.crypto import HealthState, KmsUnavailable, create_kms
 from sentinelai.platform.db.session import async_session_factory, dispose_engine, engine
@@ -181,6 +182,10 @@ def create_app() -> FastAPI:
 
     # Well-known infra endpoints (unversioned).
     app.include_router(health.router)
+
+    # Authentication lives in platform, not a domain module — it issues the sessions the
+    # module routers authorize against, so it is registered ahead of them.
+    app.include_router(auth_router)
 
     # Domain module routers (each carries its own /api/v1 prefix).
     for module_router in _MODULE_ROUTERS:

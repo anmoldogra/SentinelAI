@@ -16,8 +16,12 @@ services:
       POSTGRES_USER: sentinelai
       POSTGRES_PASSWORD: sentinelai
       POSTGRES_DB: sentinelai
+    # Host 5433 -> container 5432: 5432 is commonly already taken, both by a locally installed
+    # Postgres and by the repo-root docker-compose.yml, which publishes its own Postgres there.
+    # Only the host-side mapping moves; api/worker reach Postgres over the compose network at
+    # postgres:5432, so their DATABASE_URL is unaffected.
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -28,8 +32,11 @@ services:
 
   redis:
     image: redis:7-bookworm
+    # Host 6380 -> container 6379: 6379 is commonly already taken by a locally installed Redis.
+    # Only the host-side mapping moves; api/worker reach Redis over the compose network at
+    # redis:6379, so their REDIS_URL is unaffected.
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -45,6 +52,11 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://sentinelai:sentinelai@postgres:5432/sentinelai
       REDIS_URL: redis://redis:6379/0
+      # .env.example's default is the RELATIVE `.kms-dev-keystore`, which resolves under the
+      # image's /app WORKDIR — not writable by the non-root user the image runs as. Overriding
+      # to /tmp (world-writable) keeps the container's read-only-ish /app intact. Dev only:
+      # KMS_PROVIDER=dev is forbidden in production, so this path never exists there.
+      KMS_DEV_KEYSTORE: /tmp/kms-dev-keystore
     ports:
       - "8000:8000"
     depends_on:
@@ -62,6 +74,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://sentinelai:sentinelai@postgres:5432/sentinelai
       REDIS_URL: redis://redis:6379/0
+      # Same override as `api` — see the note there. The worker signs/verifies through the same
+      # dev KMS provider, so it needs the same writable keystore path.
+      KMS_DEV_KEYSTORE: /tmp/kms-dev-keystore
     depends_on:
       postgres:
         condition: service_healthy

@@ -14,9 +14,15 @@ export PYTHONIOENCODING := utf-8
 # place so the Makefile and .github/workflows/ci.yml agree.
 COVERAGE_FLOOR := 90
 
+# Local bootstrap identity. `POST /auth/login` needs a user to exist and nothing else creates
+# one. Override per-developer: make create-admin ADMIN_EMAIL=me@agency.gov ADMIN_ROLE=supervisor
+ADMIN_EMAIL := admin@sentinelai.local
+ADMIN_PASSWORD := sentinelai
+ADMIN_ROLE := admin
+
 .PHONY: help install lint format typecheck lint-imports test test-unit test-integration \
         test-migrations hooks check run-api run-worker migrate compose-up compose-down \
-        compose-logs
+        compose-logs create-admin dev-token
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -63,6 +69,13 @@ run-worker: ## Run the arq worker entrypoint (dev)
 
 migrate: ## Apply all per-module Alembic migrations in DAG order
 	./scripts/migrate.sh
+
+create-admin: ## Create the local admin user + role grant (idempotent; needs `make migrate` first)
+	$(PY) -m sentinelai.cli.admin create-user \
+	  --email $(ADMIN_EMAIL) --password $(ADMIN_PASSWORD) --role $(ADMIN_ROLE)
+
+dev-token: ## Mint a bearer token for the admin user, for apps/web/.env.local (non-production)
+	$(PY) -m sentinelai.cli.admin dev-token --email $(ADMIN_EMAIL)
 
 compose-up: ## Start the full dev stack (postgres, redis, api, worker, web on :5173)
 	docker compose -f docker-compose.dev.yml up -d --build
