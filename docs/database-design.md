@@ -46,6 +46,12 @@ Two schemas carry a sanctioned, narrow exception to "no cross-schema access," bo
 | | `email` | text | no | |
 | | `display_name` | text | no | |
 | | `status` | text | no | `active` \| `disabled` |
+| | `mfa_enrolled_at` | timestamptz | yes | Null ⇒ TOTP not enrolled. This **is** the enrolment flag; there is deliberately no separate `mfa_enabled` boolean that could disagree with it |
+| | `mfa_secret_ciphertext` | bytea | yes | The TOTP shared secret, **encrypted** under `KeyPurpose.SESSION_ROOT` (ADR-0009 §7, already reserved for "ADR-0010 token/secret keying"). Non-null iff `mfa_enrolled_at` is |
+| | `mfa_secret_nonce` | bytea | yes | AEAD nonce for the above |
+| | `mfa_secret_algorithm` | text | yes | AEAD algorithm, recorded per row for crypto agility |
+| | `mfa_secret_key_id` | text | yes | `provider:backend_ref:version` of the wrapping key — what makes re-encryption after a key rotation a targeted scan rather than a full-table rewrite |
+| | `mfa_last_used_step` | bigint | yes | Last accepted TOTP time-step counter. RFC 6238 §5.2 requires a verifier reject a code it has already accepted; without this a code intercepted inside its ~30s window is replayable |
 | | `created_at`, `updated_at` | timestamptz | no | |
 | `roles` | `role_id` | uuid | PK | |
 | | `name`, `description` | text | no | |
@@ -55,6 +61,17 @@ Two schemas carry a sanctioned, narrow exception to "no cross-schema access," bo
 | `sessions` | `session_id` | uuid | PK | |
 | | `user_id` | uuid | FK → `users` | |
 | | `issued_at`, `expires_at`, `revoked_at` | timestamptz | mixed | `revoked_at` nullable |
+| `mfa_recovery_codes` | `code_id` | uuid | PK | One row per unused-or-spent code; `security-architecture.md` §8 makes these account-recovery only and one-time use |
+| | `user_id` | uuid | FK → `users` | |
+| | `code_hash` | text | no | argon2id. **Hashed, not encrypted** — a recovery code is only ever verified, never read back, so the weaker of the two properties is also the safer one |
+| | `created_at` | timestamptz | no | Codes are generated as a set at MFA enrolment |
+| | `used_at` | timestamptz | yes | Non-null ⇒ spent. Rows are retained rather than deleted so "which code was redeemed, when" stays auditable |
+| `mfa_challenges` | `challenge_id` | uuid | PK | Backs the `mfa_token` in `api-design.md` §9's login → `{mfa_required, mfa_token}` → `/auth/mfa/verify` exchange. That token is a credential for a half-authenticated principal and must be revocable, so it is server-side state, exactly as the session token is |
+| | `user_id` | uuid | FK → `users` | |
+| | `token_lookup` | varchar(12) | no | indexed, non-unique — same prefix-seek-then-verify shape as `sessions` |
+| | `token_hash` | text | no | argon2id digest; the `mfa_token` itself is never stored |
+| | `issued_at`, `expires_at` | timestamptz | no | Short expiry (minutes) — this is a login step, not a session |
+| | `consumed_at` | timestamptz | yes | Single-use: set on the first successful verify so a replayed `mfa_token` cannot mint a second session |
 | `identity_provider_links` | `link_id` | uuid | PK | |
 | | `user_id` | uuid | FK → `users` | |
 | | `idp_name`, `idp_subject` | text | no | |
@@ -66,6 +83,30 @@ Two schemas carry a sanctioned, narrow exception to "no cross-schema access," bo
 | | `ip_address`, `user_agent` | text | yes | |
 | | `details` | jsonb | yes | |
 | | `prev_entry_hash`, `entry_hash` | text | no | hash chain (Section 10) |
+
+**The TOTP secret is encrypted, not hashed — and that asymmetry is the point.** Every other
+credential in this schema (`password_hash`, `sessions.token_hash`, `mfa_recovery_codes.code_hash`)
+is a one-way digest, because the server only ever needs to *verify* a value the client presents. A
+TOTP shared secret is different in kind: the server must recompute HMAC-SHA1 over it on every
+verification, so it has to be recoverable. Hashing it with argon2id — the reflex the rest of this
+table trains — would produce a column that can never authenticate anyone. It is therefore held
+under envelope encryption via the KMS (ADR-0009), never in plaintext, and a compromise of the
+database alone does not yield working second factors.
+
+**This establishes the convention for encrypted columns generally**, since it is the first one in
+the schema: persist the four fields of a `Ciphertext` (`value`, `nonce`, `algorithm`, `key_id`) as
+four columns rather than one opaque blob. The `key_id` column is what makes key rotation
+operationally tractable — rows still under a retired key version are findable by query instead of
+by re-encrypting the entire table. ADR-0007's signed outbox and ADR-0008 §5's object encryption
+should follow this same shape when they land.
+
+**Scope note: TOTP only.** `security-architecture.md` §8 also accepts WebAuthn/FIDO2 and PIV/CAC,
+both preferred over TOTP. Neither is designed here, deliberately — WebAuthn needs *multiple*
+credentials per user (one per authenticator, each with a credential id, public key, and signature
+counter), which is a table rather than columns on `users`, and PIV/CAC resolves through the
+organization's PKI as an identity-provider integration (§7) rather than as stored secret material.
+Both are additive later and neither invalidates the columns above; ADR-0010 A1 scopes the current
+increment to TOTP as the required minimum.
 
 ### 3.2 `ingestion`
 
