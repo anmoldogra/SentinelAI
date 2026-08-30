@@ -50,7 +50,7 @@ Two schemas carry a sanctioned, narrow exception to "no cross-schema access," bo
 | | `mfa_secret_ciphertext` | bytea | yes | The TOTP shared secret, **encrypted** under `KeyPurpose.SESSION_ROOT` (ADR-0009 §7, already reserved for "ADR-0010 token/secret keying"). Non-null iff `mfa_enrolled_at` is |
 | | `mfa_secret_nonce` | bytea | yes | AEAD nonce for the above |
 | | `mfa_secret_algorithm` | text | yes | AEAD algorithm, recorded per row for crypto agility |
-| | `mfa_secret_key_id` | text | yes | `provider:backend_ref:version` of the wrapping key — what makes re-encryption after a key rotation a targeted scan rather than a full-table rewrite |
+| | `mfa_secret_key_id` | text | yes | `provider:version:backend_ref` of the wrapping key — what makes re-encryption after a key rotation a targeted scan rather than a full-table rewrite. **The ref comes last, and is parsed with a 2-split**, because a backend ref may itself contain colons (an AWS KMS ARN is `arn:aws:kms:region:account:key/id`); any other field order is ambiguous the first time this runs on AWS KMS |
 | | `mfa_last_used_step` | bigint | yes | Last accepted TOTP time-step counter. RFC 6238 §5.2 requires a verifier reject a code it has already accepted; without this a code intercepted inside its ~30s window is replayable |
 | | `created_at`, `updated_at` | timestamptz | no | |
 | `roles` | `role_id` | uuid | PK | |
