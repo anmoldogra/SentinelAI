@@ -921,3 +921,94 @@ exit 0. Backend suite unchanged at 509 passed.
 
 **Not verified:** the compose `web` service has never been started (no Docker daemon available
 here); it is reasoned from the file, not observed.
+
+---
+
+## 2026-08-30 — IC-025: server-computed integrity on ingest (modernization Wave 1.5, ADR-0008 §3)
+
+**Type:** Evidentiary-core correctness. Backend service + tests + ADR. No migration, no API shape
+change, no new error code.
+
+**The gap this closes.** For `payload_ref` evidence the server stored the **client-declared**
+`integrity_hash` unchecked and left `integrity_verification_status` at `pending` forever. The
+custody genesis entry therefore attested to what the submitter *said* it had uploaded, not to
+bytes the server had seen. `verify_integrity` could recompute from storage, but nothing invoked
+it at ingest, so the check was opt-in and after the fact. ADR-0008 Decision §3 and
+`api-design.md` §167 both already specified the correct behaviour — this is an implementation
+catching up to its own contract, not new design.
+
+**What changed (`modules/ingestion/service.py`).**
+- `_recompute_stored_digest(payload_ref, algorithm)` — the recompute block lifted out of
+  `verify_integrity`. One primitive now shared by ingest-time verification and post-hoc
+  re-verification, so the digest that *admits* evidence and the digest that later *re-checks* it
+  cannot drift apart.
+- `_verify_declared_payload(data)` — the policy layer. Streams the stored object, compares
+  constant-time against the declared hash, returns the server digest. Three failure modes, all
+  **422 VALIDATION_FAILED**: malformed `payload_ref`, no stored object, digest mismatch. The
+  mismatch error carries *neither* digest — the declared one is the caller's own and the computed
+  one is not disclosed for a submission being refused.
+- `ingest_evidence` — verification runs **last**, only once every cheap rule has passed, so an
+  already-invalid submission never pays for a full object stream. Its errors are merged into the
+  same list every other rule uses, so a rejected upload produces exactly one `IntakeRecord` and
+  one `evidence.validation_failed` event, identical to any other bad submission (§25.2). The
+  genesis `ingested` custody entry now carries the **server** digest.
+- The row inserts with `integrity_verification_status="verified"`, not `pending`. This is the
+  INSERT's genesis value, never an UPDATE, so ADR-0004's append-only trigger and ADR-0015 both
+  hold — and a later `integrity_reverified` event still wins at read time via
+  `_overlay_derived_state`, which needed **no change** (verified, not assumed: it only overrides
+  from `integrity_reverified` events). `pending` now means only "written before this rule existed".
+- `supersede_evidence` — same helper. A replacement is payload-bearing evidence entering the
+  store; without this, supersession would have been a documented way to write bytes the server
+  never verified. Raises 422 directly rather than via an intake record, matching how `_validate`
+  already rejects there.
+- The `elif data.integrity_hash:` branch was **preserved deliberately**. Removing it would have
+  silently changed behaviour for inline evidence carrying a declared hash — out of scope. Only the
+  `payload_ref` branch moved.
+
+**ADR-0008's §2/§3 tension, resolved and recorded.** §2 places server-side hashing in the
+background scan job; §3 requires the server hash in the custody `ingested` event, which only
+exists during `POST /evidence`. Both cannot hold with one hash computation. **Resolved in favour
+of §3** — it is the stronger guarantee: hashing at ingest *rejects* a mismatch so no record is
+ever created for unverified bytes, whereas the scan job could only mark an already-admitted row
+`failed` after the fact. `api-design.md` §13's ingest sequence and its `POST /evidence` example
+response (`verification_status: "verified"` on creation) already assumed this reading. ADR-0008
+moved **Proposed → Accepted** with the tension written down rather than left to be rediscovered.
+
+**The accepted cost, stated plainly.** The digest is computed **inside the HTTP request**. A
+multi-gigabyte forensic image — the exact artifact class ADR-0008's own Context cites — is
+streamed and hashed synchronously. This is tolerable at the file sizes the console handles today
+and is **not** tolerable at disk-image scale. The fix belongs to the chunked/resumable-upload
+increment: hash incrementally as parts arrive, so the digest is known before `POST /evidence` and
+neither §2's single streaming pass nor §3's rejection guarantee is given up. No size-threshold
+bypass exists **by design** — two ingest paths with different integrity guarantees would be worse
+than one slow one. No dev "trust-client" flag was added either, despite
+`modernization-roadmap.md` listing one as 1.5's rollback: rollback here is reverting the commit,
+and a switch that weakens an integrity check is exactly what `CLAUDE.md` rule 8 warns against.
+
+**Tests: 11 new, 9 reworked.** The three mismatch tests and the missing-object test previously
+staged their failure by having a client lie at ingest — which ingest now rejects, so they could
+never have reached `verify_integrity`. They now tamper with **storage after ingest**, which is the
+scenario re-verification actually exists to catch, and assert against the tampered digest ("what
+is on disk now"). Four download-URL tests in `test_ingestion_storage_paths.py` named objects that
+were never uploaded and now store real bytes first;
+`test_download_url_rejects_a_malformed_payload_ref` was kept rather than deleted, mutating the bad
+value onto a stored row, because rows written before this rule can exist and the download path
+must still fail closed on one. New coverage: server digest in the genesis entry, `verified` not
+`pending`, mismatch → 422 with **no evidence row and no custody entry**, rejection still recorded
+as a failed intake + `validation_failed` event, missing object → 422, malformed ref → 422,
+large-object streaming, UoW not self-committed, inline evidence unaffected.
+
+**Gates.** `ruff` (lint + format), `mypy --strict` (180 files), `import-linter` (2 contracts kept),
+full suite **551 passed / 2 skipped** (up from 539), platform coverage floor **93.43%** against the
+90% Tier-0 requirement.
+
+**Coverage delta on `ingestion/service.py`: 84% → 85%** (269 statements/42 missed → 293/43).
++24 statements added with only +1 uncovered, so the new code is ~96% covered; module-wide
+ingestion coverage moved 77% → 79%.
+
+**Known gap, not covered.** The `ObjectNotFound` re-raise inside `_recompute_stored_digest` — the
+object deleted *between* the `exists()` check and the read — is a genuine TOCTOU window that the
+in-memory `FakeObjectStorage` cannot reproduce without a purpose-built hook. It was equally
+uncovered before the extraction; the extraction did not introduce it, but it is now on a path that
+runs for every payload-bearing ingest rather than only on explicit re-verification. Closing it
+needs a storage fake that can fail mid-stream.

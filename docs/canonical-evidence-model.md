@@ -245,6 +245,7 @@ Every rule below is enforced before an object transitions from `pending_validati
 | `source.system` and `source.collector_id` present | All evidence | Reject — no evidence without provenance |
 | `collected_at` is valid ISO 8601 and not after `ingested_at` beyond a documented clock-skew tolerance | All evidence | Reject |
 | `integrity.hash` + `integrity.algorithm` present, algorithm ∈ {SHA-256, SHA-3-256, SHA-512} | Payload-bearing evidence | Reject (weaker legacy hashes may be retained as a *secondary* field for forensic-tool compatibility, never as the primary integrity hash) |
+| `payload_ref` names an object that exists in storage, and `integrity.hash` equals the digest the **server** recomputes from that object's bytes (ADR-0008 §3) | Payload-bearing evidence | Reject — the declared hash is a claim, never trusted. The genesis `ingested` custody entry records the *server-computed* digest, and `integrity.verification_status` is `verified` at creation rather than `pending` |
 | `attributes` conforms to the registered schema for `(category, artifact_type, schema_version)` | All evidence | Reject |
 | `classification.legal_authority_ref` present (or explicitly `public_source_no_authority_required`) | `digital_forensics`, `mobile_forensics`, `social_media_intelligence`, `cloud_evidence` at minimum | Reject |
 | Core fields are write-once | All evidence | Any attempted mutation of a `validated`/`superseded` object's core fields is rejected — must go through supersession (Section 12) |

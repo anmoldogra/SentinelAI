@@ -7,6 +7,8 @@ validation and the custody hash chain itself are covered by ``test_ingestion_ser
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -17,11 +19,30 @@ from sentinelai.modules.ingestion.exceptions import EvidenceNotFoundError
 from sentinelai.modules.ingestion.schemas import EvidenceCreate
 from sentinelai.modules.ingestion.service import EvidenceService
 from sentinelai.platform.config import settings
-from sentinelai.platform.storage import InvalidObjectUri, build_object_uri
+from sentinelai.platform.storage import InvalidObjectUri, build_object_uri, parse_object_uri
 from sentinelai.shared.exceptions import ValidationFailedError
 from tests.fixtures.fake_object_storage import FakeObjectStorage
 
 _REGISTERED = ("1.0.0", "osint", "web_page")
+_PAYLOAD = b"stored-object-bytes"
+_PAYLOAD_SHA256 = hashlib.sha256(_PAYLOAD).hexdigest()
+
+
+async def _bytes(*chunks: bytes) -> AsyncIterator[bytes]:
+    for chunk in chunks:
+        yield chunk
+
+
+async def _ingest_stored(svc, storage, uri: str, actor):  # type: ignore[no-untyped-def]
+    """Put real bytes at ``uri`` and ingest evidence naming them.
+
+    Since ADR-0008 §3, ingest streams and verifies the object, so these download-path tests can
+    no longer name an object that was never uploaded — the submission would be rejected before a
+    row existed to download.
+    """
+    bucket, key = parse_object_uri(uri)
+    await storage.put_stream(bucket, key, _bytes(_PAYLOAD))
+    return await svc.ingest_evidence(_payload_evidence(uri), actor, "c")
 
 
 def _payload_evidence(payload_ref: str | None) -> EvidenceCreate:
@@ -35,7 +56,7 @@ def _payload_evidence(payload_ref: str | None) -> EvidenceCreate:
         attributes={},
         confidence=Decimal("0.8"),
         payload_ref=payload_ref,
-        integrity_hash=("a" * 64) if payload_ref else None,
+        integrity_hash=_PAYLOAD_SHA256 if payload_ref else None,
         integrity_algorithm="SHA-256" if payload_ref else None,
         inline_payload=None if payload_ref else {"k": "v"},
     )
@@ -92,7 +113,7 @@ async def test_download_url_records_an_accessed_custody_event(ing_uow, actor) ->
     storage = FakeObjectStorage()
     svc = _svc(ing_uow, storage)
     uri = build_object_uri(settings.storage_bucket, "evidence/osint/web_page/x.bin")
-    evidence = await svc.ingest_evidence(_payload_evidence(uri), actor, "c")
+    evidence = await _ingest_stored(svc, storage, uri, actor)
     before = len(ing_uow.custody.items)
 
     url = await svc.get_download_url(evidence.evidence_id, actor)
@@ -109,7 +130,7 @@ async def test_download_url_targets_the_bucket_and_key_from_payload_ref(ing_uow,
     storage = FakeObjectStorage()
     svc = _svc(ing_uow, storage)
     uri = build_object_uri("other-bucket", "deep/path/object.bin")
-    evidence = await svc.ingest_evidence(_payload_evidence(uri), actor, "c")
+    evidence = await _ingest_stored(svc, storage, uri, actor)
     url = await svc.get_download_url(evidence.evidence_id, actor)
     assert "other-bucket/deep/path/object.bin" in url
 
@@ -122,8 +143,18 @@ async def test_download_url_rejects_evidence_without_a_payload(ing_uow, actor) -
 
 
 async def test_download_url_rejects_a_malformed_payload_ref(ing_uow, actor) -> None:  # type: ignore[no-untyped-def]
-    svc = _svc(ing_uow, FakeObjectStorage())
-    evidence = await svc.ingest_evidence(_payload_evidence("not-a-uri"), actor, "c")
+    """Defence for rows written before ingest-time verification existed.
+
+    A malformed reference can no longer be submitted — ingest rejects it (see
+    ``test_ingest_rejects_a_malformed_payload_ref``). The value is mutated onto an
+    already-stored row here so the download path is still proven to fail closed on one, rather
+    than leaving pre-existing rows untested.
+    """
+    storage = FakeObjectStorage()
+    svc = _svc(ing_uow, storage)
+    uri = build_object_uri(settings.storage_bucket, "evidence/osint/web_page/x.bin")
+    evidence = await _ingest_stored(svc, storage, uri, actor)
+    evidence.payload_ref = "not-a-uri"
     with pytest.raises(InvalidObjectUri):
         await svc.get_download_url(evidence.evidence_id, actor)
 
@@ -139,7 +170,7 @@ async def test_a_failed_ledger_write_does_not_return_a_url(ing_uow, actor) -> No
     storage = FakeObjectStorage()
     svc = _svc(ing_uow, storage)
     uri = build_object_uri(settings.storage_bucket, "evidence/osint/web_page/x.bin")
-    evidence = await svc.ingest_evidence(_payload_evidence(uri), actor, "c")
+    evidence = await _ingest_stored(svc, storage, uri, actor)
 
     async def _fail(_event) -> None:  # type: ignore[no-untyped-def]
         raise RuntimeError("ledger unavailable")

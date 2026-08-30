@@ -2,7 +2,34 @@
 
 ## Status
 
-Proposed. Depends on ADR-0009 (Key Management, for object encryption).
+**Accepted.** Depends on ADR-0009 (Key Management, for object encryption).
+
+Decision items 1–3 are implemented: the `ObjectStorage` port with a MinIO adapter, the
+quarantine→scan→promote flow, and — as of the ingest-time verification change — item 3's
+server-computed authoritative hash. Items 4–5 (Object Lock/WORM, envelope encryption) remain
+scheduled, not built; they do not alter items 1–3's design.
+
+### Note: the §2 / §3 placement tension
+
+Decision **§2** places server-side hashing in the background scan job ("a background job
+**streams** the object to compute the server-side hash and run malware scanning"). Decision **§3**
+requires the server hash to be recorded in the custody **`ingested`** event — an entry that only
+exists during `POST /evidence`. Both cannot hold with one hash computation.
+
+**Resolved in favour of §3**, because §3 is the stronger guarantee: hashing at ingest means a
+mismatch is *rejected* and no evidence record is ever created for bytes the server has not
+verified, whereas hashing in the scan job can only mark an already-admitted record `failed` after
+the fact. `api-design.md` §13's ingest sequence and its `POST /evidence` example response (which
+shows `verification_status: "verified"` on creation) already assumed this reading.
+
+**The cost is real and is accepted deliberately.** The digest is computed inside the HTTP request,
+so a multi-gigabyte forensic image is streamed and hashed synchronously — the exact artifact class
+this ADR's own Context cites. It is tolerable at the file sizes the console handles today and is
+**not** tolerable at disk-image scale. Revisiting it belongs to the chunked/resumable-upload
+increment, where the natural answer is to hash incrementally as parts arrive, so the digest is
+already known when `POST /evidence` is called and neither §2's streaming pass nor §3's rejection
+guarantee has to be given up. Until then, no size-threshold bypass exists by design: two ingest
+paths with different integrity guarantees would be worse than one slow one.
 
 ## Context
 

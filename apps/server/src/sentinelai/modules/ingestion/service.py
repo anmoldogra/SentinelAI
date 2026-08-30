@@ -6,9 +6,14 @@ write-once (§13) — corrections go through supersession (§12), never mutation
 
 Presigned upload/download URLs go through ``platform.storage``'s ``ObjectStorage``
 port (ADR-0008): this module addresses blobs by ``s3://bucket/key`` URI and never
-imports an S3 client. Uploads are reserved into the quarantine bucket (ADR-0008 §2)
-and ``verify_integrity`` recomputes a stored payload's digest server-side by
-streaming it (ADR-0008 §3), recording the result on the custody ledger.
+imports an S3 client. Uploads are reserved into the quarantine bucket (ADR-0008 §2).
+
+**The client's declared ``integrity_hash`` is never trusted (ADR-0008 §3).** Ingest
+streams the stored object, recomputes its digest, and rejects the submission on a
+mismatch — so no evidence record can exist for bytes the server has not itself
+hashed. The genesis ``ingested`` custody entry carries that server digest, and
+``verify_integrity`` later re-checks it through the same primitive
+(``_recompute_stored_digest``).
 
 Malware scanning and promotion out of quarantine remain DEFERRED (ADR-0008 §2's
 scan step); see ``jobs.py``.
@@ -58,12 +63,14 @@ from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CurrentUser
 from sentinelai.platform.config import settings
 from sentinelai.platform.security.digest import (
+    StreamDigest,
     compute_stream_digest,
     digests_match,
     is_valid_digest,
 )
 from sentinelai.platform.security.scanner import MalwareScanner
 from sentinelai.platform.storage import (
+    InvalidObjectUri,
     ObjectNotFound,
     ObjectStorage,
     build_object_uri,
@@ -225,6 +232,83 @@ class EvidenceService:
         await self._uow.custody.add(event)
         return event
 
+    async def _recompute_stored_digest(self, payload_ref: str, algorithm: str) -> StreamDigest:
+        """Stream the object at ``payload_ref`` and return its server-computed digest.
+
+        The single recompute primitive shared by ingest-time verification (ADR-0008 §3) and
+        post-hoc re-verification (``verify_integrity``) — one implementation, so the digest that
+        admits evidence and the digest that later re-checks it can never diverge. The object is
+        streamed, so a multi-GB image is never held in memory.
+
+        Raises :class:`EvidencePayloadMissingError` when the object is absent. Callers decide how
+        that surfaces: at ingest it is a rejected *claim* (422), on re-verification it is a missing
+        payload for an existing record (404).
+        """
+        bucket, key = parse_object_uri(payload_ref)
+        if not await self._storage.exists(bucket, key):
+            # Distinct from a mismatch: the bytes are gone, not different.
+            raise EvidencePayloadMissingError()
+        try:
+            return await compute_stream_digest(self._storage.get_stream(bucket, key), algorithm)
+        except ObjectNotFound as exc:  # deleted between the existence check and the read
+            raise EvidencePayloadMissingError() from exc
+
+    async def _verify_declared_payload(self, data: EvidenceCreate) -> str | None:
+        """Verify a submission's declared hash against the bytes actually in storage.
+
+        **ADR-0008 §3: the server-computed digest is authoritative and a mismatch is rejected.**
+        The client's `integrity_hash` is a *claim*; this is where it stops being taken on trust.
+        Returns the server digest, which becomes the genesis `ingested` custody entry's
+        `integrity_hash_at_event` — so the ledger attests to bytes the server observed, not to
+        what the submitter said it uploaded.
+
+        Returns ``None`` for evidence with no `payload_ref` (nothing stored to verify);
+        `_validate` has already rejected a payload-bearing submission missing hash or algorithm.
+
+        Every failure here is a **validation error on the submission** (422), never a 404 or a
+        conflict: at this point no evidence record exists, and what is wrong is the request. A
+        malformed `payload_ref`, an object that is not there, and a digest that does not match the
+        stored bytes are all the same class of problem — the submission does not describe reality.
+
+        **Runs inside the HTTP request.** ADR-0008 §2 places hashing in the background scan job
+        while §3 requires the server hash in the `ingested` event, which only exists here; see the
+        tension note in ADR-0008. Hashing a multi-gigabyte image synchronously is the known cost of
+        §3's guarantee, and is what the chunked-upload increment has to revisit.
+        """
+        if not data.payload_ref:
+            return None
+        algorithm = data.integrity_algorithm or "SHA-256"
+        try:
+            digest = await self._recompute_stored_digest(data.payload_ref, algorithm)
+        except InvalidObjectUri as exc:
+            raise ValidationFailedError(
+                [{"field": "payload_ref", "message": "not a well-formed s3://bucket/key reference"}]
+            ) from exc
+        except EvidencePayloadMissingError as exc:
+            raise ValidationFailedError(
+                [
+                    {
+                        "field": "payload_ref",
+                        "message": "no stored object at this reference — upload the bytes first",
+                    }
+                ]
+            ) from exc
+        if not digests_match(data.integrity_hash or "", digest.hex_digest):
+            # Deliberately carries neither digest: the declared value is the caller's own, and the
+            # computed one is not disclosed for a submission that is being refused.
+            raise ValidationFailedError(
+                [
+                    {
+                        "field": "integrity_hash",
+                        "message": (
+                            "does not match the server-computed digest of the stored object "
+                            "(ADR-0008 §3)"
+                        ),
+                    }
+                ]
+            )
+        return digest.hex_digest
+
     @staticmethod
     def _validate(data: EvidenceCreate, ingested_at: datetime) -> list[dict[str, str]]:
         """CEM §13 rules checkable without object storage or a stored attribute schema."""
@@ -311,6 +395,17 @@ class EvidenceService:
                     "message": "(schema_version, category, artifact_type) is not registered",
                 }
             )
+        # Server-side integrity verification (ADR-0008 §3) — last, and only once everything
+        # cheap has passed: it streams the whole object, so a submission already known to be
+        # invalid must never pay for it. Its failures join the same error list as every other
+        # rule, so a rejected upload produces one intake record and one `validation_failed`
+        # event exactly like any other bad submission.
+        server_digest: str | None = None
+        if not errors:
+            try:
+                server_digest = await self._verify_declared_payload(data)
+            except ValidationFailedError as exc:
+                errors.extend(exc.details)
         if errors:
             intake = IntakeRecord(
                 connector_name=str(data.source.get("system", "unknown")),
@@ -332,9 +427,16 @@ class EvidenceService:
             )
             raise ValidationFailedError(errors)
 
-        # Inline payload can be hashed deterministically now; a payload_ref object's
-        # hash is the client-declared one (re-verification against storage is deferred).
-        if data.integrity_hash:
+        # The genesis custody entry records what the SERVER observed (ADR-0008 §3): for a
+        # payload-bearing object that is the digest just recomputed from storage, never the
+        # client's declared value — which by this point has been proven equal to it anyway, but
+        # only one of the two is a fact the server established itself. The remaining branches are
+        # untouched by this increment: an inline payload is still hashed from its own content, and
+        # a bare declared hash with no `payload_ref` is still taken as given, there being no stored
+        # bytes to check it against.
+        if server_digest is not None:
+            genesis_hash = server_digest
+        elif data.integrity_hash:
             genesis_hash = data.integrity_hash
         elif data.inline_payload is not None:
             genesis_hash = hashlib.sha256(
@@ -354,7 +456,12 @@ class EvidenceService:
             ingested_at=ingested_at,
             integrity_algorithm=data.integrity_algorithm,
             integrity_hash=data.integrity_hash,
-            integrity_verification_status=("pending" if data.payload_ref else "not_applicable"),
+            # `verified`, not `pending` (ADR-0008 §3): the row only reaches this line because the
+            # stored bytes were streamed and matched. This is the INSERT's genesis value, not an
+            # UPDATE, so ADR-0004's append-only trigger and ADR-0015 are both satisfied — and a
+            # later `integrity_reverified` event still overrides it at read time via
+            # `_overlay_derived_state`. `pending` now means only "written before this rule existed".
+            integrity_verification_status=("verified" if data.payload_ref else "not_applicable"),
             payload_ref=data.payload_ref,
             inline_payload=data.inline_payload,
             attributes=data.attributes,
@@ -592,14 +699,11 @@ class EvidenceService:
                 [{"field": "integrity_hash", "message": f"not a valid {algorithm} digest"}]
             )
 
-        bucket, key = parse_object_uri(evidence.payload_ref)
-        if not await self._storage.exists(bucket, key):
-            # Distinct from a mismatch: the bytes are gone, not different.
-            raise EvidencePayloadMissingError()
-        try:
-            digest = await compute_stream_digest(self._storage.get_stream(bucket, key), algorithm)
-        except ObjectNotFound as exc:  # deleted between the existence check and the read
-            raise EvidencePayloadMissingError() from exc
+        # Same recompute primitive the ingest path uses (`_recompute_stored_digest`), so the digest
+        # that admitted this evidence and the digest re-checking it now are produced identically.
+        # `EvidencePayloadMissingError` propagates as a 404 here — unlike at ingest, the record
+        # exists and it is genuinely its payload that is missing.
+        digest = await self._recompute_stored_digest(evidence.payload_ref, algorithm)
         matched = digests_match(expected, digest.hex_digest)
 
         # Record the recomputed digest either way — the ledger is the auditable record of the
@@ -768,6 +872,12 @@ class EvidenceService:
         errors = self._validate(data.replacement, ingested_at)
         if errors:
             raise ValidationFailedError(errors)
+        # A replacement is payload-bearing evidence entering the store, so it faces the same
+        # server-side check as any other ingest (ADR-0008 §3) — otherwise supersession would be a
+        # documented way to write bytes the server never verified. Raises 422 directly rather than
+        # via an intake record: supersession is not an intake, and `_validate` above already
+        # rejects the same way.
+        server_digest = await self._verify_declared_payload(data.replacement)
         replacement = Evidence(
             schema_version=data.replacement.schema_version,
             category=data.replacement.category,
@@ -780,7 +890,7 @@ class EvidenceService:
             integrity_algorithm=data.replacement.integrity_algorithm,
             integrity_hash=data.replacement.integrity_hash,
             integrity_verification_status=(
-                "pending" if data.replacement.payload_ref else "not_applicable"
+                "verified" if data.replacement.payload_ref else "not_applicable"
             ),
             payload_ref=data.replacement.payload_ref,
             inline_payload=data.replacement.inline_payload,
@@ -802,7 +912,9 @@ class EvidenceService:
             replacement.evidence_id,
             "ingested",
             actor,
-            integrity_hash_at_event=(replacement.integrity_hash or _GENESIS_HASH),
+            # The server-observed digest, on the same reasoning as `ingest_evidence`'s
+            # genesis entry.
+            integrity_hash_at_event=(server_digest or replacement.integrity_hash or _GENESIS_HASH),
             notes=f"supersedes {evidence_id}: {data.reason}",
         )
         await self._uow.outbox.publish(
