@@ -65,6 +65,11 @@ logs/
 # --- Test / coverage ---
 coverage/
 .nyc_output/
+# coverage.py's data file (and its parallel-run shards). Machine-local run data, not source —
+# every `pytest --cov` rewrites it, so tracking it makes an unrelated diff on any coverage run.
+.coverage
+.coverage.*
+htmlcov/
 
 # --- Misc ---
 *.local
