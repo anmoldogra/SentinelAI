@@ -1,0 +1,70 @@
+import type { EvidenceRow } from "./types";
+
+/** Mock stand-in for `GET /cases/{id}/evidence` (frontend-architecture.md §25, §26). */
+export const EVIDENCE_BY_CASE: Record<string, EvidenceRow[]> = {
+  "CASE-2041": [
+    {
+      id: "EV-0114",
+      name: "vpn-concentrator.log",
+      hash: "sha256:9f14…c2a7",
+      source: "Network log",
+      collected: "27 Aug 06:40",
+      integrity: "Verified",
+      custody: "4 events",
+    },
+    {
+      id: "EV-0231",
+      name: "NL-FS02 auth events (evtx)",
+      hash: "sha256:41bd…7e10",
+      source: "EDR",
+      collected: "27 Aug 06:44",
+      integrity: "Verified",
+      custody: "3 events",
+    },
+    {
+      id: "EV-0298",
+      name: "NL-FS02 disk image (E01)",
+      hash: "sha256:aa07…19f3",
+      source: "Forensic image",
+      collected: "27 Aug 09:12",
+      integrity: "Verified",
+      custody: "6 events",
+    },
+    {
+      id: "EV-0301",
+      name: "netflow 04:10–05:05",
+      hash: "sha256:cd52…8b44",
+      source: "Network log",
+      collected: "27 Aug 09:30",
+      integrity: "Verified",
+      custody: "2 events",
+    },
+    {
+      id: "EV-0377",
+      name: "proxy-egress.csv",
+      hash: "sha256:7b90…0d61",
+      source: "Network log",
+      collected: "28 Aug 11:02",
+      integrity: "Pending scan",
+      custody: "1 event",
+    },
+    {
+      id: "EV-0402",
+      name: "note.readme.txt",
+      hash: "sha256:e3c8…f57a",
+      source: "Endpoint file",
+      collected: "27 Aug 07:15",
+      integrity: "Verified",
+      custody: "3 events",
+    },
+    {
+      id: "OSINT-0042",
+      name: "paste-dump-16aug.html",
+      hash: "sha256:22af…9cc0",
+      source: "OSINT",
+      collected: "28 Aug 15:48",
+      integrity: "Verified",
+      custody: "2 events",
+    },
+  ],
+};

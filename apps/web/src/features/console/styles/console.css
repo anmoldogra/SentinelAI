@@ -1,0 +1,390 @@
+/*
+ * Scoped token layer + component classes for the investigator console
+ * (features/dashboard, features/cases, features/investigation).
+ *
+ * The console was designed and approved as a dense, dark-only SOC/IR tool (see the design
+ * handoff's chat transcript: "theme: Dark only") — deliberately distinct from apps/web/src/index.css's
+ * light/dark app-wide token layer, which has no other consumer yet. Everything here is scoped
+ * under `.sai-shell` so it can never leak into `/login` or any future light-themed screen; if the
+ * app later adopts a persistent dark mode for authenticated routes generally, these tokens are the
+ * ones to promote into the shared layer (frontend-architecture.md §18-19).
+ *
+ * Values are carried over verbatim from the approved Nocturne design-system export
+ * (project/_ds/nocturne-.../styles.css in the design handoff) so the console matches the approved
+ * design pixel-for-pixel, per the handoff's own instruction.
+ *
+ * Fonts and icons are self-hosted npm packages (@fontsource/inter, @phosphor-icons/web), not the
+ * handoff's unpkg.com/fonts.googleapis.com CDN links — deployment-architecture.md's air-gapped
+ * profile allows zero runtime egress, and a CDN-fetched icon font would silently fail there.
+ */
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@phosphor-icons/web/regular";
+@import "@phosphor-icons/web/fill";
+
+.sai-shell {
+  --sc-bg: #161826;
+  --sc-surface: #232532;
+  --sc-text: #e9e9ed;
+  --sc-accent: #9184d9;
+  --sc-accent-2: #a7a1db;
+  --sc-divider: color-mix(in srgb, #e9e9ed 16%, transparent);
+
+  --sc-neutral-100: #f3f5fe;
+  --sc-neutral-800: #3f424d;
+  --sc-neutral-900: #292b31;
+
+  --sc-accent-100: #f5f4ff;
+  --sc-accent-300: #d2cefd;
+  --sc-accent-400: #b5abfc;
+  --sc-accent-500: #968ae0;
+  --sc-accent-800: #423a6a;
+
+  --sc-accent-2-100: #f5f4ff;
+  --sc-accent-2-800: #423e5d;
+
+  --sc-dot-ok: #968ae0;
+  --sc-dot-warn: #b5abfc;
+  --sc-dot-idle: #75798c;
+
+  --sc-font-heading: "Inter", system-ui, sans-serif;
+  --sc-font-body: "Inter", system-ui, sans-serif;
+  --sc-font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+
+  --sc-space-1: 2.8px;
+  --sc-space-2: 5.6px;
+  --sc-space-3: 8.4px;
+  --sc-space-4: 11.2px;
+  --sc-space-6: 16.8px;
+  --sc-space-8: 22.4px;
+
+  --sc-radius-sm: 4px;
+  --sc-radius-md: 8px;
+  --sc-radius-lg: 14px;
+
+  --sc-shadow-sm: 0 0 0 1px var(--sc-neutral-800);
+  --sc-shadow-lg: 0 0 0 1px #9397ab, 0 16px 40px rgba(0, 0, 0, 0.65);
+
+  background: var(--sc-bg);
+  color: var(--sc-text);
+  font-family: var(--sc-font-body);
+  min-height: 100%;
+}
+
+.sai-shell h1,
+.sai-shell h2,
+.sai-shell h3,
+.sai-shell h4,
+.sai-shell h5,
+.sai-shell h6 {
+  font-family: var(--sc-font-heading);
+  font-weight: 500;
+  line-height: 1.12;
+  letter-spacing: -0.015em;
+  margin: 0;
+}
+.sai-shell h4 {
+  font-size: 20px;
+}
+.sai-shell h5 {
+  font-size: 16px;
+}
+.sai-shell a {
+  color: var(--sc-accent);
+  text-underline-offset: 3px;
+}
+.sai-shell a:hover {
+  color: var(--sc-accent-400);
+}
+.sai-shell :focus-visible {
+  outline: 2px solid var(--sc-accent);
+  outline-offset: 2px;
+}
+.sai-shell .sc-code {
+  font-family: var(--sc-font-mono);
+  font-size: 12px;
+}
+.sai-shell .sc-text-muted {
+  color: color-mix(in srgb, var(--sc-text) 55%, transparent);
+}
+.sai-shell .sc-row {
+  cursor: pointer;
+}
+.sai-shell .sc-nav-link {
+  font-size: 13px;
+  padding: 5.6px 10px;
+  border-radius: 8px;
+  color: color-mix(in srgb, #e9e9ed 60%, transparent);
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  font-family: inherit;
+  text-decoration: none;
+  display: inline-flex;
+}
+.sai-shell .sc-nav-link:hover {
+  background: color-mix(in srgb, #e9e9ed 7%, transparent);
+  color: #e9e9ed;
+}
+.sai-shell .sc-nav-link.active {
+  background: color-mix(in srgb, #9184d9 16%, transparent);
+  color: var(--sc-accent-300);
+}
+
+/* — buttons — */
+.sai-shell .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  text-decoration: none;
+  font-family: var(--sc-font-heading);
+  font-weight: 500;
+  font-size: 14px;
+  line-height: 1.2;
+  color: var(--sc-text);
+  background: transparent;
+  border: 1px solid transparent;
+  padding: var(--sc-space-2) calc(var(--sc-space-3) * 1.2);
+  border-radius: var(--sc-radius-md);
+}
+.sai-shell .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.sai-shell .btn-primary {
+  color: var(--sc-accent);
+  border-color: var(--sc-accent);
+}
+.sai-shell .btn-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sc-accent) 12%, transparent);
+}
+.sai-shell .btn-secondary {
+  border-color: var(--sc-divider);
+}
+.sai-shell .btn-secondary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sc-text) 7%, transparent);
+}
+.sai-shell .btn-ghost {
+  color: var(--sc-accent);
+  padding-inline: var(--sc-space-1);
+}
+.sai-shell .btn-ghost:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sc-accent) 10%, transparent);
+}
+.sai-shell .btn-icon {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+}
+.sai-shell .btn-block {
+  width: 100%;
+}
+
+/* — forms — */
+.sai-shell .field > label {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 5px;
+  color: color-mix(in srgb, var(--sc-text) 70%, transparent);
+}
+.sai-shell .input {
+  width: 100%;
+  min-height: 36px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 14px;
+  color: var(--sc-text);
+  caret-color: var(--sc-accent);
+  background: var(--sc-surface);
+  border: 1px solid var(--sc-divider);
+  border-radius: var(--sc-radius-md);
+}
+.sai-shell .input:hover {
+  border-color: color-mix(in srgb, var(--sc-text) 45%, transparent);
+}
+.sai-shell .input:focus-visible {
+  border-color: var(--sc-accent);
+  outline-offset: 0;
+}
+.sai-shell .radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.sai-shell .radio input,
+.sai-shell .seg-opt input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+.sai-shell .radio .sc-dot-toggle {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--sc-divider);
+}
+.sai-shell .radio:hover .sc-dot-toggle {
+  border-color: var(--sc-accent);
+}
+.sai-shell .radio input:checked + .sc-dot-toggle {
+  border-color: var(--sc-accent);
+  background: var(--sc-accent);
+  box-shadow: inset 0 0 0 4px var(--sc-bg);
+}
+.sai-shell .seg {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--sc-divider);
+  border-radius: var(--sc-radius-md);
+}
+.sai-shell .seg-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.sai-shell .seg-opt + .seg-opt {
+  border-left: 1px solid var(--sc-divider);
+}
+.sai-shell .seg-opt:has(input:checked) {
+  color: var(--sc-accent);
+  box-shadow: inset 0 0 0 1px var(--sc-accent);
+}
+.sai-shell .seg-opt:not(:has(input:checked)):hover {
+  background: color-mix(in srgb, var(--sc-text) 7%, transparent);
+}
+/* Route-driven tabs (CaseLayout, Entity graph depth toggle) reuse the .seg/.seg-opt look without
+   a backing radio input — `.active` stands in for `:has(input:checked)`. */
+.sai-shell a.seg-opt {
+  text-decoration: none;
+  color: inherit;
+}
+.sai-shell .seg-opt.active {
+  color: var(--sc-accent);
+  box-shadow: inset 0 0 0 1px var(--sc-accent);
+}
+.sai-shell .seg-opt:not(.active):hover {
+  background: color-mix(in srgb, var(--sc-text) 7%, transparent);
+}
+
+/* — cards — */
+.sai-shell .card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sc-space-2);
+  padding: var(--sc-space-3);
+  border-radius: var(--sc-radius-md);
+  background: var(--sc-surface);
+}
+.sai-shell .card-kicker {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--sc-accent);
+}
+.sai-shell .card-title {
+  font-family: var(--sc-font-heading);
+  font-weight: 500;
+  font-size: 17px;
+  line-height: 1.2;
+}
+.sai-shell .card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--sc-text) 50%, transparent);
+}
+.sai-shell .elev-sm {
+  box-shadow: var(--sc-shadow-sm);
+}
+
+/* — tags — */
+.sai-shell .tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+.sai-shell .tag-accent {
+  background: var(--sc-accent-800);
+  color: var(--sc-accent-100);
+}
+.sai-shell .tag-accent-2 {
+  background: var(--sc-accent-2-800);
+  color: var(--sc-accent-2-100);
+}
+.sai-shell .tag-neutral {
+  background: var(--sc-neutral-800);
+  color: var(--sc-neutral-100);
+}
+.sai-shell .tag-outline {
+  border: 1px solid var(--sc-accent);
+  color: var(--sc-accent);
+}
+
+/* — tables — */
+.sai-shell .table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+.sai-shell .table th {
+  text-align: left;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--sc-text) 60%, transparent);
+  padding: var(--sc-space-2);
+}
+.sai-shell .table td {
+  padding: var(--sc-space-2);
+}
+.sai-shell .table thead tr {
+  box-shadow: inset 0 -1px 0 var(--sc-divider);
+}
+.sai-shell .table tbody tr {
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--sc-text) 8%, transparent);
+}
+.sai-shell .table tbody tr:hover {
+  background: color-mix(in srgb, var(--sc-text) 4%, transparent);
+}
+
+/* — dialog — */
+.sai-shell .dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--sc-space-4);
+  background: color-mix(in srgb, var(--sc-neutral-900) 50%, transparent);
+}
+.sai-shell .dialog {
+  width: min(440px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sc-space-3);
+  padding: var(--sc-space-4);
+  border-radius: var(--sc-radius-lg);
+  background: var(--sc-surface);
+  box-shadow: var(--sc-shadow-lg);
+}
+
+/* — palette result hover (no `style-hover` pseudo-prop outside the DC runtime) — */
+.sai-shell .sc-palette-result:hover,
+.sai-shell .sc-palette-result:focus-visible {
+  background: color-mix(in srgb, #9184d9 14%, transparent);
+}

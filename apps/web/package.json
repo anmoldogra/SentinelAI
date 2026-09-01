@@ -19,6 +19,8 @@
     "check": "npm run format:check && npm run lint && npm run typecheck"
   },
   "dependencies": {
+    "@fontsource/inter": "5.2.8",
+    "@phosphor-icons/web": "2.1.1",
     "@tanstack/react-query": "^5.62.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
