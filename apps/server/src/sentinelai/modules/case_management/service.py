@@ -66,6 +66,8 @@ from sentinelai.modules.case_management.schemas import (
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CaseAccessChecker, CurrentUser
 from sentinelai.platform.config import settings
+from sentinelai.platform.crypto import get_kms
+from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.storage import (
     ObjectStorage,
@@ -118,9 +120,18 @@ def _actor_role(actor: CurrentUser) -> str:
 class CaseService:
     """Case lifecycle, evidence linking, status history, and report orchestration."""
 
-    def __init__(self, uow: CaseManagementUnitOfWork, *, storage: ObjectStorage) -> None:
+    def __init__(
+        self,
+        uow: CaseManagementUnitOfWork,
+        *,
+        storage: ObjectStorage,
+        kms: KeyManagementService,
+    ) -> None:
         self._uow = uow
         self._storage = storage
+        # Required, not optional: every audit write this service makes must be signed
+        # (ADR-0003 §1), and an optional KMS would make an unsigned one reachable.
+        self._kms = kms
 
     # -- internal helpers ---------------------------------------------------
     async def _load_owned(self, case_id: UUID, actor: CurrentUser) -> Case:
@@ -137,6 +148,7 @@ class CaseService:
     ) -> None:
         await record_audit_event(
             self._uow.session,
+            kms=self._kms,
             actor_user_id=actor.user_id,
             actor_role=_actor_role(actor),
             action=action,
@@ -561,9 +573,10 @@ class DbCaseAccessChecker:
 def get_case_service(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
     storage: ObjectStorage = Depends(get_object_storage),
+    kms: KeyManagementService = Depends(get_kms),
 ) -> CaseService:
     """FastAPI dependency constructing a ``CaseService`` on a request-scoped UoW."""
-    return CaseService(uow, storage=storage)
+    return CaseService(uow, storage=storage, kms=kms)
 
 
 def provide_case_access_checker(session: AsyncSession = Depends(get_session)) -> CaseAccessChecker:

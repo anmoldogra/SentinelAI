@@ -61,10 +61,14 @@ from sentinelai.modules.ingestion.schemas import (
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CurrentUser
 from sentinelai.platform.config import settings
+from sentinelai.platform.crypto import get_kms
 from sentinelai.platform.crypto.canonical import canonicalize
+from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.crypto.ledger import (
+    LEDGER_CUSTODY,
     LEDGER_HASH_ALGO,
     LEDGER_PREIMAGE_VERSION,
+    LedgerSigner,
     compute_entry_hash,
     ledger_timestamp,
     ledger_uuid,
@@ -207,15 +211,26 @@ def _custody_entry_hash(
 class EvidenceService:
     """Intake, canonicalization, custody, and integrity for evidence."""
 
-    def __init__(self, uow: IngestionUnitOfWork, *, storage: ObjectStorage) -> None:
+    def __init__(
+        self,
+        uow: IngestionUnitOfWork,
+        *,
+        storage: ObjectStorage,
+        kms: KeyManagementService,
+    ) -> None:
         self._uow = uow
         self._storage = storage
+        # Required, not optional: every custody entry and every audit write must be signed
+        # (ADR-0003 §1), and an optional KMS would make an unsigned one reachable.
+        self._kms = kms
+        self._signer = LedgerSigner(kms)
 
     async def _audit(
         self, actor: CurrentUser, action: str, target_id: UUID, details: dict[str, object]
     ) -> None:
         await record_audit_event(
             self._uow.session,
+            kms=self._kms,
             actor_user_id=actor.user_id,
             actor_role=_actor_role(actor),
             action=action,
@@ -257,6 +272,15 @@ class EvidenceService:
             notes=notes,
             integrity_hash_at_event=integrity_hash_at_event,
         )
+        # Signed before the row is constructed, so a signing failure means no custody entry
+        # rather than an unsigned one. Fails closed: a KMS outage aborts the whole transaction,
+        # which is the correct trade for a legal ledger (ADR-0003 §1).
+        signature = await self._signer.sign(
+            ledger=LEDGER_CUSTODY,
+            sequence=sequence_number,
+            prev_hash=prev_hash,
+            entry_hash=entry_hash,
+        )
         event = EvidenceCustodyEvent(
             custody_event_id=custody_event_id,
             evidence_id=evidence_id,
@@ -274,6 +298,9 @@ class EvidenceService:
             entry_hash=entry_hash,
             hash_algo=LEDGER_HASH_ALGO,
             preimage_version=LEDGER_PREIMAGE_VERSION,
+            signature=signature.envelope,
+            sig_alg=signature.sig_alg,
+            key_id=signature.key_id,
         )
         await self._uow.custody.add(event)
         return event
@@ -1023,8 +1050,9 @@ class EvidenceService:
 def get_evidence_service(
     uow: IngestionUnitOfWork = Depends(get_ingestion_uow),
     storage: ObjectStorage = Depends(get_object_storage),
+    kms: KeyManagementService = Depends(get_kms),
 ) -> EvidenceService:
-    return EvidenceService(uow, storage=storage)
+    return EvidenceService(uow, storage=storage, kms=kms)
 
 
 __all__ = ["CUSTODY_EVENT_TYPES", "VALID_CATEGORIES", "EvidenceService", "get_evidence_service"]

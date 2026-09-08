@@ -426,11 +426,17 @@ An integrity hash is computed over the **raw payload bytes as originally acquire
 
 ## 20. Digital Signatures
 
-An **optional but recommended enhancement** beyond hashing: signing an evidence hash with a private key adds non-repudiation — proof of *who* asserted the hash, not just that the content is unchanged — which directly strengthens the evidentiary foundation for admissibility standards referenced in PRD §10 (FRE 901/902, Daubert/Frye: an examiner's cryptographic signature is a modern analogue to a sworn chain-of-custody signature).
+Signing an entry's hash with a private key adds non-repudiation — proof of *who* asserted the hash, not just that the content is unchanged — which directly strengthens the evidentiary foundation for admissibility standards referenced in PRD §10 (FRE 901/902, Daubert/Frye: a cryptographic signature is a modern analogue to a sworn chain-of-custody signature).
 
-Recommended algorithm: Ed25519 (fast, small signatures, modern) or ECDSA P-384 where FIPS compliance requires it.
+**Ledger signing is mandatory, not optional (ADR-0003 §1).** This section previously described signing as "an optional but recommended enhancement". That is superseded for the two evidentiary ledgers: every entry written to `platform.audit_log` and `ingestion.evidence_custody_events` is signed at write time under `KeyPurpose.EVIDENCE_ROOT`, and a write that cannot be signed fails rather than proceeding unsigned.
 
-**Open design question, not decided here:** key custody model. Per-examiner signing keys give the strongest non-repudiation (this specific person attests to this specific hash) but add real key-management burden across many examiners; a system-level signing key is operationally simpler but weakens the non-repudiation claim to "this system attests," not "this person attests." This trade-off has legal as much as technical dimensions and is listed as an open item requiring product/legal input before adoption (§52).
+**Why it is not optional.** A hash chain is tamper-*evident* only against someone who cannot recompute it. Nothing about a hash requires a secret, so a privileged writer — a hostile DBA, a compromised application, a malicious insider — can edit any entry, recompute its hash and every subsequent hash, and produce a chain that verifies perfectly. PRD SR-4 requires tamper-evidence *"even to an administrator with direct database access"*, and only a signature made under a key that administrator cannot read delivers it. The private key lives in the KMS/HSM (ADR-0009); the application's database role has no path to it.
+
+**What is signed.** ADR-0003 §1 specifies a signature over `(sequence || prev_entry_hash || entry_hash)`. It is implemented as the RFC 8785 canonical encoding of those fields plus a ledger discriminator, rather than a raw concatenation: hash widths are not fixed under crypto agility (SHA-256 is 64 hex characters, SHA-384 is 96), so concatenating variable-length fields would let two different tuples produce one signed byte string. The discriminator prevents a signature made for one ledger being presented as valid for the other.
+
+Algorithm: **Ed25519** by policy (ADR-0009 §3), with ECDSA P-256/P-384 available where FIPS posture requires it. Callers never name an algorithm; the policy engine resolves it, and the choice is recorded on every row so history stays verifiable across a future migration.
+
+**Still open — the key custody model.** What is built is a **system-level** signing key: the claim it supports is "this system attests", not "this examiner attests". Per-examiner signing keys would give the stronger claim but add real key-management burden across many examiners, and the trade-off is as legal as it is technical. It remains an open item requiring product/legal input (§52), and nothing above should be read as having settled it.
 
 ## 21. Chain of Custody Security
 
@@ -454,7 +460,9 @@ Two audit surfaces (`database-design.md` §10) — `evidence_custody_events` (§
 
 - Append-only at the database-permission layer, identical to §21's enforcement.
 - Written through a **single, narrow, application-code-unbypassable interface** — there is exactly one path to write an audit entry, and it is not optional or skippable by any code path that performs an audited action; there is no alternate route that produces an unaudited side effect.
-- Hash-chained (`prev_entry_hash`/`entry_hash`), independently re-verifiable by any authorized reviewer without trusting the application's own claim that nothing was altered.
+- Hash-chained (`prev_entry_hash`/`entry_hash`) over the **complete** persisted field set — every column of the entry, including the attribution fields (actor, role, source address, legal authority), so who did a thing cannot be rewritten without breaking the chain.
+- **Signed** (`signature`/`sig_alg`/`key_id`) under the evidence root key at write time (§20, ADR-0003 §1). The hash makes an edit detectable; the signature makes a *recomputed* chain detectable, which is what a privileged insider would produce.
+- Independently re-verifiable by any authorized reviewer without trusting the application's own claim that nothing was altered — the verifier checks **both** the hash and the signature. A verifier that confirmed the hash alone would report a forged chain as intact.
 - Access-restricted more tightly than ordinary application data — reading `platform.audit_log` requires `admin` or `compliance` role (`api-design.md` §10), since the audit log itself is a high-value target (an attacker who can read it learns exactly what defenses exist and how thoroughly their prior actions were logged).
 
 ```mermaid
@@ -474,7 +482,7 @@ sequenceDiagram
 
 Three independent layers, catching different failure modes — no single layer is assumed sufficient on its own, consistent with §1's defense-in-depth principle:
 
-1. **Hash chain re-verification (data tampering):** a scheduled job periodically recomputes and re-verifies the custody-event and audit-log hash chains across all records, alerting immediately on any break — proactive detection, not just "verify on read."
+1. **Hash chain and signature re-verification (data tampering):** a scheduled job periodically recomputes and re-verifies the custody-event and audit-log hash chains across all records, **and verifies each entry's signature against the KMS public key**, alerting immediately on any break — proactive detection, not just "verify on read." The two checks catch different attackers: the hash catches an edit that left the digest stale, the signature catches an edit whose digest was recomputed. An entry that carries no signature at all (written before ADR-0003 §1 landed) is reported as *not independently verifiable* rather than as failed — on a court-facing report those are different findings, and only one of them is honest.
 2. **Anomaly detection on access patterns (insider misuse, PRD SR-11):** unusual bulk export volume, access outside an analyst's normal working hours or location, access to cases outside their assignment — flagged for review, not auto-blocked (a false positive shouldn't lock out a legitimate investigator mid-case), feeding §49's monitoring.
 3. **File-integrity monitoring at the infrastructure layer (system tampering):** the deployed application binaries/containers and configuration are themselves monitored for unauthorized modification — this catches an attacker who has compromised the host or supply chain (§42–46) rather than the data, a fundamentally different threat than 1–2 above.
 

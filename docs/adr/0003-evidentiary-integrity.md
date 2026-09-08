@@ -43,24 +43,36 @@ acceptance:
 | §5 Crypto-agility columns on both ledgers | 1.1 | **Built** — migrations `202609080001_platform_agility`, `202609080002_ingestion_agility`; all six columns, nullable |
 | §4 Server-computed integrity hashing | 1.5 | **Built** — landed early (out of dependency order) as `09e4f14`; ADR-0008 §3 |
 | §2 Complete preimage (all persisted fields) | 1.2 | **Built** — `platform/crypto/ledger.py`; both ledgers hash every persisted column under JCS and stamp `hash_algo`/`preimage_version`. Enforced by a table-driven test against the live schema |
-| §1 Authenticated entries (**signatures**) | 1.2 | **NOT built** — `signature`, `sig_alg` and `key_id` are still null; no KMS key is used by either ledger |
+| §1 Authenticated entries (**signatures**) | 1.2 | **Built** — `LedgerSigner` signs every audit and custody write under `KeyPurpose.EVIDENCE_ROOT` (Ed25519 by policy); `signature`/`sig_alg`/`key_id` carry real values. Fails closed: a write that cannot be signed aborts its transaction |
 | §3 External anchoring (Merkle + RFC-3161) | 1.3 | **Not built** |
-| §6 Verification Engine | 1.4 | **Not built** |
+| §6 Verification Engine | 1.4 | **Not built** — `LedgerSigner.verify` exists and is the primitive it will call, but no endpoint or scheduled job invokes it |
 
-**Context §2 (incomplete preimage) is closed. Context §1 (unkeyed, unanchored) is not**, and the
-distinction decides what can honestly be claimed today. A complete preimage binds every field of
-an entry to its hash, so an attacker who edits one row — the realistic insider, working through
-whatever access they have to the table — is now caught, including when they rewrite the
-attribution fields that were previously unbound. It does nothing against an attacker who can
-rewrite the whole chain and recompute every hash forward, because nothing yet requires a key they
-do not have.
+**Context §1's "unkeyed" half and Context §2 are now closed; "unanchored" is not.** A complete
+preimage binds every field of an entry to its hash, catching an attacker who edits one row and
+leaves the digest stale. A signature catches the attacker that hash could never catch: one who
+edits a row *and recomputes its hash*, and every subsequent hash, exactly as the application
+would. That forgery is now detectable because producing a valid signature requires the private
+key, which lives in the KMS and to which the application's database role has no path.
+`tests/integration/test_ledger_signatures_db.py` performs that attack against a live database and
+asserts the verification failure, rather than asserting the property in prose.
 
-**Therefore PRD SR-4 ("tamper-evident even to an administrator with direct database access") is
-still open.** Closing it requires §1's signature over `(sequence || prev_entry_hash ||
-entry_hash)` from a KMS key the application's database role cannot read, and §3's external anchor
-to make truncation and rollback detectable. Until both land, the correct description of the
-ledgers is "tamper-evident against row-level edits", not "tamper-proof against a privileged
-insider".
+**What is still open, and it is not a footnote.** Signatures make *edits* detectable. They do
+nothing about **truncation or rollback**: an insider who deletes the last N entries, or restores
+an older backup, leaves a shorter chain in which every remaining entry still verifies perfectly.
+Nothing in the database can detect that, because the evidence of the missing entries is exactly
+what was removed. Only §3's externally-anchored monotonic root closes it, and that is Wave 1.3.
+
+**PRD SR-4 is therefore substantially met but not complete.** "Tamper-evident even to an
+administrator with direct database access" now holds for any modification to an entry that exists.
+It does not yet hold for the removal of entries. The honest description of the ledgers today is
+**"tamper-evident and non-repudiable against modification; not yet proof against truncation"** —
+and a court-facing verification report must say so until Wave 1.3 lands.
+
+**One consequence to carry forward.** Signing happens inside the caller's transaction and fails
+closed, so a KMS outage stops every audited write rather than allowing an unsigned one. That is
+the correct trade for a legal record, but it makes the KMS a hard availability dependency of the
+whole write path. Batched Merkle signing (Wave 1.3) is the mitigation this ADR's Consequences
+already anticipated.
 
 ## Context
 
@@ -100,8 +112,10 @@ Evidentiary ledgers become **authenticated, externally-anchored, crypto-agile** 
    a `signature` over `(sequence || prev_entry_hash || entry_hash)` produced by an
    asymmetric key held in a KMS/HSM the application's DB role cannot read (see ADR-0009
    Key Management). Verification is signature-based, so a writer without the key cannot forge.
-   - ⟨OPEN⟩ Signature algorithm: **Ed25519** (FIPS 186-5) vs **ECDSA P-256** — choose per
-     the deploying agency's FIPS/HSM posture. Hash: SHA-256 (or SHA-384 for higher assurance).
+   - Signature algorithm: **Ed25519** (FIPS 186-5) is the implemented policy default; ECDSA P-256
+     remains selectable per the deploying agency's FIPS/HSM posture, as a configuration change
+     rather than a code change (ADR-0009 §3 — callers never name an algorithm). Hash: SHA-256 (or
+     SHA-384 for higher assurance). The per-deployment ratification noted in Status is unchanged.
 2. **Complete, versioned canonical encoding.** All persisted evidentiary fields are
    covered. Encoding is deterministic and independent of JSONB round-trips: **RFC 8785 JCS**
    — resolved at acceptance in favour of independent verifiability over deterministic CBOR

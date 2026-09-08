@@ -40,6 +40,7 @@ from sentinelai.platform.auth.models import AuditLog
 from sentinelai.platform.config import settings
 from sentinelai.platform.crypto.ledger import LEDGER_HASH_ALGO, LEDGER_PREIMAGE_VERSION
 from sentinelai.platform.db.base import Base
+from tests.fixtures.kms import kms_for_tests
 
 _URL = os.getenv("TEST_DATABASE_URL", settings.database_url)
 _NOW = datetime(2026, 9, 8, 12, 0, 0, 123456, tzinfo=UTC)
@@ -115,6 +116,7 @@ async def test_audit_entry_reverifies_after_a_jsonb_roundtrip(
     async with sessions() as session:
         await record_audit_event(
             session,
+            kms=kms_for_tests(),
             actor_user_id=actor,
             actor_role="investigator",
             action="evidence.read",
@@ -158,6 +160,7 @@ async def test_postgres_really_does_reorder_the_details_object(
     async with sessions() as session:
         await record_audit_event(
             session,
+            kms=kms_for_tests(),
             actor_user_id=None,
             actor_role="system",
             action="probe",
@@ -186,6 +189,7 @@ async def test_tampering_with_a_stored_audit_row_is_detected(
     async with sessions() as session:
         await record_audit_event(
             session,
+            kms=kms_for_tests(),
             actor_user_id=uuid.uuid4(),
             actor_role="investigator",
             action="evidence.export",
@@ -237,6 +241,7 @@ async def test_audit_chain_links_across_multiple_entries(
         for index in range(3):
             await record_audit_event(
                 session,
+                kms=kms_for_tests(),
                 actor_user_id=uuid.uuid4(),
                 actor_role="investigator",
                 action=f"action.{index}",

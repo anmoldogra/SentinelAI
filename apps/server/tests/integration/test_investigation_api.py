@@ -9,13 +9,16 @@ from httpx import ASGITransport, AsyncClient
 from sentinelai.entrypoints.http.main import create_app
 from sentinelai.modules.investigation.service import InvestigationService, get_investigation_service
 from sentinelai.platform.auth.dependencies import CurrentUser, get_current_user
+from tests.fixtures.kms import kms_for_tests
 
 
 def _app_with_overrides(inv_uow) -> object:
     app = create_app()
     user = CurrentUser(user_id=uuid4(), roles=("investigator",))
     app.dependency_overrides[get_current_user] = lambda: user
-    app.dependency_overrides[get_investigation_service] = lambda: InvestigationService(inv_uow)
+    app.dependency_overrides[get_investigation_service] = lambda: InvestigationService(
+        inv_uow, kms=kms_for_tests()
+    )
     return app
 
 

@@ -10,6 +10,7 @@ from sentinelai.entrypoints.http.main import create_app
 from sentinelai.modules.ingestion.service import EvidenceService, get_evidence_service
 from sentinelai.platform.auth.dependencies import CurrentUser, get_current_user
 from tests.fixtures.fake_object_storage import FakeObjectStorage
+from tests.fixtures.kms import kms_for_tests
 
 
 def _app(ing_uow) -> object:
@@ -18,7 +19,7 @@ def _app(ing_uow) -> object:
     user = CurrentUser(user_id=uuid4(), roles=("investigator",))
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(
-        ing_uow, storage=FakeObjectStorage()
+        ing_uow, storage=FakeObjectStorage(), kms=kms_for_tests()
     )
     return app
 
@@ -52,7 +53,7 @@ async def test_ingest_unregistered_schema_returns_422(ing_uow) -> None:
     user = CurrentUser(user_id=uuid4(), roles=("investigator",))
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(
-        ing_uow, storage=FakeObjectStorage()
+        ing_uow, storage=FakeObjectStorage(), kms=kms_for_tests()
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post("/api/v1/evidence", json=_BODY)

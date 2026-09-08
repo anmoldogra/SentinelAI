@@ -29,10 +29,13 @@ async def scan_uploaded_evidence(ctx: dict[str, Any], evidence_id: UUID) -> None
     session_factory = ctx["session_factory"]
     scanner = ctx.get("malware_scanner") or build_malware_scanner()
     storage = ctx.get("object_storage") or build_object_storage()
+    # The worker already builds one KMS per process (entrypoints/worker/main.py); reusing it is
+    # the point — it owns a connection pool and a circuit breaker whose value is being shared.
+    kms = ctx["kms"]
 
     async with session_factory() as session:
         uow = IngestionUnitOfWork(session)
-        service = EvidenceService(uow, storage=storage)
+        service = EvidenceService(uow, storage=storage, kms=kms)
         try:
             await service.scan_and_promote(evidence_id, scanner, correlation_id=ctx.get("job_id"))
             await uow.commit()  # ADR-0005: the entrypoint (this job wrapper) owns the transaction

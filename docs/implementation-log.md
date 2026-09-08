@@ -1267,3 +1267,130 @@ partial field set with a non-canonical encoder, so they are not recomputable by 
 backfill. The dev database's ten audit rows and one custody row will read as `partial` in the
 console forever, which is the correct answer. Production is unaffected — there is no evidentiary
 data, which is the whole reason ADR-0003 insisted this land first.
+
+---
+
+## 2026-09-08 — IC-028: KMS signatures on both evidentiary ledgers (ADR-0003 §1)
+
+**Type:** Evidentiary-core security. Both ledger writers now sign; a new signing primitive, a key
+provisioning path, and a KMS dependency threaded through five services. No schema change — Wave
+1.1 already created the columns.
+
+**What this closes, precisely.** Wave 1.2 made the entry hash cover every persisted field, which
+catches an attacker who edits a row and leaves the digest stale. It could never catch the attacker
+ADR-0003 is actually about: nothing in a hash requires a secret, so an administrator with database
+access can edit a row, recompute its hash *and every subsequent hash*, and produce a chain that
+verifies perfectly. Every entry is now also signed under `KeyPurpose.EVIDENCE_ROOT` with a key the
+application's database role has no path to, so that forgery is detectable.
+`tests/integration/test_ledger_signatures_db.py` carries out exactly that attack against a live
+Postgres — raw `UPDATE`, hash recomputed the way the application would — and asserts the
+verification failure. The property is demonstrated, not asserted in prose.
+
+**`LedgerSigner` (platform/crypto/ledger.py).** Signing lives beside hashing deliberately: they
+are two halves of one operation, the signature covers the hash, and Wave 1.4 must check both or
+neither. A verifier that confirmed the hash and skipped the signature would report a forged chain
+as intact.
+
+**The signed message is canonical JSON, not a concatenation.** ADR-0003 §1 writes it as
+`(sequence || prev_entry_hash || entry_hash)`. Implemented literally, that is ambiguous the moment
+crypto agility does its job: a SHA-256 digest is 64 hex characters and a SHA-384 digest is 96, so
+`prev || entry` stops being uniquely parseable as soon as two algorithms coexist — the classic way
+to make two different tuples produce one signed byte string. It is built with JCS instead, which
+costs nothing and keeps the signed bytes reproducible by an independent verifier. A **ledger
+discriminator** is included so a signature made for the custody ledger cannot be presented as
+valid for audit; there is a test for that. ADR-0003 §1 was updated to record the refinement rather
+than leaving the code and the ADR disagreeing.
+
+`sequence` is `null` for `audit_log`, which has no sequence column — its ordering is the chain
+itself, and `entry_hash` already covers `audit_id`, so identity is bound regardless. A null
+sequence is distinct from `0` in JCS, and that is tested.
+
+**The `signature` column stores the whole envelope, not just the raw signature bytes.** The KMS
+signs a `SignedHeader` (ADR-0009 C1), not the message directly, and that header carries a
+timestamp captured at signing time and the required-algorithm set in force *then* — neither is
+derivable afterwards. Storing 64 raw Ed25519 bytes would have produced signatures nobody could
+ever verify again. The envelope is canonical JSON mirroring `SignedHeader.canonical_bytes()` field
+for field, 366 bytes for a single Ed25519 signature, and versioned independently of
+`preimage_version`. `sig_alg` and `key_id` are denormalized copies so operations can query "what
+was signed under the key version we are retiring" — they are **not** verification inputs, and a
+test rewrites both to lies and confirms verification is unaffected, because the envelope's own
+copies are the ones the signature covers.
+
+**`kms` is a required argument with no default, and that was the point.** Adding it to
+`record_audit_event` broke seven call sites across five modules and the CLI; the type checker
+found all of them. A default would have made an unsigned audit entry reachable by omission, which
+is precisely the failure this increment exists to prevent. `EvidenceService`, `CaseService`,
+`InvestigationService` and `AuthService` now take a KMS; the HTTP DI factories pull it from
+`app.state` (the existing `get_kms` dependency, matching the `MfaRepository` precedent) and the
+worker jobs reuse `ctx["kms"]`, which the worker entrypoint already built.
+
+**Nothing provisioned keys before this, so `make ensure-keys` was needed.** No code path called
+`kms.create_key`, and `create_key` is **not** idempotent — on an existing key it mints a new
+version, i.e. it rotates. So the new CLI command checks existence first and creates only when the
+key is genuinely absent. Silently rotating an evidence signing key because someone re-ran
+`make create-admin` would be a serious operational fault. `create-admin` and `dev-token` now
+ensure the key themselves, since both write audit entries.
+
+**Measured cost (dev provider, local):** 1.17 ms per signature, 0.56 ms per verification. The full
+backend suite went from 100 s to 137 s purely from real signing on every audited write.
+
+### Two things that are worse than they look, stated plainly
+
+**1. The KMS is now a hard availability dependency of every write path.** Signing happens inside
+the caller's transaction and fails closed: if the KMS is unreachable, the audit write raises and
+the whole business transaction aborts. For a legal record that is the correct trade — an unsigned
+entry is a hole no later process can fill, because the bytes that should have been signed are gone
+— but it means a Vault outage stops evidence ingestion, case updates, and logins, not just
+auditing. It also puts a network round-trip inside a database transaction, holding locks for its
+duration. ADR-0003's Consequences already anticipated this and named batched Merkle signing (Wave
+1.3) as the mitigation.
+
+**2. This increment widens a pre-existing chain-head race, and that should be the next task.**
+`_get_last_entry_hash` reads the current head with a plain `SELECT ... ORDER BY occurred_at DESC
+LIMIT 1` — no `FOR UPDATE`, no advisory lock — and there is **no unique constraint** on
+`audit_log.prev_entry_hash` or on `evidence_custody_events (evidence_id, sequence_number)`
+(verified against the initial migrations, not assumed). Two concurrent writers can therefore read
+the same head and both insert, forking the chain into two valid-looking branches. That defect
+predates this change, but signing adds a KMS round-trip *between the read and the insert*, which
+widens the window from sub-millisecond to however long the KMS takes — milliseconds locally, a
+network RTT with Vault. A forked ledger is not a hypothetical inconvenience on a court-facing
+record. The fix is a uniqueness constraint on the chain link plus a retry, or serialization of the
+append; it is a migration and belongs in its own increment rather than being bolted onto this one.
+
+### What is still open
+
+Signatures make **modification** detectable. They do nothing about **truncation or rollback**: an
+insider who deletes the last N entries, or restores an older backup, leaves a shorter chain in
+which every remaining entry verifies perfectly. Nothing inside the database can detect that,
+because the evidence of the missing entries is exactly what was removed. Only ADR-0003 §3's
+externally-anchored monotonic root closes it — Wave 1.3.
+
+So **PRD SR-4 is substantially met but not complete.** "Tamper-evident even to an administrator
+with direct database access" now holds for any modification to an entry that exists; it does not
+yet hold for removal of entries. The honest description is *"tamper-evident and non-repudiable
+against modification; not yet proof against truncation"*, and that is what the ADR and
+`security-architecture.md` §20/§22/§23 now say. `security-architecture.md` §20 previously called
+signing "an optional but recommended enhancement" — superseded for the two ledgers, while its
+genuinely open question (per-examiner vs system-level key custody, which is a legal decision as
+much as a technical one) is preserved and explicitly *not* resolved by this work. What is built
+supports "this system attests", not "this examiner attests".
+
+The Verification Engine (Wave 1.4) is still unbuilt. `LedgerSigner.verify` is the primitive it
+will call, but no endpoint or scheduled job invokes it yet, so nothing is checking these
+signatures in production — only the tests are.
+
+**Tests: 38 new** (28 unit, 10 integration), all against real Ed25519 from the dev provider. A
+stub would have made every tamper assertion vacuous, so `tests/fixtures/kms.py` builds the real
+provider on a throwaway keystore removed at exit. Existing tests needed the KMS threaded through
+46 service constructions across 13 files.
+
+**Gates.** ruff (lint + format), `mypy --strict` (186 files), import-linter (2/2 kept), full suite
+**805 passed / 2 skipped** (up from 767). Platform coverage **92.27%** against the 90% floor, with
+`crypto/ledger.py` at **100%**.
+
+**Known gap.** Rows written before this increment carry `signature = NULL`. They cannot be signed
+retroactively with any honesty — a signature applied now would attest to bytes nobody witnessed at
+the time — so they stay null forever and a verifier must report them as *not independently
+verifiable*, distinct from both verified and forged. That distinction is already implemented in
+`LedgerSigner.verify` (a missing envelope returns `False`, and callers check the column to tell
+the two apart) and in the console's `partial` status from IC-027.

@@ -32,6 +32,7 @@ from sentinelai.platform.config import settings
 from sentinelai.platform.storage import build_object_uri
 from sentinelai.shared.exceptions import LegalHoldViolationError
 from tests.fixtures.fake_object_storage import FakeObjectStorage
+from tests.fixtures.kms import kms_for_tests
 
 _REGISTERED = ("1.0.0", "osint", "web_page")
 _PAYLOAD = b"payload-bytes-under-test"
@@ -63,7 +64,7 @@ def _create(**overrides: object) -> EvidenceCreate:
 
 def _svc(ing_uow, storage: FakeObjectStorage | None = None) -> EvidenceService:  # type: ignore[no-untyped-def]
     ing_uow.attribute_schemas.registered.add(_REGISTERED)
-    return EvidenceService(ing_uow, storage=storage or FakeObjectStorage())
+    return EvidenceService(ing_uow, storage=storage or FakeObjectStorage(), kms=kms_for_tests())
 
 
 async def _payload_evidence(svc: EvidenceService, storage: FakeObjectStorage, actor):  # type: ignore[no-untyped-def]

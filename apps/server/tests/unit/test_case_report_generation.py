@@ -26,6 +26,7 @@ from sentinelai.modules.case_management.service import CaseService
 from sentinelai.platform.config import settings
 from sentinelai.platform.storage import parse_object_uri
 from tests.fixtures.fake_object_storage import FakeObjectStorage
+from tests.fixtures.kms import kms_for_tests
 
 
 class _FakeTaskQueue:
@@ -38,7 +39,7 @@ class _FakeTaskQueue:
 
 
 async def _case_with_report(uow: Any, actor: Any) -> tuple[CaseService, Any, Any, _FakeTaskQueue]:
-    service = CaseService(uow, storage=FakeObjectStorage())
+    service = CaseService(uow, storage=FakeObjectStorage(), kms=kms_for_tests())
     case = await service.create_case(CaseCreate(title="Operation X"), actor, "corr-1")
     queue = _FakeTaskQueue()
     report = await service.generate_report(
@@ -156,7 +157,7 @@ async def test_rerunning_a_completed_job_is_a_no_op(uow, actor) -> None:
 
 
 async def test_completing_an_unknown_report_raises_not_found(uow, actor) -> None:
-    service = CaseService(uow, storage=FakeObjectStorage())
+    service = CaseService(uow, storage=FakeObjectStorage(), kms=kms_for_tests())
     with pytest.raises(ReportNotFoundError):
         await service.complete_report(uuid4(), FakeObjectStorage(), "corr-1")
 

@@ -31,6 +31,8 @@ from sentinelai.platform.auth.repository import (
     get_user_repository,
 )
 from sentinelai.platform.config import settings
+from sentinelai.platform.crypto import get_kms
+from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.security.hashing import Argon2PasswordHasher, PasswordHasher
 from sentinelai.platform.security.tokens import generate_opaque_token
@@ -67,8 +69,13 @@ class AuthService:
         sessions: SessionRepository,
         hasher: PasswordHasher | None = None,
         ttl_seconds: int | None = None,
+        *,
+        kms: KeyManagementService,
     ) -> None:
         self._session = session
+        # Keyword-only and required: login success *and* failure are both audited
+        # (security-architecture §5), and both entries must be signed (ADR-0003 §1).
+        self._kms = kms
         self._users = users
         self._sessions = sessions
         self._hasher = hasher if hasher is not None else Argon2PasswordHasher()
@@ -123,6 +130,7 @@ class AuthService:
         roles = await self._sessions.get_role_names(user.user_id)
         await record_audit_event(
             self._session,
+            kms=self._kms,
             actor_user_id=user.user_id,
             actor_role=roles[0] if roles else "none",
             action="login_success",
@@ -155,6 +163,7 @@ class AuthService:
         """Record a rejected attempt. ``actor_user_id`` is null when no account resolved."""
         await record_audit_event(
             self._session,
+            kms=self._kms,
             actor_user_id=user.user_id if user is not None else None,
             actor_role="anonymous",
             action="login_failed",
@@ -172,6 +181,7 @@ async def get_auth_service(
     session: AsyncSession = Depends(get_session),
     users: UserRepository = Depends(get_user_repository),
     sessions: SessionRepository = Depends(get_session_repository),
+    kms: KeyManagementService = Depends(get_kms),
 ) -> AuthService:
     """FastAPI dependency providing a request-scoped ``AuthService``."""
-    return AuthService(session, users, sessions)
+    return AuthService(session, users, sessions, kms=kms)

@@ -35,10 +35,13 @@ async def generate_case_report(ctx: dict[str, Any], case_id: UUID, report_id: UU
     """
     session_factory = ctx["session_factory"]
     storage = ctx.get("object_storage") or build_object_storage()
+    # One KMS per worker process (entrypoints/worker/main.py) — it owns a connection pool
+    # and a circuit breaker whose whole value is being shared across jobs.
+    kms = ctx["kms"]
 
     async with session_factory() as session:
         uow = CaseManagementUnitOfWork(session)
-        service = CaseService(uow, storage=storage)
+        service = CaseService(uow, storage=storage, kms=kms)
         try:
             await service.complete_report(
                 report_id, storage, correlation_id=str(ctx.get("job_id") or case_id)
@@ -53,6 +56,6 @@ async def generate_case_report(ctx: dict[str, Any], case_id: UUID, report_id: UU
     # Fresh transaction: the one above is dead, and the failure must be visible to a poller.
     async with session_factory() as session:
         failure_uow = CaseManagementUnitOfWork(session)
-        await CaseService(failure_uow, storage=storage).fail_report(report_id, reason)
+        await CaseService(failure_uow, storage=storage, kms=kms).fail_report(report_id, reason)
         await failure_uow.commit()
     raise RuntimeError(f"case report {report_id} failed to generate: {reason}")

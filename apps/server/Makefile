@@ -22,7 +22,7 @@ ADMIN_ROLE := admin
 
 .PHONY: help install lint format typecheck lint-imports test test-unit test-integration \
         test-migrations hooks check run-api run-worker migrate compose-up compose-down \
-        compose-logs create-admin dev-token
+        compose-logs create-admin dev-token ensure-keys
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -69,6 +69,9 @@ run-worker: ## Run the arq worker entrypoint (dev)
 
 migrate: ## Apply all per-module Alembic migrations in DAG order
 	./scripts/migrate.sh
+
+ensure-keys: ## Create the evidence signing key if absent (idempotent; never rotates)
+	$(PY) -m sentinelai.cli.admin ensure-keys
 
 create-admin: ## Create the local admin user + role grant (idempotent; needs `make migrate` first)
 	$(PY) -m sentinelai.cli.admin create-user \

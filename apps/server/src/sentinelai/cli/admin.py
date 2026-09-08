@@ -39,6 +39,8 @@ from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.models import Role, User, UserRole
 from sentinelai.platform.auth.repository import SessionRepository, UserRepository
 from sentinelai.platform.config import settings
+from sentinelai.platform.crypto import KeyManagementService, KeyNotFound, create_kms
+from sentinelai.platform.crypto.ledger import EVIDENCE_LEDGER_KEY
 from sentinelai.platform.db.session import async_session_factory, dispose_engine
 from sentinelai.platform.security.hashing import Argon2PasswordHasher
 from sentinelai.platform.security.tokens import generate_opaque_token
@@ -122,6 +124,43 @@ async def _grant_role(session: AsyncSession, user_id: UUID, role: Role) -> bool:
     return True
 
 
+async def _ensure_evidence_key() -> tuple[KeyManagementService, bool]:
+    """Return a started KMS plus whether it had to create the evidence signing key.
+
+    Every audit write is signed under ``KeyPurpose.EVIDENCE_ROOT`` (ADR-0003 §1), and the CLI
+    writes audit entries, so it needs the key to exist. ``create_key`` is **not** idempotent — on
+    an existing key it mints a new version, i.e. it rotates — so existence is checked first and
+    creation only happens when the key is genuinely absent. Silently rotating an evidence signing
+    key because someone re-ran ``create-admin`` would be a serious operational fault.
+    """
+    kms = create_kms(settings)
+    await kms.start()
+    try:
+        await kms.get_metadata(EVIDENCE_LEDGER_KEY)
+        return kms, False
+    except KeyNotFound:
+        await kms.create_key(EVIDENCE_LEDGER_KEY)
+        return kms, True
+
+
+async def ensure_keys() -> int:
+    """Create the evidence signing key if it does not exist. Idempotent; safe to re-run."""
+    kms, created = await _ensure_evidence_key()
+    try:
+        metadata = await kms.get_metadata(EVIDENCE_LEDGER_KEY)
+    finally:
+        await kms.aclose()
+    verb = "created" if created else "already present"
+    print(
+        f"evidence signing key {verb}: provider={metadata.key_id.provider.value} "
+        f"ref={metadata.key_id.backend_ref} version={metadata.key_id.version} "
+        f"algorithm={metadata.algorithm.value}"
+    )
+    if not created:
+        print("(re-running never rotates — use an explicit rotation procedure for that)")
+    return 0
+
+
 async def create_user(
     *,
     email: str,
@@ -132,6 +171,9 @@ async def create_user(
 ) -> int:
     """Create (or top up) a user and ensure the role grant. Idempotent."""
     hasher = Argon2PasswordHasher()
+    kms, key_created = await _ensure_evidence_key()
+    if key_created:
+        print("created the evidence signing key (KeyPurpose.EVIDENCE_ROOT)")
     async with async_session_factory() as session:
         users = UserRepository(session)
         existing = await users.get_by_email(email)
@@ -172,6 +214,7 @@ async def create_user(
 
         await record_audit_event(
             session,
+            kms=kms,
             actor_user_id=None,  # provisioned out of band, not by a signed-in operator
             actor_role="system",
             action="user_provisioned",
@@ -181,6 +224,7 @@ async def create_user(
             details={"email": user.email, "role": role_name, "via": "cli"},
         )
         await session.commit()  # ADR-0005: the entrypoint owns the transaction
+    await kms.aclose()
     return 0
 
 
@@ -192,6 +236,7 @@ async def issue_dev_token(*, email: str, ttl_days: int, quiet: bool) -> int:
             f"(APP_ENV={settings.app_env}). This bypasses password verification and MFA."
         )
 
+    kms, _ = await _ensure_evidence_key()
     async with async_session_factory() as session:
         user = await UserRepository(session).get_by_email(email)
         if user is None:
@@ -210,6 +255,7 @@ async def issue_dev_token(*, email: str, ttl_days: int, quiet: bool) -> int:
         )
         await record_audit_event(
             session,
+            kms=kms,
             actor_user_id=user.user_id,
             actor_role="system",
             action="dev_session_issued",
@@ -219,6 +265,7 @@ async def issue_dev_token(*, email: str, ttl_days: int, quiet: bool) -> int:
             details={"ttl_days": ttl_days, "via": "cli"},
         )
         await session.commit()  # ADR-0005: the entrypoint owns the transaction
+    await kms.aclose()
 
     if quiet:
         print(token)
@@ -252,6 +299,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reset the password if the user already exists.",
     )
 
+    sub.add_parser(
+        "ensure-keys",
+        help="Create the evidence signing key if absent (idempotent; never rotates)",
+    )
+
     token = sub.add_parser("dev-token", help="Mint a long-lived session token (non-production)")
     token.add_argument("--email", required=True)
     token.add_argument("--ttl-days", type=int, default=_DEV_TOKEN_DEFAULT_DAYS)
@@ -274,6 +326,8 @@ async def _run(args: argparse.Namespace) -> int:
                 display_name=args.display_name,
                 update_password=args.update_password,
             )
+        if args.command == "ensure-keys":
+            return await ensure_keys()
         return await issue_dev_token(email=args.email, ttl_days=args.ttl_days, quiet=args.quiet)
     finally:
         await dispose_engine()

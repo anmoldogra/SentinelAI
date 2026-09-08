@@ -25,6 +25,7 @@ from sentinelai.platform.config import settings
 from sentinelai.platform.storage import StorageUnavailable, build_object_uri
 from sentinelai.shared.exceptions import ValidationFailedError
 from tests.fixtures.fake_object_storage import FakeObjectStorage
+from tests.fixtures.kms import kms_for_tests
 
 _REGISTERED = ("1.0.0", "osint", "web_page")
 _PAYLOAD = b"forensic-image-bytes"
@@ -62,7 +63,7 @@ def _evidence_create(
 
 def _svc(ing_uow, storage: FakeObjectStorage) -> EvidenceService:  # type: ignore[no-untyped-def]
     ing_uow.attribute_schemas.registered.add(_REGISTERED)
-    return EvidenceService(ing_uow, storage=storage)
+    return EvidenceService(ing_uow, storage=storage, kms=kms_for_tests())
 
 
 async def _stored_evidence(  # type: ignore[no-untyped-def]

@@ -29,9 +29,12 @@ from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.platform.auth.models import AuditLog
+from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.crypto.ledger import (
+    LEDGER_AUDIT,
     LEDGER_HASH_ALGO,
     LEDGER_PREIMAGE_VERSION,
+    LedgerSigner,
     compute_entry_hash,
     ledger_timestamp,
     ledger_uuid,
@@ -96,6 +99,7 @@ def _compute_hash(
 async def record_audit_event(
     session: AsyncSession,
     *,
+    kms: KeyManagementService,
     actor_user_id: UUID | None,
     actor_role: str,
     action: str,
@@ -106,7 +110,20 @@ async def record_audit_event(
     user_agent: str | None = None,
     details: dict[str, Any] | None = None,
 ) -> None:
-    """Append one tamper-evident audit entry, on the caller's open transaction."""
+    """Append one authenticated audit entry, on the caller's open transaction.
+
+    ``kms`` is required, with no default. That is the point: an unsigned audit entry must be
+    impossible to write, and a default would make one reachable by omission. Every call site
+    supplies a KMS or fails to compile.
+
+    **This performs a KMS operation inside the caller's transaction, and fails closed.** If the
+    signing backend is unreachable the write raises and the whole transaction aborts — the audited
+    action does not happen. That is the correct trade for a legal record (an unsigned entry is a
+    hole no later process can fill, because the bytes that should have been signed are gone), but
+    it is a real coupling: with a remote KMS, signing latency is added to every audited write and a
+    KMS outage stops them. ADR-0003 anticipates this and points at batched Merkle signing (Wave
+    1.3) as the mitigation.
+    """
     prev_hash = await _get_last_entry_hash(session)
     # Both are generated here rather than left to a column default, because both are part of the
     # preimage: the row's own identity is bound to its hash, so an entry's contents cannot be
@@ -127,6 +144,15 @@ async def record_audit_event(
         user_agent=user_agent,
         details=details,
     )
+    # Signed before the insert, so a signing failure means no row rather than an unsigned one.
+    signature = await LedgerSigner(kms).sign(
+        ledger=LEDGER_AUDIT,
+        # `audit_log` has no sequence column — its ordering is the chain itself. `entry_hash`
+        # already covers `audit_id` and every other persisted field, so identity is bound anyway.
+        sequence=None,
+        prev_hash=prev_hash,
+        entry_hash=entry_hash,
+    )
     await session.execute(
         insert(AuditLog).values(
             audit_id=audit_id,
@@ -144,5 +170,8 @@ async def record_audit_event(
             entry_hash=entry_hash,
             hash_algo=LEDGER_HASH_ALGO,
             preimage_version=LEDGER_PREIMAGE_VERSION,
+            signature=signature.envelope,
+            sig_alg=signature.sig_alg,
+            key_id=signature.key_id,
         )
     )

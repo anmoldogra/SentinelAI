@@ -15,6 +15,7 @@ from sentinelai.modules.investigation.models import Entity
 from sentinelai.modules.investigation.service import InvestigationService, entity_etag
 from sentinelai.shared.exceptions import PreconditionFailedError, ValidationFailedError
 from sentinelai.shared.pagination import PageParams
+from tests.fixtures.kms import kms_for_tests
 
 
 def _proposed_entity() -> Entity:
@@ -33,7 +34,7 @@ def _proposed_entity() -> Entity:
 async def test_review_entity_confirm_writes_revision_and_no_event(inv_uow, actor) -> None:
     entity = _proposed_entity()
     await inv_uow.entities.add(entity)
-    svc = InvestigationService(inv_uow)
+    svc = InvestigationService(inv_uow, kms=kms_for_tests())
     updated = await svc.review_entity_status(
         entity.entity_id, "confirmed", actor, "c", entity_etag(entity)
     )
@@ -47,7 +48,7 @@ async def test_review_entity_already_reviewed_is_conflict(inv_uow, actor) -> Non
     entity = _proposed_entity()
     entity.status = "rejected"
     await inv_uow.entities.add(entity)
-    svc = InvestigationService(inv_uow)
+    svc = InvestigationService(inv_uow, kms=kms_for_tests())
     with pytest.raises(FindingAlreadyReviewedError):
         await svc.review_entity_status(
             entity.entity_id, "confirmed", actor, "c", entity_etag(entity)
@@ -57,7 +58,7 @@ async def test_review_entity_already_reviewed_is_conflict(inv_uow, actor) -> Non
 async def test_review_entity_invalid_disposition(inv_uow, actor) -> None:
     entity = _proposed_entity()
     await inv_uow.entities.add(entity)
-    svc = InvestigationService(inv_uow)
+    svc = InvestigationService(inv_uow, kms=kms_for_tests())
     with pytest.raises(ValidationFailedError):
         await svc.review_entity_status(
             entity.entity_id, "archived", actor, "c", entity_etag(entity)
@@ -67,13 +68,13 @@ async def test_review_entity_invalid_disposition(inv_uow, actor) -> None:
 async def test_review_entity_etag_mismatch(inv_uow, actor) -> None:
     entity = _proposed_entity()
     await inv_uow.entities.add(entity)
-    svc = InvestigationService(inv_uow)
+    svc = InvestigationService(inv_uow, kms=kms_for_tests())
     with pytest.raises(PreconditionFailedError):
         await svc.review_entity_status(entity.entity_id, "confirmed", actor, "c", 'W/"stale"')
 
 
 async def test_get_entity_not_found(inv_uow, actor) -> None:
-    svc = InvestigationService(inv_uow)
+    svc = InvestigationService(inv_uow, kms=kms_for_tests())
     with pytest.raises(EntityNotFoundError):
         await svc.get_entity(uuid4(), actor)
 
@@ -81,7 +82,7 @@ async def test_get_entity_not_found(inv_uow, actor) -> None:
 async def test_list_entities_pagination_reports_has_more(inv_uow, actor) -> None:
     for _ in range(3):
         await inv_uow.entities.add(_proposed_entity())
-    svc = InvestigationService(inv_uow)
+    svc = InvestigationService(inv_uow, kms=kms_for_tests())
     items, next_cursor, has_more = await svc.list_entities(
         actor, None, PageParams(limit=2, cursor=None)
     )

@@ -25,6 +25,7 @@ from sentinelai.platform.security.scanner import DummyMalwareScanner, ScanResult
 from sentinelai.platform.storage import build_object_uri, parse_object_uri
 from sentinelai.shared.exceptions import ValidationFailedError
 from tests.fixtures.fake_object_storage import FakeObjectStorage
+from tests.fixtures.kms import kms_for_tests
 
 _PAYLOAD = b"uploaded-object-bytes"
 _PAYLOAD_SHA256 = hashlib.sha256(_PAYLOAD).hexdigest()
@@ -51,7 +52,7 @@ async def _quarantined(ing_uow, actor, storage, *, category="osint", artifact_ty
     ing_uow.attribute_schemas.registered.add(("1.0.0", category, artifact_type))
     key = f"evidence/{category}/{artifact_type}/{uuid4()}"
     await storage.put_stream(_QUARANTINE, key, _bytes(_PAYLOAD))
-    svc = EvidenceService(ing_uow, storage=storage)
+    svc = EvidenceService(ing_uow, storage=storage, kms=kms_for_tests())
     evidence = await svc.ingest_evidence(
         EvidenceCreate(
             schema_version="1.0.0",
@@ -253,7 +254,7 @@ async def test_missing_object_raises_rather_than_promoting(ing_uow, actor) -> No
 
 async def test_evidence_without_a_payload_cannot_be_scanned(ing_uow, actor) -> None:  # type: ignore[no-untyped-def]
     ing_uow.attribute_schemas.registered.add(("1.0.0", "osint", "web_page"))
-    svc = EvidenceService(ing_uow, storage=FakeObjectStorage())
+    svc = EvidenceService(ing_uow, storage=FakeObjectStorage(), kms=kms_for_tests())
     evidence = await svc.ingest_evidence(
         EvidenceCreate(
             schema_version="1.0.0",
@@ -274,7 +275,7 @@ async def test_evidence_without_a_payload_cannot_be_scanned(ing_uow, actor) -> N
 
 
 async def test_scanning_unknown_evidence_raises_not_found(ing_uow, actor) -> None:  # type: ignore[no-untyped-def]
-    svc = EvidenceService(ing_uow, storage=FakeObjectStorage())
+    svc = EvidenceService(ing_uow, storage=FakeObjectStorage(), kms=kms_for_tests())
     with pytest.raises(EvidenceNotFoundError):
         await svc.scan_and_promote(uuid4(), DummyMalwareScanner())
 

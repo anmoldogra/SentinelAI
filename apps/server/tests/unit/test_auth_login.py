@@ -26,6 +26,7 @@ from sentinelai.platform.auth.service import AuthService, get_auth_service
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.security.tokens import LOOKUP_PREFIX_LENGTH, token_lookup_prefix
 from sentinelai.shared.exceptions import UnauthenticatedError
+from tests.fixtures.kms import kms_for_tests
 
 _PASSWORD = "correct-horse-battery-staple"
 
@@ -133,6 +134,7 @@ def make_service(
         sessions,  # type: ignore[arg-type]
         hasher=hasher,
         ttl_seconds=ttl_seconds,
+        kms=kms_for_tests(),
     )
     return service, sessions, hasher
 

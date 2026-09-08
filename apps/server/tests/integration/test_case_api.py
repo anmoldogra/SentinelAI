@@ -20,6 +20,7 @@ from sentinelai.platform.auth.dependencies import (
 )
 from sentinelai.platform.tasks import get_task_queue
 from tests.fixtures.fake_object_storage import FakeObjectStorage
+from tests.fixtures.kms import kms_for_tests
 
 
 class _AllowAll:
@@ -53,7 +54,9 @@ def _app_with_overrides(uow, storage=None, task_queue=None) -> object:
     shared_storage = storage if storage is not None else FakeObjectStorage()
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_case_access_checker] = lambda: _AllowAll()
-    app.dependency_overrides[get_case_service] = lambda: CaseService(uow, storage=shared_storage)
+    app.dependency_overrides[get_case_service] = lambda: CaseService(
+        uow, storage=shared_storage, kms=kms_for_tests()
+    )
     if task_queue is not None:
         app.dependency_overrides[get_task_queue] = lambda: task_queue
     return app
@@ -130,7 +133,7 @@ async def test_report_lifecycle_api_flow(uow) -> None:
         assert too_early.json()["error"]["code"] == "CONFLICT"
 
         # 4. The worker runs.
-        await CaseService(uow, storage=storage).complete_report(
+        await CaseService(uow, storage=storage, kms=kms_for_tests()).complete_report(
             UUID(report_id), storage, "corr-report-lifecycle"
         )
 

@@ -48,6 +48,8 @@ from sentinelai.modules.investigation.repository import (
 from sentinelai.modules.investigation.schemas import EntityCreate
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CurrentUser
+from sentinelai.platform.crypto import get_kms
+from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.tasks import TaskQueue
 from sentinelai.shared.exceptions import PreconditionFailedError, ValidationFailedError
 from sentinelai.shared.pagination import PageParams, decode_cursor, encode_cursor
@@ -96,14 +98,18 @@ def _actor_role(actor: CurrentUser) -> str:
 
 
 class InvestigationService:
-    def __init__(self, uow: InvestigationUnitOfWork) -> None:
+    def __init__(self, uow: InvestigationUnitOfWork, *, kms: KeyManagementService) -> None:
         self._uow = uow
+        # Required, not optional: every audit write this service makes must be signed
+        # (ADR-0003 §1), and an optional KMS would make an unsigned one reachable.
+        self._kms = kms
 
     async def _audit(
         self, actor: CurrentUser, action: str, target_id: UUID, details: dict[str, object]
     ) -> None:
         await record_audit_event(
             self._uow.session,
+            kms=self._kms,
             actor_user_id=actor.user_id,
             actor_role=_actor_role(actor),
             action=action,
@@ -398,8 +404,9 @@ def _paginate[T](
 
 def get_investigation_service(
     uow: InvestigationUnitOfWork = Depends(get_investigation_uow),
+    kms: KeyManagementService = Depends(get_kms),
 ) -> InvestigationService:
-    return InvestigationService(uow)
+    return InvestigationService(uow, kms=kms)
 
 
 __all__ = [
