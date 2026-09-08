@@ -115,15 +115,17 @@ Representative `artifact_type` values per category (additive — new types are a
 
 | Category | Artifact types |
 |---|---|
-| `digital_forensics` | `disk_image`, `memory_dump`, `file_artifact`, `registry_hive`, `event_log`, `network_capture`, `email_archive` |
-| `mobile_forensics` | `full_extraction`, `file_system_extraction`, `call_log`, `sms_mms_message`, `app_data_artifact`, `device_metadata`, `location_history` |
+| `digital_forensics` | `disk_image`, `memory_dump`, `file_artifact`, `registry_hive`, `event_log`, `network_capture`, `email_archive`, `forensic_image` |
+| `mobile_forensics` | `full_extraction`, `file_system_extraction`, `call_log`, `sms_mms_message`, `app_data_artifact`, `device_metadata`, `location_history`, `oxygen_extraction` |
 | `osint` | `public_record`, `domain_whois`, `breach_data_record`, `web_page_snapshot`, `image_metadata`, `people_search_result` |
 | `threat_intelligence` | `ioc`, `threat_actor_profile`, `malware_sample_metadata`, `ttp_report`, `vulnerability_reference` |
 | `social_media_intelligence` | `post`, `profile_snapshot`, `comment`, `direct_message`, `network_connection_snapshot`, `media_upload` |
 | `blockchain_intelligence` | `wallet_address`, `transaction`, `smart_contract`, `exchange_attribution`, `token_transfer`, `cluster_attribution` |
-| `drone_iot` | `flight_log`, `telemetry_stream`, `sensor_reading`, `captured_media`, `device_registration`, `geofence_event` |
-| `cloud_evidence` | `storage_object`, `access_log`, `api_call_log`, `container_image_snapshot`, `saas_audit_log`, `configuration_snapshot` |
+| `drone_iot` | `flight_log`, `telemetry_stream`, `sensor_reading`, `captured_media`, `device_registration`, `geofence_event`, `cfid_log`, `datcon_log` |
+| `cloud_evidence` | `storage_object`, `access_log`, `api_call_log`, `container_image_snapshot`, `saas_audit_log`, `configuration_snapshot`, `oxygen_cloud_extraction` |
 | `manual` | `analyst_note`, `external_document`, `physical_evidence_record` |
+
+Some artifact types name a **specific acquisition format** rather than a generic shape, because the format determines the parser and the attributes schema: `cfid_log`/`datcon_log` are the two DJI flight-log formats; `oxygen_extraction`/`oxygen_cloud_extraction` are Oxygen Forensic device and cloud extractions; `forensic_image` is a forensic disk image carrying an acquisition manifest (as distinct from a raw `disk_image`). These five are the baseline seeded into the schema registry by migration `202608300002_ingestion_seed`.
 
 Each `(category, artifact_type)` pair has a registered `attributes` schema (Section 12's schema registry) — e.g. an `sms_mms_message` requires `sender`, `recipient`, `body`, `direction`; a `wallet_address` requires `chain`, `address`, `attribution_confidence`.
 
