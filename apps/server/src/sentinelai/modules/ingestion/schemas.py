@@ -60,6 +60,19 @@ class CustodyEventCreate(BaseModel):
 
 
 class CustodyEventRead(BaseModel):
+    """One custody ledger entry (CEM §4, api-design.md §5).
+
+    Exposes every field of the entry-hash preimage, because `api-design.md` §5 commits this
+    endpoint to returning each event so "the chain is independently verifiable by the caller" —
+    and a caller can only recompute `entry_hash` if it receives every input that went into it.
+    `_custody_entry_hash` hashes `{prev, evidence_id, seq, event_type, integrity_hash_at_event,
+    occurred_at}`, so omitting `prev_event_hash` or `integrity_hash_at_event` (as this schema
+    previously did) left the ledger displayable but unverifiable.
+
+    Additive only — no field is renamed or removed, so per `api-design.md` §2.2 this does not bump
+    the API version.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     custody_event_id: UUID
@@ -68,7 +81,19 @@ class CustodyEventRead(BaseModel):
     event_type: str
     occurred_at: datetime
     actor_user_id: UUID | None
+    # The actor's role *at the time of the action*, retained even if the role later changes.
+    actor_role: str | None
+    authority_ref: str | None
+    # Payload hash recomputed at this event — proves what was accessed/exported/analyzed matched
+    # the original (CEM §4).
+    integrity_hash_at_event: str
+    # Returned as stored, including the all-zero genesis sentinel, rather than mapped to null.
+    # The sentinel is what `_custody_entry_hash` actually hashed for the first entry, so a client
+    # that received `null` here could not reproduce the genesis preimage without knowing the
+    # convention out of band — which would defeat the point of exposing the chain at all.
+    prev_event_hash: str
     entry_hash: str
+    notes: str | None
 
 
 class EvidenceSupersedeCreate(BaseModel):

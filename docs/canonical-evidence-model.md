@@ -89,7 +89,7 @@ Custody is an **append-only, hash-chained ledger** of events per `evidence_id` �
 | `actor_role` | string | The actor's role *at the time of the action* (kept even if the role later changes) |
 | `authority_ref` | string, optional | Legal authority relevant to this specific action, if distinct from the evidence's own `classification.legal_authority_ref` |
 | `integrity_hash_at_event` | hash | Payload hash recomputed at this event — proves what was accessed/exported/analyzed matched the original |
-| `prev_event_hash` | hash, nullable | The `entry_hash` of the previous event for this `evidence_id` (null only for the genesis `collected`/`ingested` event) |
+| `prev_event_hash` | hash | The `entry_hash` of the previous event for this `evidence_id`. The genesis `collected`/`ingested` event has no predecessor and carries the **all-zero sentinel** (64 `0` characters), not null — the column is `NOT NULL`, and the sentinel is the literal value hashed into that entry's own `entry_hash`, so a verifying client must receive it to reproduce the genesis preimage |
 | `entry_hash` | hash | Computed over this entry's own fields plus `prev_event_hash` |
 | `notes` | string, optional | Free text (e.g. reason for access) |
 
@@ -450,7 +450,7 @@ Illustrative examples — abbreviated to the fields most relevant to each catego
     "occurred_at": "2026-06-02T14:03:00Z",
     "actor_id": "examiner:priya.n",
     "actor_role": "forensic_examiner",
-    "prev_event_hash": null,
+    "prev_event_hash": "0000000000000000000000000000000000000000000000000000000000000000",
     "entry_hash": "h1..."
   },
   {

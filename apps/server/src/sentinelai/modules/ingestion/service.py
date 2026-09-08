@@ -225,7 +225,8 @@ class EvidenceService:
             authority_ref=authority_ref,
             notes=notes,
             integrity_hash_at_event=integrity_hash_at_event,
-            # CEM §4: genesis has null prev; the column is NOT NULL, so a sentinel is stored.
+            # CEM §4: the genesis entry carries the all-zero sentinel, which is also the literal
+            # value hashed into its `entry_hash` — so it is stored and returned, never nulled.
             prev_event_hash=prev_hash,
             entry_hash=entry_hash,
         )
