@@ -111,7 +111,11 @@ flowchart TB
     F3 -.-> API
 ```
 
-Each feature owns its own routes, data-fetching hooks (Section 10), and components; **features never import from one another directly** — the only sanctioned cross-feature communication is through shared data (a React Query cache entry another feature also queries) or navigation (a route link), never a direct component/hook import across the `features/` boundary. This is the frontend expression of the same discipline `apps/server/README.md`'s module boundary rules enforce on the backend.
+Each feature owns its own routes, data-fetching hooks (Section 10), and components; **a feature's internals are private to it.** Sanctioned cross-feature communication is through shared data (a React Query cache entry another feature also queries), navigation (a route link), or a feature's declared **public surface** — never a reach into another feature's internal files.
+
+**The public surface is a single `features/<name>/public.ts`**, the frontend analogue of `apps/server/src/sentinelai/modules/*/public.py` that `CLAUDE.md`'s rule 7 already mandates on the backend. It re-exports the narrow set another feature legitimately needs, and everything else in the feature stays private. `features/cases/routes/CaseEvidencePage.tsx` importing `useEvidenceItem` from `@/features/evidence/public` is correct; importing it from `@/features/evidence/api/useEvidenceItem` is the violation. This exists because domain data genuinely crosses features — a case's evidence links, an entity-graph node, and a timeline entry all carry a bare `evidence_id` that only the `evidence` feature knows how to resolve, and `database-design.md`'s no-cross-schema-FK rule means the backend cannot pre-join it away. Keeping that resolution in one owning feature behind one exported hook is what stops each consumer growing its own copy.
+
+A public surface stays deliberately narrow: export what a consumer needs to *use* the feature, not its internal fetchers, and never a component's internal state. If a consumer needs something not exported, the fix is a considered addition to `public.ts` — not a deeper import. This is the frontend expression of the same discipline `apps/server/README.md`'s module boundary rules enforce on the backend.
 
 ## 4. Route Hierarchy
 
@@ -344,6 +348,8 @@ Two layers, mirroring `api-design.md` §2.4's 400-vs-422 distinction and `securi
 
 ## 17. Modal Architecture
 
+**Layout spec.** A modal is a `surface-raised` panel on a `scrim` backdrop, capped at a readable measure (roughly 32rem for a form modal) and always inset from the viewport edge so it never becomes a full-bleed sheet on a narrow window. Structure is fixed so the shape is learnable: a heading row that labels the dialog for assistive technology, a single-column field stack, an error region directly above the actions, and a right-aligned action row whose primary action is the accent-filled control and whose cancel is a bordered ghost. Field labels and help text are compact and monospaced where they name a field or an enum value (Section 19.1); the values an analyst types are proportional. Implemented on the platform's native dialog primitive rather than a hand-built overlay, so the focus trap, `Esc` handling, and background inerting come from the platform instead of from effects that have to be kept correct by hand.
+
 Three modal categories: **confirmation dialogs** (destructive/consequential actions — rejecting a finding, unlinking evidence from a case); **form modals** (quick case creation, evidence linking) for actions that don't warrant a full route; **detail/preview modals** (a quick look at an evidence item without leaving a list context). **Principle for choosing modal vs. route:** if a view needs to be bookmarked, deep-linked, or shared (Section 9's URL-state principle), it is a route, not a modal — the Entity Graph (Section 27) and any evidence detail view an analyst might want to send a supervisor are always routes. **No modal stacking** — opening a second modal while one is open replaces it rather than layering, since stacked modals are disorienting mid-investigation and rarely represent an intentional workflow.
 
 | Category | Example | Dismiss behavior |
@@ -372,6 +378,34 @@ Named, semantic token categories — described as a taxonomy, not as CSS values:
 | Motion | Duration/easing roles for transitions, kept minimal and non-distracting given the focus-intensive nature of the work |
 
 Every component (Section 20–21) consumes tokens by role, never a raw value — the enforcement mechanism for Section 18's theming and Section 44's visual consistency.
+
+### 19.1 The tactical console palette
+
+SentinelAI's visual language is a **tactical OSINT / SOC operations console**: a dark-first, high-density surface where an analyst reads dense evidentiary data for hours. Dark is the *primary* look, not the only one — Section 18's light and high-contrast themes remain first-class, and this palette defines what each role resolves to in each theme rather than replacing the role layer.
+
+The table below is the one place in this document that names colour families. It is a statement about **what the roles resolve to**, not a licence for components to reach past them: the rule above still holds without exception, and the concrete values live in `apps/web/src/index.css`.
+
+| Role | Palette family | Rationale |
+|---|---|---|
+| `canvas`, `surface`, `surface-raised`, `border` | Slate / zinc, deepening from raised panel → surface → canvas | A neutral cool grey recedes, so saturated status colour is the only thing that draws the eye. Three surface steps (not two) are what make a multi-panel workspace legible without drawing a border around every region. |
+| `accent` | Cyan | Reserved for interactive affordance — focus rings, primary actions, links. Deliberately *not* used for status, so "cyan" always means "you can act on this". |
+| `status-open` | Emerald | Active/healthy. |
+| `status-archived` | Amber | Attention/degraded — the state that is neither active nor an error. |
+| `danger` | Rose | Failure and destructive intent: validation errors, failed jobs, destructive confirmations. Distinct from amber on purpose; conflating "needs attention" with "something broke" is exactly the ambiguity an operations console cannot afford. |
+| `status-closed` | Neutral slate | Terminal but unremarkable — intentionally the least visually assertive state. |
+| `scrim` | Translucent near-black | Modal backdrop (Section 17). A token rather than a hardcoded overlay, so the dimming level is themeable with everything else. |
+
+**Monospace is a semantic role, not a stylistic preference.** Evidentiary identifiers, hashes, timestamps, cursors, and metadata keys render in a monospaced face because their *character-level* content matters: an analyst comparing two SHA-256 digests or transcribing a case ID needs column alignment and unambiguous `0`/`O`, `1`/`l` glyphs. Prose — titles, descriptions, labels, body copy — stays proportional. The face is the platform's own monospace stack rather than a bundled webfont, because Section 2's air-gapped deployment profile cannot fetch one and a font that silently fails to load would take the disambiguation guarantee with it.
+
+| Renders monospaced | Renders proportional |
+|---|---|
+| Case/evidence/entity IDs, hashes, `payload_ref`s, pagination cursors | Case titles and descriptions |
+| Timestamps and durations | Headings, navigation, prose |
+| Metadata keys, enum/status values, field names | Help text, validation messages, and empty-state prose |
+| Form labels and panel headers that name an API field or a resource | The values an analyst types into those fields |
+| Action/command labels in a modal action row or panel toolbar (Section 17) | Body copy and anything read as a sentence |
+
+A form label is a *field name*, so it takes the monospaced treatment (compact, uppercase, quiet) — the prose beside it explaining the field does not. This is the one place the two columns above meet, and Section 17's modal spec resolves it the same way.
 
 **Worked example — classification tokens end to end.** `security-architecture.md` §38 defines four classification levels. The Design Tokens layer defines one color role per level (not a hex value — a role like "classification-restricted"); the `StatusBadge` composite (Section 20) consumes that role plus the level's text label and an icon (Section 36's color-plus-text rule); the Evidence Explorer (Section 26), Entity Graph (Section 27, via classification inheritance from `security-architecture.md` §38), and Case Overview (Section 25) all render the *same* badge component for the *same* underlying level — so an analyst learns the visual language once and it holds everywhere, and a future change to how `Confidential` is displayed is a single token-layer edit, not a hunt through every feature that happens to show a classification badge.
 
@@ -459,6 +493,18 @@ A tabbed case workspace under `CaseLayout` (Section 5, 8): **Overview** (title, 
 | Graph | `GET /cases/{id}/graph` | Section 27 in full |
 | Timeline | Aggregated across evidence/custody/status/finding events | Filter by event type/date range (Section 28) |
 | Reports | `GET /cases/{id}/reports` | Trigger new report (`POST`, async), download completed ones |
+
+### 25.1 Workspace layout
+
+The case workspace is a **high-density, multi-panel console**, not a document page. Three regions, consistent across every tab:
+
+| Region | Contains | Behaviour |
+|---|---|---|
+| **Command header** | Case ID (monospace, §19.1), title, status badge, issued/closed timestamps, status-transition controls | Always visible; the identity strip an analyst orients from. Pinned so it survives scrolling within a tab. |
+| **Operations grid** | Case metadata as label/value pairs on a `surface` panel | A description list, not a table — the relationships are label-to-value, and assistive technology should be told so. Metadata *values* that are identifiers or timestamps render monospaced. |
+| **Panel region** | The active tab's working surface — evidence list, entity graph, timeline, reports | Panels are `surface` regions separated by borders rather than by whitespace, which is what keeps density legible at this information volume. |
+
+**The Graph panel is sized for a force-directed layout from the outset.** Section 27's force-directed entity graph needs a large, stable, aspect-controlled canvas region: a force simulation that is handed a container which resizes on every parent reflow will re-run its layout and visibly jitter, so the panel reserves its area (a minimum height, its own bounded scroll context) *before* any rendering library is introduced. Until that library lands, the panel renders an explicit empty state naming what will occupy it and pointing at `GET /cases/{id}/graph` as its data source — a reserved, labelled region, never a silently blank box that reads as a loading failure.
 
 ## 26. Evidence Explorer
 
@@ -765,7 +811,7 @@ Concrete mistakes this architecture is designed to make structurally difficult, 
 - **Building offline write queuing "since we're already handling connection loss."** §35 explicitly scopes offline handling to graceful degradation, not write-sync, given this platform's chain-of-custody stakes — don't let a reasonable-sounding feature request expand that scope without revisiting the underlying risk analysis.
 - **Encoding status or classification in color alone.** Convenient to implement, but fails both accessibility (§36) and the platform's own classification-clarity requirement (`security-architecture.md` §38).
 - **Adding a filter control the API doesn't support, or vice versa.** §30's filter-schema-per-resource discipline exists precisely to keep the UI and `api-design.md`'s documented query parameters from silently drifting apart over time.
-- **Importing directly between feature modules.** Even a "small, obviously safe" cross-feature import erodes §3's boundary discipline the same way a direct cross-schema query would erode the backend's module boundaries — route around it through shared data or navigation instead.
+- **Reaching into another feature's internals.** Importing `@/features/evidence/api/useEvidenceItem` rather than `@/features/evidence/public` erodes §3's boundary discipline the same way a direct cross-schema query would erode the backend's module boundaries. Go through the feature's `public.ts`, shared data, or navigation — and if what you need isn't exported, add it there deliberately rather than importing past it.
 - **Skipping virtualization "until it's actually slow."** Retrofitting virtualization onto an already-built list or graph view is meaningfully harder than building it in from the start (§32) — treat it as a requirement for any view that can realistically grow large, not an optimization to defer.
 - **Promoting a component to `packages/ui-components` preemptively.** §21's promotion rule is deliberate — promoting before a second real need exists just relocates the same premature-abstraction risk `CLAUDE.md` already warns against on the backend.
 
@@ -863,7 +909,7 @@ A consolidated reference — every route (Section 4) alongside its primary React
 |---|---|---|
 | `/dashboard` | `['cases','list',{assigned:true}]`, `['relationships','list',{status:'proposed'}]`, `['notifications','list']` | `GET /cases`, `GET /relationships`, `GET /notifications` |
 | `/cases` | `['cases','list',filters]` | `GET /cases` |
-| `/cases/:id` | `['cases',id]` | `GET /cases/{id}` |
+| `/cases/:id` | `['cases','detail',id]` | `GET /cases/{id}` |
 | `/cases/:id/evidence` | `['cases',id,'evidence']` | `GET /cases/{id}/evidence` |
 | `/cases/:id/graph` | `['cases',id,'graph',filters]` | `GET /cases/{id}/graph` |
 | `/cases/:id/reports` | `['cases',id,'reports']`, `['reports',reportId]` | `GET /cases/{id}/reports`, `POST /cases/{id}/reports`, `GET /reports/{id}` |

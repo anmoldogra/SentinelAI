@@ -14,9 +14,11 @@
     "typecheck": "tsc --build --force",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "test": "vitest",
+    "test:run": "vitest run",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "npm run format:check && npm run lint && npm run typecheck"
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:run"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.62.0",
@@ -39,6 +41,7 @@
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.18.0",
-    "vite": "^6.0.0"
+    "vite": "^6.0.0",
+    "vitest": "^4.1.11"
   }
 }

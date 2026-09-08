@@ -1,59 +1,96 @@
 @import "tailwindcss";
 
 /*
- * Design-token layer (frontend-architecture.md §18-19, ADR-0016 §4).
+ * Design-token layer (frontend-architecture.md §18-19.1, ADR-0016 §4).
  *
  * Tokens are SEMANTIC — named by role, never by value. Feature code uses `bg-surface`, never
- * `bg-white` or `bg-zinc-900`, which is what keeps theming (§18) a change here rather than a
- * hunt through every component. Light is the default; dark follows the OS preference and can be
+ * `bg-slate-900` or `text-cyan-400`, which is what keeps theming (§18) a change here rather than
+ * a hunt through every component. Light is the default; dark follows the OS preference and can be
  * forced either way with `data-theme` on <html>, since §18 requires an explicit persisted
  * per-user override in addition to the OS default.
  *
- * A high-contrast variant is a first-class theme per §18; it is not defined yet because no
- * component consumes tokens yet. It slots in as another block here.
+ * The values below implement §19.1's tactical console palette: slate/zinc surfaces in three
+ * depths, cyan reserved exclusively for interactive affordance, and emerald/amber/rose carrying
+ * status. Dark is where that language is fully expressed — §19.1 calls it the primary look — but
+ * light stays first-class per §18, so both themes resolve every role.
+ *
+ * A high-contrast variant is a first-class theme per §18; it is not defined yet. It slots in as
+ * another block here.
  */
 
 :root {
-  --sai-canvas: oklch(98.5% 0.002 250);
+  --sai-canvas: oklch(97.5% 0.003 255);
   --sai-surface: oklch(100% 0 0);
-  --sai-border: oklch(90% 0.005 250);
-  --sai-text: oklch(23% 0.01 250);
-  --sai-text-muted: oklch(50% 0.01 250);
-  --sai-accent: oklch(55% 0.15 250);
+  /* Third surface depth (§19.1): modals and panels that sit above the page surface. */
+  --sai-surface-raised: oklch(100% 0 0);
+  --sai-border: oklch(88% 0.006 255);
+  --sai-text: oklch(22% 0.012 255);
+  --sai-text-muted: oklch(48% 0.012 255);
+  /* Cyan, and ONLY for interactive affordance — never for status (§19.1). */
+  --sai-accent: oklch(52% 0.12 210);
   --sai-accent-contrast: oklch(100% 0 0);
+  /* Modal backdrop (§17), tokenised so the dimming level themes with everything else. */
+  --sai-scrim: oklch(20% 0.01 255 / 0.5);
+  /* Case-lifecycle roles (ADR-0015's open|closed|archived), named by MEANING not colour, so a
+   * palette change is a token edit. §36 requires colour never be the only signal — the status
+   * badge pairs these with the text label. */
+  --sai-status-open: oklch(52% 0.14 160);
+  --sai-status-closed: oklch(52% 0.02 255);
+  --sai-status-archived: oklch(56% 0.12 70);
+  /* Rose. Failure and destructive intent — deliberately distinct from amber's "needs
+   * attention", since an operations console cannot afford to conflate the two (§19.1). */
+  --sai-danger: oklch(53% 0.19 18);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --sai-canvas: oklch(18% 0.01 250);
-    --sai-surface: oklch(23% 0.012 250);
-    --sai-border: oklch(33% 0.014 250);
-    --sai-text: oklch(96% 0.004 250);
-    --sai-text-muted: oklch(72% 0.012 250);
-    --sai-accent: oklch(72% 0.13 250);
-    --sai-accent-contrast: oklch(18% 0.01 250);
+    --sai-canvas: oklch(15.5% 0.012 255);
+    --sai-surface: oklch(20% 0.014 255);
+    --sai-surface-raised: oklch(24.5% 0.016 255);
+    --sai-border: oklch(35% 0.02 255);
+    --sai-text: oklch(96% 0.004 255);
+    --sai-text-muted: oklch(72% 0.014 255);
+    --sai-accent: oklch(78% 0.12 205);
+    --sai-accent-contrast: oklch(16% 0.012 255);
+    --sai-scrim: oklch(8% 0.01 255 / 0.7);
+    --sai-status-open: oklch(76% 0.15 160);
+    --sai-status-closed: oklch(70% 0.02 255);
+    --sai-status-archived: oklch(80% 0.13 75);
+    --sai-danger: oklch(70% 0.16 18);
   }
 }
 
 /* The explicit per-user override wins over the OS preference, in both directions. */
 :root[data-theme="light"] {
-  --sai-canvas: oklch(98.5% 0.002 250);
+  --sai-canvas: oklch(97.5% 0.003 255);
   --sai-surface: oklch(100% 0 0);
-  --sai-border: oklch(90% 0.005 250);
-  --sai-text: oklch(23% 0.01 250);
-  --sai-text-muted: oklch(50% 0.01 250);
-  --sai-accent: oklch(55% 0.15 250);
+  --sai-surface-raised: oklch(100% 0 0);
+  --sai-border: oklch(88% 0.006 255);
+  --sai-text: oklch(22% 0.012 255);
+  --sai-text-muted: oklch(48% 0.012 255);
+  --sai-accent: oklch(52% 0.12 210);
   --sai-accent-contrast: oklch(100% 0 0);
+  --sai-scrim: oklch(20% 0.01 255 / 0.5);
+  --sai-status-open: oklch(52% 0.14 160);
+  --sai-status-closed: oklch(52% 0.02 255);
+  --sai-status-archived: oklch(56% 0.12 70);
+  --sai-danger: oklch(53% 0.19 18);
 }
 
 :root[data-theme="dark"] {
-  --sai-canvas: oklch(18% 0.01 250);
-  --sai-surface: oklch(23% 0.012 250);
-  --sai-border: oklch(33% 0.014 250);
-  --sai-text: oklch(96% 0.004 250);
-  --sai-text-muted: oklch(72% 0.012 250);
-  --sai-accent: oklch(72% 0.13 250);
-  --sai-accent-contrast: oklch(18% 0.01 250);
+  --sai-canvas: oklch(15.5% 0.012 255);
+  --sai-surface: oklch(20% 0.014 255);
+  --sai-surface-raised: oklch(24.5% 0.016 255);
+  --sai-border: oklch(35% 0.02 255);
+  --sai-text: oklch(96% 0.004 255);
+  --sai-text-muted: oklch(72% 0.014 255);
+  --sai-accent: oklch(78% 0.12 205);
+  --sai-accent-contrast: oklch(16% 0.012 255);
+  --sai-scrim: oklch(8% 0.01 255 / 0.7);
+  --sai-status-open: oklch(76% 0.15 160);
+  --sai-status-closed: oklch(70% 0.02 255);
+  --sai-status-archived: oklch(80% 0.13 75);
+  --sai-danger: oklch(70% 0.16 18);
 }
 
 /* Expose ONLY the semantic roles to Tailwind. Raw palette utilities are deliberately not
@@ -61,11 +98,17 @@
 @theme inline {
   --color-canvas: var(--sai-canvas);
   --color-surface: var(--sai-surface);
+  --color-surface-raised: var(--sai-surface-raised);
   --color-border: var(--sai-border);
   --color-text: var(--sai-text);
   --color-text-muted: var(--sai-text-muted);
   --color-accent: var(--sai-accent);
   --color-accent-contrast: var(--sai-accent-contrast);
+  --color-scrim: var(--sai-scrim);
+  --color-status-open: var(--sai-status-open);
+  --color-status-closed: var(--sai-status-closed);
+  --color-status-archived: var(--sai-status-archived);
+  --color-danger: var(--sai-danger);
 }
 
 body {

@@ -2,9 +2,16 @@
 
 ## Status
 
-Proposed. Required by `frontend-architecture.md`'s header note and §48, which state the React +
+Accepted. Required by `frontend-architecture.md`'s header note and §48, which state the React +
 React Query choice "should be recorded as an ADR before implementation begins" — this records it
 and closes the surrounding tooling `frontend-architecture.md` §2 deliberately left open.
+
+Moved from Proposed to Accepted once every item below was implemented in `apps/web` and gated in
+CI (`.github/workflows/ci.yml`'s frontend job runs the Prettier, ESLint, and `tsc` checks item 6
+and 7 describe). Items 4a and 4b were added at the same time: the token *mechanism* was decided
+here from the start, but the palette semantics and typography rules it carries were only written
+down in `frontend-architecture.md` §19.1, leaving the rule that `index.css` cites this ADR for
+without an ADR actually stating it.
 
 ## Context
 
@@ -42,6 +49,36 @@ Constraints that actually narrow the choice, rather than a generic evaluation:
    Theme switching therefore remains a token-layer edit, as §18 requires. Tailwind v4's CSS-first
    configuration means the token layer *is* the config, rather than a parallel JS object that can
    drift from it.
+
+   Items 4a and 4b below fix what the roles *mean*. They are lettered rather than numbered so the
+   existing citations to items 5–7 (`tsconfig.app.json` cites §6, `eslint.config.js` cites §7)
+   keep resolving; renumbering this list silently breaks every reference into it.
+
+   4a. **A tactical OSINT / SOC console aesthetic, dark-first.** Analysts read dense evidentiary
+   data for hours, so the surface recedes and saturated colour is spent only where it carries
+   meaning. Surfaces are slate/zinc in three depths (`canvas` → `surface` → `surface-raised`);
+   three steps, not two, are what let a multi-panel workspace separate regions with borders
+   instead of drawing a box around everything. **Cyan is reserved exclusively for interactive
+   affordance** — focus rings, primary actions, links — and is never a status colour, so cyan
+   always means "you can act on this". Status is carried by emerald (active/healthy), amber
+   (attention/degraded), rose (failure and destructive intent), and neutral slate (terminal but
+   unremarkable). Amber and rose are deliberately not interchangeable: conflating "needs
+   attention" with "something broke" is the one ambiguity an operations console cannot afford.
+   The modal backdrop is itself a token (`scrim`), not a hardcoded overlay. Dark is the *primary*
+   look, not the only one — §18's light and high-contrast themes stay first-class, and every role
+   resolves in each theme.
+
+   4b. **Monospace is a semantic role, not a stylistic preference.** It marks content whose
+   *character-level* detail is load-bearing: evidentiary identifiers, hashes, `payload_ref`s,
+   pagination cursors, timestamps, durations, metadata keys, and enum/status values — an analyst
+   comparing two SHA-256 digests or transcribing a case ID needs column alignment and unambiguous
+   `0`/`O` and `1`/`l` glyphs. It **also** covers labels and panel headers that *name* an API
+   field or resource, and command labels in a modal action row or panel toolbar, since those name
+   machine-side identifiers rather than reading as prose. Everything read as language stays
+   proportional: titles, descriptions, help text, validation messages, and the values an analyst
+   types. The face is the platform's own monospace stack rather than a bundled webfont — the
+   air-gapped profile cannot fetch one, and a font that silently failed to load would take the
+   glyph-disambiguation guarantee with it.
 5. **Native `fetch`, not Axios**, behind the §11 client layer. §11 describes a *thin* wrapper whose
    job is envelope parsing and header conventions; `fetch` covers that without a dependency, and
    the wrapper is the abstraction seam anyway, so the transport can change without touching
@@ -60,6 +97,24 @@ Constraints that actually narrow the choice, rather than a generic evaluation:
   token layer entirely. The mitigation is that only semantic tokens are defined in `@theme`, so
   bypassing them is visible in review; a lint rule restricting raw palette utilities is the
   natural enforcement step when the design system lands (§21).
+- **4a and 4b are currently convention, not enforcement.** Nothing mechanically stops a component
+  from using cyan for a status or monospacing a paragraph of prose; review is the only gate. This
+  is the same exposure as the raw-palette risk above and has the same fix — the lint rule that
+  restricts palette utilities should also be the place role misuse gets caught.
+- A **precondition for** §36's WCAG 2.1 AA target, not a guarantee of it. Defining status as a
+  role rather than a colour is what makes "colour is never the only signal" implementable — the
+  status badge pairs the role with a text label — and routing every surface/text pair through
+  tokens is what makes contrast auditable in one place. Neither property holds automatically:
+  contrast ratios and the colour-plus-text rule still have to be verified per component.
+- Naming colour families in an ADR is a deliberate, bounded exception to §19's "roles, never
+  values" rule. `frontend-architecture.md` §19.1 and this item are the only places families are
+  named; the concrete values live solely in `apps/web/src/index.css`, and component code still
+  reaches for the role. Stating the family here is what stops "which green?" being re-litigated
+  per feature.
+- 4b's rule has one genuine collision — a form label that names an API field is both "a label"
+  and "a field name". It resolves as monospaced, and `frontend-architecture.md` §17 and §19.1
+  resolve it identically; that consistency is load-bearing, so a change to it belongs in all
+  three places at once.
 - No SSR means the initial-payload cost of §2 is real and must be paid down by code-splitting;
   this ADR does not change that trade-off, it inherits it.
 - React Router and Vite are both replaceable without touching feature code (routing is confined

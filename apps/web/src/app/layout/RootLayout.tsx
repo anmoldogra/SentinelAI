@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 
 /**
@@ -7,6 +8,27 @@ import { NavLink, Outlet } from "react-router-dom";
  */
 
 const NAV_LINK_BASE = "rounded px-3 py-2 text-sm font-medium transition-colors";
+
+/**
+ * Fallback while a lazily-loaded route chunk is in flight (§40).
+ *
+ * Deliberately plain: a route chunk on a local network resolves in milliseconds, so anything
+ * elaborate would flash rather than inform. It reserves a little height so the shell does not
+ * collapse and then jump when the module lands, and it is a live region — a sighted user sees the
+ * indicator, and without `role="status"` a screen-reader user would get silence between activating
+ * a link and the new screen arriving (§36).
+ */
+function ModuleLoader() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex min-h-48 items-center justify-center font-mono text-xs uppercase tracking-wider text-text-muted"
+    >
+      <span className="animate-pulse">Loading module…</span>
+    </div>
+  );
+}
 
 export function RootLayout() {
   return (
@@ -30,7 +52,16 @@ export function RootLayout() {
       </header>
 
       <main className="mx-auto w-full max-w-7xl flex-1 px-6 py-8">
-        <Outlet />
+        {/*
+         * The boundary sits *inside* the layout, wrapping only the outlet — not around the router
+         * in `App.tsx`. That placement is the whole point: a boundary above the layout would
+         * unmount the header and primary navigation on every chunk fetch, so the application
+         * would appear to blink out and rebuild itself each time an analyst opened a new section.
+         * Here the shell stays put and only the routed region is replaced.
+         */}
+        <Suspense fallback={<ModuleLoader />}>
+          <Outlet />
+        </Suspense>
       </main>
     </div>
   );

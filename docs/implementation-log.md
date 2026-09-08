@@ -924,6 +924,61 @@ here); it is reasoned from the file, not observed.
 
 ---
 
+## 2026-08-21 — IC-024: Redis port remap + Case Dashboard wired to the API
+
+**Type:** Compose fix + first real frontend feature. No backend source changed.
+
+**Compose.** `redis` maps host **6380 -> container 6379** (6379 was already allocated on the
+developer's host). Only the host side moves: `api`/`worker` reach Redis over the compose network
+at `redis:6379`, so their `REDIS_URL` is untouched — verified by parsing the file back.
+
+**Frontend.** `shared/api/pagination.ts` (keyset helpers: `withPageParams`, `nextCursor`,
+`flattenPages`), `shared/api/errors.ts` (§12's code -> UI-treatment taxonomy),
+`features/cases/{types,api/getCases,api/useCases}`, and the Case Dashboard rendering skeleton /
+error / empty / table + "Load more".
+
+**React Query.** `useInfiniteQuery`, not `useQuery`: the endpoint is keyset-paginated with no
+total count, so "next page from this cursor" is the only shape it supports. `getNextPageParam`
+returns `undefined` (not `null`) when exhausted — that is what React Query reads as
+`hasNextPage === false` — and guards on `has_more` *and* a non-null cursor, because paging
+forever on a missing cursor is a worse failure than stopping one page early.
+
+**Dev auth seam — and the blocker it cannot remove.** `VITE_DEV_ACCESS_TOKEN` is read in
+`token-store.ts` behind `import.meta.env.DEV`, so Vite dead-code-eliminates it from production
+builds; **verified by grepping the built bundle — the variable name does not appear in `dist/`.**
+The token still only lives in memory (§35).
+
+It does **not** manufacture a session, and no mock token can. The backend resolves a bearer token
+against a real `platform.sessions` row, and `SessionRepository.get_active_by_token` currently
+raises `NotImplementedError` with no login endpoint anywhere — so **every authenticated endpoint
+fails today regardless of what the client sends.** Against a live backend this page renders its
+error state until the auth slice lands. The prompt's "mock JWT / mock authentication layer"
+assumption does not match the implementation (there is no JWT and no JWKS); backend changes were
+out of scope, so the seam is built to work the moment auth exists rather than faked.
+
+> **Correction, added when this entry was committed (2026-09-08).** The paragraph above was
+> accurate on 2026-08-21 but was overtaken before it landed: commit `70e6cfb` implemented
+> `SessionRepository.get_active_by_token` and shipped `POST /api/v1/auth/login`. The seam is now
+> usable rather than aspirational — `make dev-token` mints a token the server accepts. It is left
+> in place because the login *screen* is still unbuilt; the sentence in `token-store.ts` that
+> asserted the endpoint did not exist was corrected in the same commit. Nothing else in this entry
+> changed.
+
+**Two lint findings fixed at the cause.** `CaseStatus | string` collapses to `string`, so the
+union bought nothing — `status` is now honestly `string`, while `STATUS_STYLES` is keyed
+`Record<CaseStatus, string>` so adding a lifecycle state fails the build until it has a token.
+Status colours were added as **semantic tokens** in `index.css` rather than hardcoded, per §19
+(a first attempt double-inserted one block and missed another; corrected and verified as exactly
+four theme blocks plus one `@theme` mapping).
+
+**Notable: the Postgres-gated integration tests now execute.** With the dev stack up, the suite
+went 509 passed/9 skipped -> **514 passed/4 skipped**. The migration round-trip, ADR-0004
+privileges, append-only triggers, and the notification keyset-pagination SQL — all previously
+"asserted in code, never executed anywhere" — now pass against a real Postgres, retroactively
+confirming IC-008, IC-015 and IC-021.
+
+---
+
 ## 2026-08-30 — IC-025: server-computed integrity on ingest (modernization Wave 1.5, ADR-0008 §3)
 
 **Type:** Evidentiary-core correctness. Backend service + tests + ADR. No migration, no API shape

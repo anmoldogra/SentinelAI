@@ -3,3 +3,7 @@ dist/
 coverage/
 .vite/
 *.local
+
+# Local env overrides — may contain a real session token.
+.env.local
+.env.*.local
