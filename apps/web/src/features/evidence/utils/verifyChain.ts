@@ -1,20 +1,32 @@
 /**
- * Client-side verification of the custody hash chain (CEM §4, api-design.md §5).
+ * Client-side verification of the custody hash chain (CEM §4, api-design.md §5, ADR-0003).
  *
  * `api-design.md` §5 commits the custody endpoint to returning each event so the chain is
  * "independently verifiable by the caller". This is that verification: it recomputes every
  * `entry_hash` from the fields the server hashed and confirms each entry names its predecessor.
  * Nothing here trusts the server's own claim of integrity — that is the entire point.
  *
- * **This must mirror `_custody_entry_hash` in the backend's `ingestion/service.py` byte for
- * byte.** Any divergence produces a false "verification failed" on a perfectly intact ledger,
- * which on a legal-custody surface is a serious defect in its own right. The two subtleties that
- * make this non-obvious are documented at `custodyPreimage` and `toPythonIsoformat` below; both
- * were confirmed against the running backend rather than inferred.
+ * **This must mirror `_custody_entry_hash` in the backend's `ingestion/service.py`.** Any
+ * divergence produces a false "verification failed" on a perfectly intact ledger, which on a
+ * legal-custody surface is a serious defect in its own right. Wave 1.2 made that mirroring far
+ * less fragile than it was:
+ *
+ * - The preimage is now built with a shared **RFC 8785 (JCS)** encoder (`shared/crypto`) instead
+ *   of a hand-written string template that had to reproduce Python's `json.dumps` key order by
+ *   eye. Field order is now computed, not transcribed.
+ * - The hashed timestamp is now the **wire form** the API actually sends (`...Z`). It used to be
+ *   Python's `isoformat()` (`...+00:00`), so the string the server hashed was not the string the
+ *   client received and this file had to translate six characters back. That translation, and the
+ *   microsecond-truncation hazard that came with it, are gone.
+ * - The preimage covers **every** persisted column of the entry, so the attribution fields —
+ *   who acted, in what role, under what authority — are now bound to the hash. Before Wave 1.2
+ *   they were not, and this verifier would have happily confirmed a ledger whose custodian had
+ *   been rewritten.
  *
  * No external crypto dependency: SHA-256 comes from the platform's Web Crypto.
  */
 
+import { canonicalJson, type JsonValue } from "../../../shared/crypto/canonicalJson";
 import type { CustodyEvent } from "../types";
 
 /**
@@ -24,69 +36,55 @@ import type { CustodyEvent } from "../types";
  */
 export const GENESIS_PREV_HASH = "0".repeat(64);
 
+/** The only preimage version this client knows how to rebuild (ADR-0003 §5). */
+export const SUPPORTED_PREIMAGE_VERSION = 1;
+
 export type ChainVerification =
   | { status: "pending" }
   /** Nothing to verify — an empty ledger is not a failure. */
   | { status: "idle" }
   | { status: "verified"; count: number }
+  /**
+   * The chain links and sequence are intact, but some entries predate the complete preimage
+   * (ADR-0003 §2) and cannot be recomputed from what the API returns. Distinct from both
+   * "verified" and "failed" on purpose — see `verifyCustodyChain`.
+   */
+  | { status: "partial"; verifiedCount: number; unverifiableCount: number }
   | { status: "failed"; reason: string; sequenceNumber: number }
   /** Could not be checked at all. Says nothing about the ledger's integrity. */
   | { status: "unavailable"; reason: string };
 
 /**
- * Convert the wire timestamp to the exact string Python hashed.
+ * Rebuild the exact structure the backend hashed.
  *
- * The server hashes `occurred_at.isoformat()`, which renders UTC as a `+00:00` offset, but
- * Pydantic serialises the same value to JSON with a `Z` suffix (api-design.md §2.3 mandates the
- * `Z` form on the wire). So the received string is *not* the hashed string, and the difference is
- * exactly those six characters.
+ * Mirrors `_custody_entry_hash`, which passes these eleven fields to `compute_entry_hash`; that
+ * helper then injects `hash_algo` and `preimage_version` before canonicalizing. Those two are
+ * inside the hash rather than beside it as a **downgrade defense**: if the version that says how
+ * to verify an entry were merely stored next to it, an attacker could rewrite the entry under the
+ * old partial format and reset the version to make it verify under the weaker rules.
  *
- * Deliberately a string operation, never a `Date` round-trip: `Date` holds only milliseconds, and
- * these timestamps carry microseconds from a Postgres `timestamptz`. Parsing and re-formatting
- * would silently truncate `.123456` to `.123` and break every hash. The fractional part is
- * already byte-identical between the two representations — six digits when microseconds are
- * non-zero (trailing zeros preserved, e.g. `.100000`), and absent entirely when they are zero —
- * so it is carried across untouched.
+ * Two keys are abbreviated in the preimage and only there: the columns are `prev_event_hash` and
+ * `sequence_number`, but the hashed object uses `prev` and `seq`.
+ *
+ * Key order is not written out here — `canonicalJson` sorts, exactly as the backend's JCS encoder
+ * does — so adding a field cannot silently put the two implementations out of order.
  */
-export function toPythonIsoformat(wireTimestamp: string): string {
-  if (wireTimestamp.endsWith("Z")) {
-    return `${wireTimestamp.slice(0, -1)}+00:00`;
-  }
-  // Already in offset form, or something unexpected. Passed through unchanged rather than
-  // guessed at: a wrong guess would fabricate a mismatch and accuse an intact ledger.
-  return wireTimestamp;
-}
-
-/**
- * Rebuild the exact byte string the backend hashed.
- *
- * The backend calls `json.dumps(..., sort_keys=True, separators=(",", ":"))`, so: no whitespace,
- * and keys in ASCII-sorted order — `event_type`, `evidence_id`, `integrity_hash_at_event`,
- * `occurred_at`, `prev`, `seq`. Note `"event_type"` sorts *before* `"evidence_id"` (`e` < `i` at
- * the third character), which is easy to get backwards by eye.
- *
- * **Two of those keys are abbreviated in the preimage and only there:** the payload field is
- * `prev_event_hash` and `sequence_number`, but the hashed dictionary uses `prev` and `seq`. This
- * mapping is the single most likely thing to get wrong, and getting it wrong fails every entry.
- *
- * The order is written out literally rather than produced by sorting an object at runtime, so the
- * sorted order is visible in review and cannot drift if a field is added.
- *
- * Values go through `JSON.stringify` for escaping. Python's `json.dumps` defaults to
- * `ensure_ascii=True` and would emit `\uXXXX` for non-ASCII where `JSON.stringify` emits the
- * character raw — the two agree here only because every hashed value is ASCII by construction
- * (hex digests, a UUID, an ISO-8601 timestamp, and `event_type`, a closed lowercase enum from
- * CEM §4). A future non-ASCII field in this preimage would need explicit escaping.
- */
-export function custodyPreimage(event: CustodyEvent): string {
-  return (
-    `{"event_type":${JSON.stringify(event.event_type)},` +
-    `"evidence_id":${JSON.stringify(event.evidence_id)},` +
-    `"integrity_hash_at_event":${JSON.stringify(event.integrity_hash_at_event)},` +
-    `"occurred_at":${JSON.stringify(toPythonIsoformat(event.occurred_at))},` +
-    `"prev":${JSON.stringify(event.prev_event_hash)},` +
-    `"seq":${String(event.sequence_number)}}`
-  );
+export function custodyPreimage(event: CustodyEvent): JsonValue {
+  return {
+    prev: event.prev_event_hash,
+    custody_event_id: event.custody_event_id,
+    evidence_id: event.evidence_id,
+    seq: event.sequence_number,
+    event_type: event.event_type,
+    occurred_at: event.occurred_at,
+    actor_user_id: event.actor_user_id,
+    actor_role: event.actor_role,
+    authority_ref: event.authority_ref,
+    notes: event.notes,
+    integrity_hash_at_event: event.integrity_hash_at_event,
+    hash_algo: event.hash_algo,
+    preimage_version: event.preimage_version,
+  };
 }
 
 /** Lowercase hex, matching Python's `hexdigest()`. */
@@ -110,7 +108,7 @@ function subtleCrypto(): SubtleCrypto | undefined {
 }
 
 async function sha256Hex(subtle: SubtleCrypto, input: string): Promise<string> {
-  // UTF-8 on both sides: Python's `str.encode()` defaults to UTF-8, as does TextEncoder.
+  // UTF-8 on both sides: Python's `canonicalize()` returns UTF-8 bytes, as does TextEncoder.
   const digest = await subtle.digest("SHA-256", new TextEncoder().encode(input));
   return toHex(digest);
 }
@@ -124,10 +122,21 @@ async function sha256Hex(subtle: SubtleCrypto, input: string): Promise<string> {
  * removed from the *front* of the ledger, which the hashes alone would not — a valid chain
  * starting at sequence 5 is still a valid chain.
  *
+ * **Mixed-format chains.** An entry written before Wave 1.2 carries `preimage_version: null`. It
+ * was hashed over a partial field set with a non-canonical encoder and cannot be rebuilt from
+ * this payload at all. Such an entry is **skipped for recomputation but still checked for
+ * linkage and sequence**, and the result degrades to `partial`. Reporting it as `failed` would
+ * accuse an intact ledger; reporting it as `verified` would claim a binding that was never made.
+ * Neither is true, so neither is said. The same applies to any future version this build does not
+ * know: an old client must not declare a newer entry forged.
+ *
  * **Known limit, worth stating plainly:** entries removed from the *end* leave a shorter but
  * internally consistent chain, and no client-side check can detect that. Catching truncation
- * needs an external anchor (ADR-0003's periodic anchoring), not a recomputation. "Verified" here
- * means "this ledger is internally consistent and unaltered", not "this ledger is complete".
+ * needs an external anchor (ADR-0003 §3, Wave 1.3), not a recomputation. And because entries are
+ * hashed but not yet *signed* (ADR-0003 §1 — `signature` is still null), a writer who can rewrite
+ * the whole chain can still produce one that verifies here. "Verified" means "this ledger is
+ * internally consistent and unaltered by anyone who could not recompute it", not "this ledger is
+ * complete" and not yet "this ledger is authentic".
  *
  * A copy is sorted by `sequence_number` for the walk. That is computation, not presentation —
  * the ledger is still *displayed* in the server's order, which `api-design.md` §5 requires never
@@ -151,6 +160,8 @@ export async function verifyCustodyChain(events: CustodyEvent[]): Promise<ChainV
 
   let expectedPrev = GENESIS_PREV_HASH;
   let expectedSequence = 1;
+  let verifiedCount = 0;
+  let unverifiableCount = 0;
 
   try {
     for (const event of ordered) {
@@ -173,22 +184,32 @@ export async function verifyCustodyChain(events: CustodyEvent[]): Promise<ChainV
         };
       }
 
-      const recomputed = await sha256Hex(subtle, custodyPreimage(event));
-      if (recomputed !== event.entry_hash) {
-        return {
-          status: "failed",
-          sequenceNumber: event.sequence_number,
-          reason: "The recorded hash does not match this entry's contents — the entry was altered.",
-        };
+      if (event.preimage_version === SUPPORTED_PREIMAGE_VERSION) {
+        const recomputed = await sha256Hex(subtle, canonicalJson(custodyPreimage(event)));
+        if (recomputed !== event.entry_hash) {
+          return {
+            status: "failed",
+            sequenceNumber: event.sequence_number,
+            reason:
+              "The recorded hash does not match this entry's contents — the entry was altered.",
+          };
+        }
+        verifiedCount += 1;
+      } else {
+        unverifiableCount += 1;
       }
 
       expectedPrev = event.entry_hash;
       expectedSequence += 1;
     }
   } catch {
-    // A crypto failure is not evidence of tampering, so it must not be reported as one.
+    // A crypto or encoding failure is not evidence of tampering, so it must not be reported as
+    // one. This includes a value the canonicalizer refuses.
     return { status: "unavailable", reason: "The integrity check could not be completed." };
   }
 
-  return { status: "verified", count: ordered.length };
+  if (unverifiableCount > 0) {
+    return { status: "partial", verifiedCount, unverifiableCount };
+  }
+  return { status: "verified", count: verifiedCount };
 }

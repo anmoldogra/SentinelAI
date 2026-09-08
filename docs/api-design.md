@@ -621,7 +621,7 @@ Idempotency-Key: a1b2...
 | Query Parameters | `cursor`, `limit` |
 | Request Body | none |
 | Validation Rules | none beyond existence |
-| Response Body | `{ data: [CustodyEvent] }`, each including `entry_hash`/`prev_event_hash` so the chain is independently verifiable by the caller |
+| Response Body | `{ data: [CustodyEvent] }`. Each entry returns **every input to its own `entry_hash`** — the full preimage (ADR-0003 §2), not just the hashes — so the chain is genuinely recomputable by the caller rather than merely displayable. That includes the attribution fields (`actor_user_id`, `actor_role`, `authority_ref`, `notes`), `integrity_hash_at_event`, `prev_event_hash` (returned as stored, including the all-zero genesis sentinel), and the two agility fields `hash_algo` and `preimage_version`. A caller **must dispatch on `preimage_version`**: `null` marks an entry written before the complete preimage existed, which cannot be recomputed from this payload and must be reported as *not independently verifiable* rather than as altered — a chain may legitimately contain both kinds |
 | Success Codes | 200 |
 | Error Codes | 401, 403, 404 |
 | Authentication | Required |

@@ -218,6 +218,18 @@ function VerificationBadge({ verification }: { verification: ChainVerification }
           style: "bg-status-open/15 text-status-open",
           label: `chain verified · ${String(verification.count)} entries`,
         };
+      case "partial":
+        // The same amber `unavailable` uses, deliberately: both mean "neither a pass nor a
+        // failure", and inventing a fourth colour would imply a distinction the analyst does not
+        // need to make at a glance. The label carries the difference, per this component's rule
+        // that colour is never the sole signal. Both counts are in it because "how much of this
+        // was actually checked" is the only question that matters here.
+        return {
+          style: "bg-status-archived/15 text-status-archived",
+          label: `chain partly verified · ${String(verification.verifiedCount)} of ${String(
+            verification.verifiedCount + verification.unverifiableCount,
+          )} entries`,
+        };
       case "failed":
         return { style: "bg-danger/15 text-danger", label: "verification failed" };
       case "unavailable":
@@ -252,6 +264,19 @@ function VerificationDetail({ verification }: { verification: ChainVerification 
           Integrity check failed at sequence {verification.sequenceNumber}
         </p>
         <p className="mt-0.5 text-sm text-text-muted">{verification.reason}</p>
+      </div>
+    );
+  }
+  if (verification.status === "partial") {
+    return (
+      <div className="border-b border-border px-6 py-3">
+        <p className="text-sm text-text-muted">
+          {verification.unverifiableCount} of{" "}
+          {verification.verifiedCount + verification.unverifiableCount} entries predate this
+          system&rsquo;s complete integrity record and cannot be independently recomputed. The
+          chain&rsquo;s links and ordering were checked and are intact; the contents of those
+          entries were not. This is not a sign of tampering.
+        </p>
       </div>
     );
   }

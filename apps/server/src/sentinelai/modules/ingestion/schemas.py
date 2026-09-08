@@ -65,9 +65,16 @@ class CustodyEventRead(BaseModel):
     Exposes every field of the entry-hash preimage, because `api-design.md` §5 commits this
     endpoint to returning each event so "the chain is independently verifiable by the caller" —
     and a caller can only recompute `entry_hash` if it receives every input that went into it.
-    `_custody_entry_hash` hashes `{prev, evidence_id, seq, event_type, integrity_hash_at_event,
-    occurred_at}`, so omitting `prev_event_hash` or `integrity_hash_at_event` (as this schema
-    previously did) left the ledger displayable but unverifiable.
+    Since Wave 1.2 the preimage covers **every** persisted column of the entry (ADR-0003 §2), so
+    this schema returns every one of them, plus the two agility fields a caller needs to know
+    *how* to recompute: `hash_algo` and `preimage_version`.
+
+    `preimage_version` is what makes the ledger verifiable across the format change rather than
+    despite it. A chain written before Wave 1.2 carries `null` there — those entries were hashed
+    over a partial field set with a non-canonical encoder and cannot be re-derived from this
+    payload at all. A client must therefore dispatch on it, and report a `null` entry as *not
+    independently verifiable* rather than as failed: a chain can legitimately contain both, and
+    calling an old-format entry "tampered" would be a false accusation on a legal-custody surface.
 
     Additive only — no field is renamed or removed, so per `api-design.md` §2.2 this does not bump
     the API version.
@@ -94,6 +101,11 @@ class CustodyEventRead(BaseModel):
     prev_event_hash: str
     entry_hash: str
     notes: str | None
+    # Digest that produced `entry_hash`, and which field set went into it. Null on entries
+    # written before Wave 1.2 — see the class docstring for why that is a dispatch input and not
+    # a defect.
+    hash_algo: str | None
+    preimage_version: int | None
 
 
 class EvidenceSupersedeCreate(BaseModel):

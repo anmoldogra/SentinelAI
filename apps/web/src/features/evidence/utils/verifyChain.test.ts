@@ -1,278 +1,293 @@
 /**
- * Cross-language lock on the custody hash chain (CEM §4, api-design.md §5).
+ * Cross-language agreement between this verifier and the Python backend (ADR-0003, Wave 1.2).
  *
- * **What this suite is actually for.** `verifyChain.ts` reimplements, in TypeScript, a hash the
- * Python backend computes in `ingestion/service.py::_custody_entry_hash`. Nothing in the type
- * system connects the two. If someone renames a preimage key, reorders the dictionary, or changes
- * how the timestamp is rendered on either side, the code still compiles, still lints, still
- * builds — and every intact custody ledger in the product silently starts reporting
- * **"verification failed"**, telling analysts their evidence was tampered with.
+ * The fixtures below are **not hand-written**. Every `entry_hash` and every canonical preimage
+ * string was produced by running the backend's own `_custody_entry_hash` and
+ * `platform.crypto.canonical.canonicalize`, then pasted here verbatim. That is what makes this a
+ * real cross-implementation test rather than a restatement of this file's own logic: if the two
+ * canonicalizers ever disagree — on key order, on number rendering, on how a non-ASCII note or an
+ * embedded quote is escaped — these hashes stop matching.
  *
- * That is the failure this file exists to make impossible. The vectors below are not invented:
- * they are the literal output of the backend's own hashing function, captured by running it, and
- * committed here so a divergence on either side fails loudly and immediately.
+ * The chain deliberately exercises the cases most likely to break agreement: entry 1 has null
+ * `authority_ref`/`notes`; entry 2 carries accented text and an em dash; entry 3 has a null actor
+ * and a note containing both a quote and a backslash. Timestamps cover whole seconds, half-second,
+ * and full microsecond precision.
  *
- * **Regenerating the vector** (only when the preimage contract *intentionally* changes — and then
- * `docs/canonical-evidence-model.md` §4 must change in the same commit):
- *
- * ```
- * cd apps/server && python -c "
- * import sys, json, hashlib
- * sys.path.insert(0,'src')
- * from datetime import datetime, UTC, timedelta
- * from uuid import UUID
- * evid = UUID('1f3b2e2a-0000-4000-8000-000000000001')
- * prev='0'*64
- * base = datetime(2026,6,2,14,3,0,tzinfo=UTC)
- * for i,(et,micro) in enumerate([('collected',123456),('ingested',0),('accessed',100000)], start=1):
- *     occ=(base+timedelta(seconds=i)).replace(microsecond=micro)
- *     ih=hashlib.sha256(('payload%d'%i).encode()).hexdigest()
- *     pre=json.dumps({'prev':prev,'evidence_id':str(evid),'seq':i,'event_type':et,
- *         'integrity_hash_at_event':ih,'occurred_at':occ.isoformat()},
- *         sort_keys=True,separators=(',',':'))
- *     eh=hashlib.sha256(pre.encode()).hexdigest()
- *     print(pre); print(eh)
- *     prev=eh
- * "
- * ```
- *
- * **Why these three entries specifically.** The timestamps deliberately cover every microsecond
- * shape Python's `isoformat()` can emit, because that is where a naive implementation breaks:
- * `.123456` (six digits), none at all (microsecond zero — Python omits the fraction entirely),
- * and `.100000` (trailing zeros preserved, which a `Date` round-trip or a zero-trim would
- * destroy). A suite that only tested one shape would pass while the other two silently failed in
- * production.
+ * Entries are named constants rather than array indices so no assertion is needed to read one.
  */
 
 import { describe, expect, it } from "vitest";
 
+import { canonicalJson } from "../../../shared/crypto/canonicalJson";
 import type { CustodyEvent } from "../types";
 import {
   custodyPreimage,
   GENESIS_PREV_HASH,
-  toPythonIsoformat,
+  SUPPORTED_PREIMAGE_VERSION,
   verifyCustodyChain,
 } from "./verifyChain";
 
 const EVIDENCE_ID = "1f3b2e2a-0000-4000-8000-000000000001";
 
-/**
- * The canonical ledger, exactly as the backend serialises it on the wire — note the `Z` suffix,
- * which is *not* what gets hashed (Python hashes the `+00:00` form). That mismatch is the whole
- * reason `toPythonIsoformat` exists, so the vector must carry the wire form to exercise it.
- */
-const CANONICAL_CHAIN: readonly CustodyEvent[] = [
+const HASH_1 = "5a6d376b0f452124e643c1153d36779f513d4c272e5e9be702bf340ff72a6782";
+const HASH_2 = "5e9e5eb6147a346bbd1541a1e4956ca09199920e3615c35791e62dec8cb71343";
+const HASH_3 = "4b88d24f90d524ccf1367077e7313424732852a9fcee5951ae891ad3a7c1a30c";
+
+const ENTRY_1: CustodyEvent = {
+  custody_event_id: "aaaaaaaa-0000-4000-8000-000000000001",
+  evidence_id: EVIDENCE_ID,
+  sequence_number: 1,
+  event_type: "ingested",
+  occurred_at: "2026-09-08T10:00:00Z",
+  actor_user_id: "33333333-3333-3333-3333-333333333333",
+  actor_role: "investigator",
+  authority_ref: null,
+  integrity_hash_at_event: "a".repeat(64),
+  prev_event_hash: GENESIS_PREV_HASH,
+  entry_hash: HASH_1,
+  notes: null,
+  hash_algo: "SHA-256",
+  preimage_version: 1,
+};
+
+const ENTRY_2: CustodyEvent = {
+  custody_event_id: "aaaaaaaa-0000-4000-8000-000000000002",
+  evidence_id: EVIDENCE_ID,
+  sequence_number: 2,
+  event_type: "accessed",
+  occurred_at: "2026-09-08T11:30:00.500000Z",
+  actor_user_id: "44444444-4444-4444-4444-444444444444",
+  actor_role: "analyst",
+  authority_ref: "warrant-2026-001",
+  integrity_hash_at_event: "a".repeat(64),
+  prev_event_hash: HASH_1,
+  entry_hash: HASH_2,
+  notes: "Chaîne de contrôle — vérifiée",
+  hash_algo: "SHA-256",
+  preimage_version: 1,
+};
+
+const ENTRY_3: CustodyEvent = {
+  custody_event_id: "aaaaaaaa-0000-4000-8000-000000000003",
+  evidence_id: EVIDENCE_ID,
+  sequence_number: 3,
+  event_type: "exported",
+  occurred_at: "2026-09-08T12:00:00.123456Z",
+  actor_user_id: null,
+  actor_role: "system",
+  authority_ref: null,
+  integrity_hash_at_event: "b".repeat(64),
+  prev_event_hash: HASH_2,
+  entry_hash: HASH_3,
+  notes: 'quote " and \\ backslash',
+  hash_algo: "SHA-256",
+  preimage_version: 1,
+};
+
+const CANONICAL_CHAIN: CustodyEvent[] = [ENTRY_1, ENTRY_2, ENTRY_3];
+
+/** Each entry paired with the exact bytes Python's `canonicalize()` produced for it. */
+const FIXTURES: readonly { event: CustodyEvent; preimage: string }[] = [
   {
-    custody_event_id: "00000000-0000-0000-0000-000000000001",
-    evidence_id: EVIDENCE_ID,
-    sequence_number: 1,
-    event_type: "collected",
-    occurred_at: "2026-06-02T14:03:01.123456Z",
-    actor_user_id: null,
-    actor_role: "forensic_examiner",
-    authority_ref: null,
-    integrity_hash_at_event: "75f3ae1057c197610e33633c630a4e0000dd997f095592bb90cf797202a92b07",
-    prev_event_hash: "0000000000000000000000000000000000000000000000000000000000000000",
-    entry_hash: "188063861e9df2d57f6765bba07dd85c147b3231b4b5e963c2893aeb6924e863",
-    notes: null,
+    event: ENTRY_1,
+    preimage:
+      '{"actor_role":"investigator","actor_user_id":"33333333-3333-3333-3333-333333333333","authority_ref":null,"custody_event_id":"aaaaaaaa-0000-4000-8000-000000000001","event_type":"ingested","evidence_id":"1f3b2e2a-0000-4000-8000-000000000001","hash_algo":"SHA-256","integrity_hash_at_event":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","notes":null,"occurred_at":"2026-09-08T10:00:00Z","preimage_version":1,"prev":"0000000000000000000000000000000000000000000000000000000000000000","seq":1}',
   },
   {
-    custody_event_id: "00000000-0000-0000-0000-000000000002",
-    evidence_id: EVIDENCE_ID,
-    sequence_number: 2,
-    event_type: "ingested",
-    occurred_at: "2026-06-02T14:03:02Z",
-    actor_user_id: null,
-    actor_role: "forensic_examiner",
-    authority_ref: null,
-    integrity_hash_at_event: "b96b2ae937a0d587b9890dbad2e7e98d5e9898ed940ec10a7518a14d4fb4b60c",
-    prev_event_hash: "188063861e9df2d57f6765bba07dd85c147b3231b4b5e963c2893aeb6924e863",
-    entry_hash: "c1c1ebd956c3928840f9f8a3e507c91bf9386cfa20e22aa1a5cacdb18edfc40f",
-    notes: null,
+    event: ENTRY_2,
+    preimage:
+      '{"actor_role":"analyst","actor_user_id":"44444444-4444-4444-4444-444444444444","authority_ref":"warrant-2026-001","custody_event_id":"aaaaaaaa-0000-4000-8000-000000000002","event_type":"accessed","evidence_id":"1f3b2e2a-0000-4000-8000-000000000001","hash_algo":"SHA-256","integrity_hash_at_event":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","notes":"Chaîne de contrôle — vérifiée","occurred_at":"2026-09-08T11:30:00.500000Z","preimage_version":1,"prev":"5a6d376b0f452124e643c1153d36779f513d4c272e5e9be702bf340ff72a6782","seq":2}',
   },
   {
-    custody_event_id: "00000000-0000-0000-0000-000000000003",
-    evidence_id: EVIDENCE_ID,
-    sequence_number: 3,
-    event_type: "accessed",
-    occurred_at: "2026-06-02T14:03:03.100000Z",
-    actor_user_id: null,
-    actor_role: "forensic_examiner",
-    authority_ref: null,
-    integrity_hash_at_event: "b4f3bdff83fbf2030f6e60c0ebf5f184946b84855482e2e02b43207f4ced1eb7",
-    prev_event_hash: "c1c1ebd956c3928840f9f8a3e507c91bf9386cfa20e22aa1a5cacdb18edfc40f",
-    entry_hash: "b4409b1501f680102771155368e2a86a9f2157829de4f4c9fadf79056bab9d7b",
-    notes: null,
+    event: ENTRY_3,
+    preimage:
+      '{"actor_role":"system","actor_user_id":null,"authority_ref":null,"custody_event_id":"aaaaaaaa-0000-4000-8000-000000000003","event_type":"exported","evidence_id":"1f3b2e2a-0000-4000-8000-000000000001","hash_algo":"SHA-256","integrity_hash_at_event":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","notes":"quote \\" and \\\\ backslash","occurred_at":"2026-09-08T12:00:00.123456Z","preimage_version":1,"prev":"5e9e5eb6147a346bbd1541a1e4956ca09199920e3615c35791e62dec8cb71343","seq":3}',
   },
 ];
 
-/** Python's `json.dumps(..., sort_keys=True, separators=(",", ":"))` output, verbatim. */
-const CANONICAL_PREIMAGES: readonly string[] = [
-  '{"event_type":"collected","evidence_id":"1f3b2e2a-0000-4000-8000-000000000001","integrity_hash_at_event":"75f3ae1057c197610e33633c630a4e0000dd997f095592bb90cf797202a92b07","occurred_at":"2026-06-02T14:03:01.123456+00:00","prev":"0000000000000000000000000000000000000000000000000000000000000000","seq":1}',
-  '{"event_type":"ingested","evidence_id":"1f3b2e2a-0000-4000-8000-000000000001","integrity_hash_at_event":"b96b2ae937a0d587b9890dbad2e7e98d5e9898ed940ec10a7518a14d4fb4b60c","occurred_at":"2026-06-02T14:03:02+00:00","prev":"188063861e9df2d57f6765bba07dd85c147b3231b4b5e963c2893aeb6924e863","seq":2}',
-  '{"event_type":"accessed","evidence_id":"1f3b2e2a-0000-4000-8000-000000000001","integrity_hash_at_event":"b4f3bdff83fbf2030f6e60c0ebf5f184946b84855482e2e02b43207f4ced1eb7","occurred_at":"2026-06-02T14:03:03.100000+00:00","prev":"c1c1ebd956c3928840f9f8a3e507c91bf9386cfa20e22aa1a5cacdb18edfc40f","seq":3}',
-];
-
-/** A mutable deep copy, so a tamper case can never bleed into another test's vector. */
-function chain(): CustodyEvent[] {
-  return structuredClone(CANONICAL_CHAIN) as CustodyEvent[];
+/** The chain with one entry patched — used to model a tampered or legacy row. */
+function patched(target: CustodyEvent, patch: Partial<CustodyEvent>): CustodyEvent[] {
+  return CANONICAL_CHAIN.map((event) =>
+    event.sequence_number === target.sequence_number ? { ...event, ...patch } : { ...event },
+  );
 }
 
-/** Narrowing helper — keeps the failure assertions readable without non-null assertions. */
-function at(events: CustodyEvent[], index: number): CustodyEvent {
-  const event = events[index];
-  if (event === undefined) {
-    throw new Error(`test vector has no entry at index ${String(index)}`);
-  }
-  return event;
-}
-
-describe("custodyPreimage", () => {
-  it("reproduces Python's json.dumps output byte for byte", () => {
-    const events = chain();
-    expect(custodyPreimage(at(events, 0))).toBe(CANONICAL_PREIMAGES[0]);
-    expect(custodyPreimage(at(events, 1))).toBe(CANONICAL_PREIMAGES[1]);
-    expect(custodyPreimage(at(events, 2))).toBe(CANONICAL_PREIMAGES[2]);
+describe("canonicalJson agreement with the Python canonicalizer", () => {
+  it("reproduces the backend's canonical preimage byte for byte", () => {
+    for (const { event, preimage } of FIXTURES) {
+      expect(canonicalJson(custodyPreimage(event))).toBe(preimage);
+    }
   });
 
-  it("emits keys in Python's sort_keys order", () => {
-    // Parsed back out rather than eyeballed, so the assertion is about the emitted bytes.
-    const keys = Object.keys(
-      JSON.parse(custodyPreimage(at(chain(), 0))) as Record<string, unknown>,
+  it("sorts keys, so the field order is computed rather than transcribed", () => {
+    const keys = [...canonicalJson(custodyPreimage(ENTRY_1)).matchAll(/"([a-z_]+)":/g)].map(
+      (match) => match[1],
     );
-    expect(keys).toEqual([
-      "event_type",
-      "evidence_id",
-      "integrity_hash_at_event",
-      "occurred_at",
-      "prev",
-      "seq",
-    ]);
+    expect(keys).toEqual([...keys].sort());
   });
 
-  it("abbreviates prev_event_hash and sequence_number to prev and seq", () => {
-    // The payload field names and the hashed key names differ, and only here. Asserted
-    // explicitly because using the payload names is the single most likely way to break this.
-    const preimage = custodyPreimage(at(chain(), 0));
-    expect(preimage).toContain('"prev":');
-    expect(preimage).toContain('"seq":');
-    expect(preimage).not.toContain("prev_event_hash");
-    expect(preimage).not.toContain("sequence_number");
+  it("emits non-ASCII literally rather than as escapes", () => {
+    const encoded = canonicalJson(custodyPreimage(ENTRY_2));
+    expect(encoded).toContain("Chaîne de contrôle — vérifiée");
+    expect(encoded).not.toContain("\\u");
   });
 
-  it("contains no whitespace, matching separators=(',', ':')", () => {
-    expect(custodyPreimage(at(chain(), 0))).not.toMatch(/\s/);
-  });
-});
-
-describe("toPythonIsoformat", () => {
-  it("rewrites the wire Z suffix to Python's +00:00 offset", () => {
-    expect(toPythonIsoformat("2026-06-02T14:03:02Z")).toBe("2026-06-02T14:03:02+00:00");
-  });
-
-  it("preserves microsecond precision, including trailing zeros", () => {
-    // A Date round-trip would truncate to milliseconds and drop the trailing zeros — the exact
-    // bug this function exists to avoid.
-    expect(toPythonIsoformat("2026-06-02T14:03:01.123456Z")).toBe(
-      "2026-06-02T14:03:01.123456+00:00",
-    );
-    expect(toPythonIsoformat("2026-06-02T14:03:03.100000Z")).toBe(
-      "2026-06-02T14:03:03.100000+00:00",
+  it("escapes quotes and backslashes exactly as Python does", () => {
+    expect(canonicalJson(custodyPreimage(ENTRY_3))).toContain(
+      '"notes":"quote \\" and \\\\ backslash"',
     );
   });
 
-  it("omits a fractional part when the source has none", () => {
-    expect(toPythonIsoformat("2026-06-02T14:03:02Z")).not.toContain(".");
+  it("renders integers without a decimal point", () => {
+    expect(canonicalJson({ seq: 1, version: 1 })).toBe('{"seq":1,"version":1}');
   });
 
-  it("passes through a value already in offset form", () => {
-    expect(toPythonIsoformat("2026-06-02T14:03:02+00:00")).toBe("2026-06-02T14:03:02+00:00");
+  it("contains no whitespace", () => {
+    expect(canonicalJson(custodyPreimage(ENTRY_1))).not.toMatch(/\s/);
+  });
+
+  it("hashes the wire timestamp as received, with no rewriting", () => {
+    // Wave 1.2 moved the backend to hashing the Z form, so what the client got is what was
+    // hashed. The old +00:00 translation is gone and must not come back.
+    expect(canonicalJson(custodyPreimage(ENTRY_1))).toContain(
+      '"occurred_at":"2026-09-08T10:00:00Z"',
+    );
   });
 });
 
 describe("verifyCustodyChain", () => {
   it("verifies the canonical chain produced by the Python backend", async () => {
-    await expect(verifyCustodyChain(chain())).resolves.toEqual({
+    await expect(verifyCustodyChain([...CANONICAL_CHAIN])).resolves.toEqual({
       status: "verified",
       count: 3,
     });
   });
 
   it("verifies regardless of the order the server returned entries in", async () => {
-    // Ordering is a display concern; verification sorts a copy by sequence_number.
-    const shuffled = [at(chain(), 2), at(chain(), 0), at(chain(), 1)];
-    await expect(verifyCustodyChain(shuffled)).resolves.toEqual({ status: "verified", count: 3 });
+    await expect(verifyCustodyChain([ENTRY_3, ENTRY_1, ENTRY_2])).resolves.toEqual({
+      status: "verified",
+      count: 3,
+    });
   });
 
   it("treats an empty ledger as nothing to verify, not as a failure", async () => {
     await expect(verifyCustodyChain([])).resolves.toEqual({ status: "idle" });
   });
 
+  // Each of these is a field that was NOT in the preimage before Wave 1.2. Every one of them
+  // would have verified while altered.
+  const attributionForgeries: [string, Partial<CustodyEvent>][] = [
+    ["actor_role", { actor_role: "admin" }],
+    ["actor_user_id", { actor_user_id: "99999999-9999-9999-9999-999999999999" }],
+    ["authority_ref", { authority_ref: "warrant-2026-999" }],
+    ["notes", { notes: "something else entirely" }],
+    ["custody_event_id", { custody_event_id: "99999999-0000-4000-8000-000000000009" }],
+  ];
+
+  it.each(attributionForgeries)(
+    "detects an altered %s — an attribution field Wave 1.2 added",
+    async (_name, patch) => {
+      await expect(verifyCustodyChain(patched(ENTRY_2, patch))).resolves.toMatchObject({
+        status: "failed",
+        sequenceNumber: 2,
+      });
+    },
+  );
+
   it("detects an altered event_type", async () => {
-    const events = chain();
-    at(events, 1).event_type = "exported";
-
-    const result = await verifyCustodyChain(events);
-
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.sequenceNumber).toBe(2);
-      expect(result.reason).toContain("altered");
-    }
+    await expect(
+      verifyCustodyChain(patched(ENTRY_1, { event_type: "disposed" })),
+    ).resolves.toMatchObject({ status: "failed", sequenceNumber: 1 });
   });
 
   it("detects an altered timestamp", async () => {
-    const events = chain();
-    at(events, 0).occurred_at = "2026-06-02T14:03:01.123457Z";
+    await expect(
+      verifyCustodyChain(patched(ENTRY_3, { occurred_at: "2026-09-08T12:00:00.123457Z" })),
+    ).resolves.toMatchObject({ status: "failed", sequenceNumber: 3 });
+  });
 
-    const result = await verifyCustodyChain(events);
-
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.sequenceNumber).toBe(1);
-    }
+  it("detects an altered integrity hash", async () => {
+    await expect(
+      verifyCustodyChain(patched(ENTRY_1, { integrity_hash_at_event: "c".repeat(64) })),
+    ).resolves.toMatchObject({ status: "failed", sequenceNumber: 1 });
   });
 
   it("detects a removed genesis entry via the sequence gap", async () => {
-    // The remaining entries still chain to each other correctly, so only the sequence check
-    // catches truncation from the front.
-    const result = await verifyCustodyChain(chain().slice(1));
-
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.sequenceNumber).toBe(2);
-      expect(result.reason).toContain("missing");
-    }
+    await expect(verifyCustodyChain([ENTRY_2, ENTRY_3])).resolves.toMatchObject({
+      status: "failed",
+      sequenceNumber: 2,
+    });
   });
 
   it("detects a broken prev_event_hash link", async () => {
-    const events = chain();
-    at(events, 2).prev_event_hash = "f".repeat(64);
-
-    const result = await verifyCustodyChain(events);
-
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.sequenceNumber).toBe(3);
-      expect(result.reason).toContain("chain is broken");
-    }
+    await expect(
+      verifyCustodyChain(patched(ENTRY_2, { prev_event_hash: "f".repeat(64) })),
+    ).resolves.toMatchObject({ status: "failed", sequenceNumber: 2 });
   });
 
   it("rejects a first entry that does not carry the genesis sentinel", async () => {
-    const events = chain();
-    at(events, 0).prev_event_hash = "a".repeat(64);
-
-    const result = await verifyCustodyChain(events);
-
-    expect(result.status).toBe("failed");
-    if (result.status === "failed") {
-      expect(result.sequenceNumber).toBe(1);
-      expect(result.reason).toContain("genesis");
-    }
+    await expect(
+      verifyCustodyChain([{ ...ENTRY_1, prev_event_hash: "9".repeat(64) }]),
+    ).resolves.toMatchObject({ status: "failed", sequenceNumber: 1 });
   });
 
   it("exposes the genesis sentinel the backend actually stores", () => {
     expect(GENESIS_PREV_HASH).toBe("0".repeat(64));
-    expect(at(chain(), 0).prev_event_hash).toBe(GENESIS_PREV_HASH);
+    expect(ENTRY_1.prev_event_hash).toBe(GENESIS_PREV_HASH);
+  });
+});
+
+describe("mixed-format chains", () => {
+  /** An entry written before Wave 1.2: hashed over a partial field set, so not recomputable. */
+  const legacyFirst = patched(ENTRY_1, { hash_algo: null, preimage_version: null });
+
+  it("reports a legacy entry as unverifiable, never as altered", async () => {
+    // The distinction is the whole point: calling an old-format entry "tampered" would be a
+    // false accusation on a legal-custody surface.
+    await expect(verifyCustodyChain(legacyFirst)).resolves.toEqual({
+      status: "partial",
+      verifiedCount: 2,
+      unverifiableCount: 1,
+    });
+  });
+
+  it("still checks linkage and sequence across a legacy entry", async () => {
+    // The chain links do not depend on the preimage format, so they are verified either way — a
+    // legacy entry is skipped for recomputation, not skipped entirely.
+    const broken = legacyFirst.map((event) =>
+      event.sequence_number === 2 ? { ...event, prev_event_hash: "e".repeat(64) } : event,
+    );
+    await expect(verifyCustodyChain(broken)).resolves.toMatchObject({
+      status: "failed",
+      sequenceNumber: 2,
+    });
+  });
+
+  it("treats a downgraded preimage_version as unverifiable, not as verified", async () => {
+    // The version is inside the hash, so claiming an older format cannot make a tampered entry
+    // verify under weaker rules — the best an attacker achieves is "not checked".
+    await expect(verifyCustodyChain(patched(ENTRY_2, { preimage_version: null }))).resolves.toEqual(
+      { status: "partial", verifiedCount: 2, unverifiableCount: 1 },
+    );
+  });
+
+  it("does not declare a future preimage version forged", async () => {
+    // An old client meeting a newer entry must degrade, not accuse.
+    await expect(
+      verifyCustodyChain(patched(ENTRY_3, { preimage_version: SUPPORTED_PREIMAGE_VERSION + 1 })),
+    ).resolves.toEqual({ status: "partial", verifiedCount: 2, unverifiableCount: 1 });
+  });
+
+  it("reports an all-legacy ledger as fully unverifiable", async () => {
+    const allLegacy = CANONICAL_CHAIN.map((event) => ({
+      ...event,
+      hash_algo: null,
+      preimage_version: null,
+    }));
+    await expect(verifyCustodyChain(allLegacy)).resolves.toEqual({
+      status: "partial",
+      verifiedCount: 0,
+      unverifiableCount: 3,
+    });
   });
 });

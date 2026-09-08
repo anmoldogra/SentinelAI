@@ -42,14 +42,25 @@ acceptance:
 | §2 Canonical encoding (JCS) | 1.1 | **Built** — `platform/crypto/canonical.py`, RFC 8785 vectors + JSONB round-trip tests |
 | §5 Crypto-agility columns on both ledgers | 1.1 | **Built** — migrations `202609080001_platform_agility`, `202609080002_ingestion_agility`; all six columns, nullable |
 | §4 Server-computed integrity hashing | 1.5 | **Built** — landed early (out of dependency order) as `09e4f14`; ADR-0008 §3 |
-| §1 Authenticated entries (signatures) | 1.2 | **Not built** — columns exist and are null; ledgers still use the bare `json.dumps` chain |
-| §2 Complete preimage (all persisted fields) | 1.2 | **Not built** — the incomplete preimage in Context §2 is still live |
+| §2 Complete preimage (all persisted fields) | 1.2 | **Built** — `platform/crypto/ledger.py`; both ledgers hash every persisted column under JCS and stamp `hash_algo`/`preimage_version`. Enforced by a table-driven test against the live schema |
+| §1 Authenticated entries (**signatures**) | 1.2 | **NOT built** — `signature`, `sig_alg` and `key_id` are still null; no KMS key is used by either ledger |
 | §3 External anchoring (Merkle + RFC-3161) | 1.3 | **Not built** |
 | §6 Verification Engine | 1.4 | **Not built** |
 
-Until Wave 1.2 lands, **the defects in Context §1 and §2 remain exploitable**: the chains are
-still unkeyed and unanchored, and a privileged writer can still forge one. Wave 1.1 removes the
-excuse for building the fix on an unstable encoding; it does not itself close SR-4.
+**Context §2 (incomplete preimage) is closed. Context §1 (unkeyed, unanchored) is not**, and the
+distinction decides what can honestly be claimed today. A complete preimage binds every field of
+an entry to its hash, so an attacker who edits one row — the realistic insider, working through
+whatever access they have to the table — is now caught, including when they rewrite the
+attribution fields that were previously unbound. It does nothing against an attacker who can
+rewrite the whole chain and recompute every hash forward, because nothing yet requires a key they
+do not have.
+
+**Therefore PRD SR-4 ("tamper-evident even to an administrator with direct database access") is
+still open.** Closing it requires §1's signature over `(sequence || prev_entry_hash ||
+entry_hash)` from a KMS key the application's database role cannot read, and §3's external anchor
+to make truncation and rollback detectable. Until both land, the correct description of the
+ledgers is "tamper-evident against row-level edits", not "tamper-proof against a privileged
+insider".
 
 ## Context
 

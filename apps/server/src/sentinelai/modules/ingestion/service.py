@@ -22,7 +22,6 @@ scan step); see ``jobs.py``.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -62,6 +61,14 @@ from sentinelai.modules.ingestion.schemas import (
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CurrentUser
 from sentinelai.platform.config import settings
+from sentinelai.platform.crypto.canonical import canonicalize
+from sentinelai.platform.crypto.ledger import (
+    LEDGER_HASH_ALGO,
+    LEDGER_PREIMAGE_VERSION,
+    compute_entry_hash,
+    ledger_timestamp,
+    ledger_uuid,
+)
 from sentinelai.platform.security.digest import (
     StreamDigest,
     compute_stream_digest,
@@ -150,26 +157,51 @@ def _actor_role(actor: CurrentUser) -> str:
 
 
 def _custody_entry_hash(
+    *,
     prev_hash: str,
+    custody_event_id: UUID,
     evidence_id: UUID,
     sequence_number: int,
     event_type: str,
-    integrity_hash_at_event: str,
     occurred_at: datetime,
+    actor_user_id: UUID | None,
+    actor_role: str | None,
+    authority_ref: str | None,
+    notes: str | None,
+    integrity_hash_at_event: str,
 ) -> str:
-    preimage = json.dumps(
+    """Chain one custody entry onto the previous one over its complete persisted field set.
+
+    **Wave 1.2 (ADR-0003 §2) completed this preimage.** It previously covered six of the eleven
+    columns, omitting `actor_user_id`, `actor_role`, `authority_ref`, `notes`, and the row's own
+    id — so who touched a piece of evidence, in what role, and under what legal authority could
+    all be rewritten without breaking the chain. On a chain-of-custody record those *are* the
+    evidence; a ledger that binds the payload hash but not the custodian answers the wrong
+    question.
+
+    Every column of `ingestion.evidence_custody_events` is covered except `entry_hash` (this
+    function's own output) and `signature`/`key_id`/`sig_alg`/`anchor_ref`, which are written
+    after the hash exists. `tests/unit/test_ledger_preimage.py` enforces that exclusion list
+    against the live table definition, so a column added later cannot quietly escape the preimage.
+
+    Keyword-only on purpose: four of these are `str | None` and two are `UUID`, so a transposed
+    positional call would typecheck, hash cleanly, and be wrong.
+    """
+    return compute_entry_hash(
         {
             "prev": prev_hash,
+            "custody_event_id": str(custody_event_id),
             "evidence_id": str(evidence_id),
             "seq": sequence_number,
             "event_type": event_type,
+            "occurred_at": ledger_timestamp(occurred_at),
+            "actor_user_id": ledger_uuid(actor_user_id),
+            "actor_role": actor_role,
+            "authority_ref": authority_ref,
+            "notes": notes,
             "integrity_hash_at_event": integrity_hash_at_event,
-            "occurred_at": occurred_at.isoformat(),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+        }
     )
-    return hashlib.sha256(preimage.encode()).hexdigest()
 
 
 class EvidenceService:
@@ -207,21 +239,32 @@ class EvidenceService:
         prev_hash = last.entry_hash if last is not None else _GENESIS_HASH
         sequence_number = (last.sequence_number + 1) if last is not None else 1
         occurred_at = datetime.now(UTC)
+        # Generated here rather than left to the column default, because the row's own identity is
+        # part of the preimage — an entry's contents cannot be transplanted onto a new id and
+        # still verify.
+        custody_event_id = uuid4()
+        actor_role = _actor_role(actor)
         entry_hash = _custody_entry_hash(
-            prev_hash,
-            evidence_id,
-            sequence_number,
-            event_type,
-            integrity_hash_at_event,
-            occurred_at,
-        )
-        event = EvidenceCustodyEvent(
+            prev_hash=prev_hash,
+            custody_event_id=custody_event_id,
             evidence_id=evidence_id,
             sequence_number=sequence_number,
             event_type=event_type,
             occurred_at=occurred_at,
             actor_user_id=actor.user_id,
-            actor_role=_actor_role(actor),
+            actor_role=actor_role,
+            authority_ref=authority_ref,
+            notes=notes,
+            integrity_hash_at_event=integrity_hash_at_event,
+        )
+        event = EvidenceCustodyEvent(
+            custody_event_id=custody_event_id,
+            evidence_id=evidence_id,
+            sequence_number=sequence_number,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            actor_user_id=actor.user_id,
+            actor_role=actor_role,
             authority_ref=authority_ref,
             notes=notes,
             integrity_hash_at_event=integrity_hash_at_event,
@@ -229,6 +272,8 @@ class EvidenceService:
             # value hashed into its `entry_hash` — so it is stored and returned, never nulled.
             prev_event_hash=prev_hash,
             entry_hash=entry_hash,
+            hash_algo=LEDGER_HASH_ALGO,
+            preimage_version=LEDGER_PREIMAGE_VERSION,
         )
         await self._uow.custody.add(event)
         return event
@@ -440,9 +485,13 @@ class EvidenceService:
         elif data.integrity_hash:
             genesis_hash = data.integrity_hash
         elif data.inline_payload is not None:
-            genesis_hash = hashlib.sha256(
-                json.dumps(data.inline_payload, sort_keys=True).encode()
-            ).hexdigest()
+            # Canonicalized (RFC 8785), not `json.dumps`. `inline_payload` is a JSONB column, so
+            # Postgres discards key order on write — an integrity hash built from `json.dumps`
+            # could never be recomputed from the stored row, which is exactly what Wave 1.4's
+            # Verification Engine will have to do. Adjacent to Wave 1.2's scope rather than inside
+            # it, but leaving one uncanonicalized evidentiary hash beside two fixed ones would
+            # just be a defect with a longer fuse.
+            genesis_hash = hashlib.sha256(canonicalize(data.inline_payload)).hexdigest()
         else:
             genesis_hash = _GENESIS_HASH
 

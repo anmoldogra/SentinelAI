@@ -60,6 +60,16 @@ export interface CustodyEvent {
   entry_hash: string;
   /** Free text, e.g. the reason for an access event. */
   notes: string | null;
+  /**
+   * Digest that produced `entry_hash`, and which field set went into it (ADR-0003 §5).
+   *
+   * Both are `null` on entries written before Wave 1.2. That is a dispatch input, not a defect:
+   * such an entry was hashed over a partial field set with a non-canonical encoder and cannot be
+   * recomputed from this payload, so `verifyCustodyChain` reports it as unverifiable rather than
+   * as altered. A chain can legitimately contain both kinds.
+   */
+  hash_algo: string | null;
+  preimage_version: number | null;
 }
 
 /**
