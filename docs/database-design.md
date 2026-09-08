@@ -45,6 +45,7 @@ Two schemas carry a sanctioned, narrow exception to "no cross-schema access," bo
 | | `external_idp_subject` | text | yes | SSO/OIDC subject identifier |
 | | `email` | text | no | |
 | | `display_name` | text | no | |
+| | `password_hash` | text | yes | argon2id digest (ADR-0010 §3); null for SSO-only identities |
 | | `status` | text | no | `active` \| `disabled` |
 | | `mfa_enrolled_at` | timestamptz | yes | Null ⇒ TOTP not enrolled. This **is** the enrolment flag; there is deliberately no separate `mfa_enabled` boolean that could disagree with it |
 | | `mfa_secret_ciphertext` | bytea | yes | The TOTP shared secret, **encrypted** under `KeyPurpose.SESSION_ROOT` (ADR-0009 §7, already reserved for "ADR-0010 token/secret keying"). Non-null iff `mfa_enrolled_at` is |
@@ -60,6 +61,8 @@ Two schemas carry a sanctioned, narrow exception to "no cross-schema access," bo
 | | `granted_at` | timestamptz | no | |
 | `sessions` | `session_id` | uuid | PK | |
 | | `user_id` | uuid | FK → `users` | |
+| | `token_lookup` | varchar(12) | no | indexed, non-unique; short non-secret prefix of the bearer token (ADR-0010 §1) |
+| | `token_hash` | text | no | argon2id digest of the bearer token — the token itself is never stored |
 | | `issued_at`, `expires_at`, `revoked_at` | timestamptz | mixed | `revoked_at` nullable |
 | `mfa_recovery_codes` | `code_id` | uuid | PK | One row per unused-or-spent code; `security-architecture.md` §8 makes these account-recovery only and one-time use |
 | | `user_id` | uuid | FK → `users` | |
