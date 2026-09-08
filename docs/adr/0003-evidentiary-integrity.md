@@ -2,15 +2,54 @@
 
 ## Status
 
-Proposed — supersedes the integrity approach implied by `canonical-evidence-model.md` §4
-and `security-architecture.md` §22/§27. The ⟨OPEN⟩ items below are resolved to the
-**adopted defaults** noted inline, **pending security-board / FIPS ratification** for the
-specific deploying agency (algorithm and anchoring mechanism may be constrained by air-gap
-or approved-algorithm policy).
+**Accepted** (2026-09-08) — supersedes the integrity approach implied by
+`canonical-evidence-model.md` §4 and `security-architecture.md` §22/§27.
 
-**Adopted defaults (pending ratification):** signatures **Ed25519** (FIPS 186-5) + **SHA-256**;
-canonical encoding **RFC 8785 JCS**; anchoring **RFC-3161 TSA + WORM** (internal transparency
-log optional).
+Accepted on the **design**, which is now being built in dependency order as
+`docs/modernization-roadmap.md` Wave 1. Acceptance is what unblocks that build; it is not a claim
+that the subsystem exists. The implementation status below is verified against the code, not
+assumed, and is expected to change — the Decision section is what is settled.
+
+**Decided by this acceptance:**
+
+- ⟨RESOLVED⟩ **Canonical encoding: RFC 8785 JCS**, not deterministic CBOR (RFC 8949 §4.2.1). JCS
+  wins on the criterion that actually matters here — *independent* verifiability. A defence
+  expert, an oversight body, or opposing counsel must be able to recompute an entry hash with
+  tooling we did not write; JCS canonicalizes to ordinary JSON text, so any conforming
+  implementation in any language reproduces the bytes, and the intermediate form stays readable
+  in a report. Deterministic CBOR is more compact and marginally simpler to emit, but it puts a
+  binary decode step between an auditor and the evidence, for a size saving that is irrelevant at
+  ledger-entry scale. Implemented in `platform/crypto/canonical.py` (Wave 1.1).
+- **Encoding version and `preimage_version` are separate axes.** The encoding names *how* a
+  structure becomes bytes; `preimage_version` names *which fields* went in. Either can change
+  without invalidating the other, and the Verification Engine dispatches on both.
+
+**Still adopted defaults, pending security-board / FIPS ratification** for the specific deploying
+agency (algorithm and anchoring mechanism may be constrained by air-gap or approved-algorithm
+policy) — these remain genuinely open and are resolved in their own waves, not by this
+acceptance:
+
+- ⟨OPEN⟩ Signature algorithm: **Ed25519** (FIPS 186-5) + **SHA-256**, vs ECDSA P-256 — settled
+  per deployment in Wave 1.2, which is when the first signature is actually produced.
+- ⟨OPEN⟩ Anchoring: **RFC-3161 TSA + WORM**, with an internal transparency log and/or public
+  blockchain anchor optional for deployments where a TSA is unreachable — settled in Wave 1.3.
+  An air-gapped deployment has no reachable public TSA, so this cannot be closed generically.
+
+**Implementation status (verified against the code as of 2026-09-08):**
+
+| Decision | Wave | State |
+|---|---|---|
+| §2 Canonical encoding (JCS) | 1.1 | **Built** — `platform/crypto/canonical.py`, RFC 8785 vectors + JSONB round-trip tests |
+| §5 Crypto-agility columns on both ledgers | 1.1 | **Built** — migrations `202609080001_platform_agility`, `202609080002_ingestion_agility`; all six columns, nullable |
+| §4 Server-computed integrity hashing | 1.5 | **Built** — landed early (out of dependency order) as `09e4f14`; ADR-0008 §3 |
+| §1 Authenticated entries (signatures) | 1.2 | **Not built** — columns exist and are null; ledgers still use the bare `json.dumps` chain |
+| §2 Complete preimage (all persisted fields) | 1.2 | **Not built** — the incomplete preimage in Context §2 is still live |
+| §3 External anchoring (Merkle + RFC-3161) | 1.3 | **Not built** |
+| §6 Verification Engine | 1.4 | **Not built** |
+
+Until Wave 1.2 lands, **the defects in Context §1 and §2 remain exploitable**: the chains are
+still unkeyed and unanchored, and a privileged writer can still forge one. Wave 1.1 removes the
+excuse for building the fix on an unstable encoding; it does not itself close SR-4.
 
 ## Context
 
@@ -53,9 +92,10 @@ Evidentiary ledgers become **authenticated, externally-anchored, crypto-agile** 
    - ⟨OPEN⟩ Signature algorithm: **Ed25519** (FIPS 186-5) vs **ECDSA P-256** — choose per
      the deploying agency's FIPS/HSM posture. Hash: SHA-256 (or SHA-384 for higher assurance).
 2. **Complete, versioned canonical encoding.** All persisted evidentiary fields are
-   covered. Encoding is deterministic and independent of JSONB round-trips —
-   ⟨OPEN⟩ **RFC 8785 JCS** vs **deterministic CBOR (RFC 8949 §4.2.1)**. A `preimage_version`
-   column pins the format.
+   covered. Encoding is deterministic and independent of JSONB round-trips: **RFC 8785 JCS**
+   — resolved at acceptance in favour of independent verifiability over deterministic CBOR
+   (RFC 8949 §4.2.1); see Status. A `preimage_version` column pins the **field set**, and the
+   encoding carries its own version, so the two evolve independently.
 3. **External trust anchoring.** Periodically (e.g., per N entries or per interval) build a
    **Merkle tree** over new entries, sign the root, and anchor it via **RFC-3161 timestamping
    (TSA)** written to **WORM** storage — and ⟨OPEN⟩ optionally an internal **transparency

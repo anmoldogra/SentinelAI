@@ -16,6 +16,7 @@ from sqlalchemy import (
     CheckConstraint,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     String,
     Text,
@@ -243,3 +244,13 @@ class AuditLog(Base):
     details: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     prev_entry_hash: Mapped[str] = mapped_column(Text, nullable=False)
     entry_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # --- Cryptographic agility (ADR-0003 §5, modernization Wave 1.1) -------------------
+    # Mirrors ingestion.evidence_custody_events exactly: ADR-0003 treats the custody and audit
+    # ledgers as one integrity subsystem, so the Verification Engine (Wave 1.4) can dispatch on
+    # one column set rather than two. Nullable for the same staged reason documented there.
+    hash_algo: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sig_alg: Mapped[str | None] = mapped_column(Text, nullable=True)
+    key_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preimage_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    signature: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    anchor_ref: Mapped[str | None] = mapped_column(Text, nullable=True)

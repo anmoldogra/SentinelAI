@@ -1067,3 +1067,94 @@ in-memory `FakeObjectStorage` cannot reproduce without a purpose-built hook. It 
 uncovered before the extraction; the extraction did not introduce it, but it is now on a path that
 runs for every payload-bearing ingest rather than only on explicit re-verification. Closing it
 needs a storage fake that can fail mid-stream.
+
+---
+
+## 2026-09-08 — IC-026: RFC 8785 canonical encoding + crypto-agility columns (Wave 1.1, ADR-0003)
+
+**Type:** Evidentiary-core foundation. New platform primitive + two additive migrations + docs.
+No existing hash changed, no endpoint changed, no behaviour changed.
+
+**What this increment is, and deliberately is not.** Wave 1.1 builds the *substrate* for
+authenticated ledgers: a deterministic encoding, and the columns that let the format evolve. It
+does **not** rewrite `_custody_entry_hash` or `_compute_hash` to use either — that is Wave 1.2
+(complete signed preimage), and doing it here would have changed every entry hash in the same
+change that introduced the encoding, leaving nothing stable to verify against. **The defects in
+ADR-0003 Context §1/§2 remain live after this commit**; SR-4 is not closed.
+
+**`platform/crypto/canonical.py`.** RFC 8785 JCS, pure stdlib, ~90 statements, 100% covered. The
+three divergences from `json.dumps(sort_keys=True, separators=(",", ":"))` — the encoding both
+ledgers use today — are each a silent hash change, and each is pinned by a test:
+
+- **Numbers** follow ECMAScript `Number::toString`, not `repr(float)`: `1.0` renders `1`, `1e-7`
+  renders `1e-7` (not `1e-07`). Implemented by taking the shortest round-tripping digits from
+  `repr` and re-deriving only the *layout* per ECMA-262 §6.1.6.1.20, so it is exact without
+  reimplementing shortest-float printing.
+- **Non-ASCII** is emitted as literal UTF-8, not `é`.
+- **Keys** sort by **UTF-16 code unit**, not code point. These differ only above U+FFFF — a
+  surrogate pair leads with 0xD800-0xDBFF and so sorts below U+E000-U+FFFF. RFC 8785 §3.2.3's
+  worked example is exactly this case (U+1F600 before U+FB33) and is asserted verbatim.
+
+Everything unrepresentable **raises** rather than coercing: NaN/Infinity, non-string keys, lone
+surrogates, non-JSON types, nesting past 100 levels. A silent coercion would change a preimage
+without changing anything visible, which is the single failure mode the subsystem exists to
+prevent.
+
+**A real bound bug the database found.** The first draft rejected integers outside ±(2**53 - 1).
+That is wrong, and only a live Postgres exposed it: `jsonb` stores numbers as `numeric` and
+renders a stored `1e21` back as the digit string `1000000000000000000000`, which `json.loads`
+yields as an **int**. The encoder accepted the value on the way in and rejected it on the way out
+— precisely the round-trip divergence this module exists to prevent. The correct criterion is not
+magnitude but exact representability: an int is admissible iff `float(n)` round-trips to `n`.
+That admits 10**21 (= 5**21 * 2**21, and 5**21 fits in 53 bits) and 2**53 itself, while still
+rejecting 2**53 + 1, which collapses onto the same double as 2**53. Had this shipped on the unit
+suite alone, the failure would have surfaced years later as an unverifiable custody entry.
+
+**Migrations.** `202609080001_platform_agility` (audit_log) and `202609080002_ingestion_agility`
+(evidence_custody_events) add the six ADR-0003 §5 columns: `hash_algo`, `sig_alg`, `key_id`,
+`preimage_version`, `signature` (BYTEA — no base64 layer to disagree about when verifying),
+`anchor_ref`. Two migrations rather than one because each module owns its own schema and history
+(database-design.md §5/§11); the change is one logical unit but must not cross a schema boundary.
+
+All six are **nullable by design**. Wave 1.2 populates the signing metadata, Wave 1.3 fills
+`anchor_ref` asynchronously. A null therefore means "written before that guarantee existed" — a
+state the Verification Engine (1.4) dispatches on. NOT NULL with defaults would assert an entry
+was signed under an algorithm when no signature exists, which is a worse lie on a court-facing
+record than absent metadata.
+
+**No privilege migration was needed, and that was checked rather than assumed.**
+`platform.db.privileges` grants `INSERT, SELECT` at *table* level, not column level, so new
+columns are covered by the existing grant; the ADR-0004 append-only trigger blocks row mutation
+and is unaffected by DDL adding a column. Verified against a real database: both schemas at head,
+all 12 columns present, correct types and nullability, existing rows untouched.
+
+**ADR-0003 Proposed -> Accepted**, with the JCS-vs-CBOR ⟨OPEN⟩ resolved in favour of JCS: the
+deciding criterion is *independent* verifiability, since a defence expert or oversight body must
+recompute an entry hash with tooling we did not write, and JCS canonicalizes to ordinary JSON
+text that any conforming implementation reproduces. CBOR is more compact but interposes a binary
+decode between an auditor and the evidence, for a size saving irrelevant at ledger-entry scale.
+The signature-algorithm and anchoring ⟨OPEN⟩s are **not** closed — they belong to Waves 1.2/1.3,
+and anchoring in particular cannot be settled generically because an air-gapped deployment has no
+reachable public TSA. The ADR now carries a verified per-decision implementation table so its
+status cannot drift from the code again.
+
+**Tests: 64 new** (58 unit, 6 integration). Specification vectors (RFC 8785 §3.2.3, twenty
+ECMAScript number cases), determinism properties over a 1500-document seeded corpus, and six
+JSONB round-trip tests against a real Postgres 16. The round-trip suite asserts **both**
+directions — that Postgres really does reorder `jsonb` keys, and that canonicalization absorbs it
+— so it cannot pass vacuously if `jsonb` semantics ever change.
+
+`hypothesis` was deliberately **not** added. For a determinism property, a seeded corpus that is
+byte-identical on every machine and in every CI run is worth more than random exploration, and it
+leaves the air-gapped dependency surface unchanged. Worth revisiting if Wave 1.2's preimage work
+wants shrinking on failure.
+
+**Gates.** ruff (lint + format), `mypy --strict` (185 files), import-linter (2/2 contracts kept),
+full suite **718 passed / 2 skipped** (up from 656 collected; the 2 skips are Vault and the KMS
+benchmark, both opt-in via env var). Platform coverage **91.95%** against the 90% floor;
+`canonical.py` at **100%**.
+
+**Known gap, stated plainly.** The encoding is not yet *used* by anything. Until Wave 1.2 wires it
+into both ledgers, `canonical.py` is a tested primitive with no production caller, and the
+agility columns are six nulls per row. That is the intended end state of Wave 1.1 and the reason
+1.2 must follow immediately rather than after unrelated work.

@@ -19,6 +19,7 @@ from sqlalchemy import (
     Boolean,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -93,6 +94,17 @@ class EvidenceCustodyEvent(Base):
     integrity_hash_at_event: Mapped[str] = mapped_column(Text, nullable=False)
     prev_event_hash: Mapped[str] = mapped_column(Text, nullable=False)
     entry_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # --- Cryptographic agility (ADR-0003 §5, modernization Wave 1.1) -------------------
+    # All nullable: Wave 1.1 adds the columns, Wave 1.2 populates hash_algo/sig_alg/key_id/
+    # signature at write time, Wave 1.3 populates anchor_ref asynchronously. A null therefore
+    # means "written before that wave", which the Verification Engine (1.4) dispatches on —
+    # it is a real state, not a missing value.
+    hash_algo: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sig_alg: Mapped[str | None] = mapped_column(Text, nullable=True)
+    key_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preimage_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    signature: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    anchor_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class IntakeRecord(Base):

@@ -6,6 +6,11 @@ The single, provider-agnostic cryptographic trust boundary. Consumers import ONL
 
 from __future__ import annotations
 
+from sentinelai.platform.crypto.canonical import (
+    CANONICAL_ENCODING,
+    CanonicalizationError,
+    canonicalize,
+)
 from sentinelai.platform.crypto.exceptions import (
     AlgorithmNotAllowed,
     CapabilityNotSupported,
@@ -37,8 +42,10 @@ from sentinelai.platform.crypto.types import (
 )
 
 __all__ = [
+    "CANONICAL_ENCODING",
     "Algorithm",
     "AlgorithmNotAllowed",
+    "CanonicalizationError",
     "CapabilityNotSupported",
     "Ciphertext",
     "CryptoError",
@@ -58,6 +65,7 @@ __all__ = [
     "Signature",
     "SignatureBundle",
     "SignatureInvalid",
+    "canonicalize",
     "create_kms",
     "get_kms",
 ]
