@@ -140,3 +140,65 @@ class AttributeSchemaRead(BaseModel):
     schema_version: str
     category: str
     artifact_type: str
+
+
+class VerificationFindingRead(BaseModel):
+    """One entry's verdict inside a verification report (ADR-0003 §6)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    sequence: int | None
+    entry_hash: str
+    state: str
+    findings: list[str]
+
+
+class AnchorFindingRead(BaseModel):
+    """One anchor's verdict.
+
+    `worm_object_ref` is included so a reviewer can fetch the anchor document from WORM storage and
+    verify the root independently of this API — which is the entire purpose of anchoring, since the
+    database is the thing being checked.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    anchor_id: UUID
+    state: str
+    expected_entry_count: int
+    covered_entries: int
+    worm_object_ref: str
+    findings: list[str]
+
+
+class ChainVerificationRead(BaseModel):
+    """Court-facing verification report for one evidence item's chain of custody.
+
+    **Three states, not two.** `state` is `verified`, `partial`, or `failed`. `partial` means one or
+    more entries cannot be *independently re-derived* — rows written before Wave 1.2 carry a null
+    `preimage_version` and a null `signature`, and they can never be signed retroactively with any
+    honesty because the bytes that should have been signed are gone. A client must render that
+    distinctly from both of the other two: reporting it as `verified` whitewashes an unsigned row,
+    and reporting it as `failed` is a false accusation of tampering on a legal-custody surface.
+
+    `findings` carries the distinct machine-readable reasons across the whole chain, while
+    `entries[].findings` localizes each one to a sequence number. A report is only actionable if a
+    reviewer can say *which* entry is wrong and *how*, so both levels are returned.
+
+    `unanchored_entries` is not a failure. Anchoring is batched, so the newest entries are
+    legitimately uncommitted until the next batch is cut — but a value that keeps climbing across
+    reports means batch cutting has stopped, which is worth surfacing to an operator.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    ledger: str
+    state: str
+    entry_count: int
+    verified_entries: int
+    partial_entries: int
+    failed_entries: int
+    unanchored_entries: int
+    findings: list[str]
+    entries: list[VerificationFindingRead]
+    anchors: list[AnchorFindingRead]

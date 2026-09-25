@@ -60,6 +60,7 @@ from sentinelai.modules.ingestion.schemas import (
 )
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CurrentUser
+from sentinelai.platform.auth.ledger_verification import read_anchor_views
 from sentinelai.platform.config import settings
 from sentinelai.platform.crypto import get_kms
 from sentinelai.platform.crypto.canonical import canonicalize
@@ -72,6 +73,11 @@ from sentinelai.platform.crypto.ledger import (
     compute_entry_hash,
     ledger_timestamp,
     ledger_uuid,
+)
+from sentinelai.platform.crypto.verification import (
+    LedgerEntryView,
+    LedgerVerificationReport,
+    LedgerVerifier,
 )
 from sentinelai.platform.security.digest import (
     StreamDigest,
@@ -160,6 +166,49 @@ def _actor_role(actor: CurrentUser) -> str:
     return actor.roles[0] if actor.roles else "unknown"
 
 
+def custody_preimage_fields(
+    *,
+    prev_hash: str,
+    custody_event_id: UUID,
+    evidence_id: UUID,
+    sequence_number: int,
+    event_type: str,
+    occurred_at: datetime,
+    actor_user_id: UUID | None,
+    actor_role: str | None,
+    authority_ref: str | None,
+    notes: str | None,
+    integrity_hash_at_event: str,
+) -> dict[str, object]:
+    """The exact field set hashed into an ``ingestion.evidence_custody_events`` entry.
+
+    **Public because verification needs it (Wave 1.4, ADR-0003 §6).** The Verification Engine lives
+    in ``platform``, which may not import this module, so it cannot know the custody field set —
+    ``ingestion`` supplies it by building
+    :class:`~sentinelai.platform.crypto.verification.LedgerEntryView` records with this function.
+    That is the right way round: the preimage *is* this table's schema, and the module that owns the
+    schema is the only place that can be trusted to stay in step with it.
+
+    One function serves both directions — :meth:`EvidenceService._append_custody` on the way in and
+    :meth:`EvidenceService.verify_custody_chain` on the way out — because two copies of a preimage
+    would drift, and the drift would surface years later as a chain that stops verifying with no
+    discoverable cause.
+    """
+    return {
+        "prev": prev_hash,
+        "custody_event_id": str(custody_event_id),
+        "evidence_id": str(evidence_id),
+        "seq": sequence_number,
+        "event_type": event_type,
+        "occurred_at": ledger_timestamp(occurred_at),
+        "actor_user_id": ledger_uuid(actor_user_id),
+        "actor_role": actor_role,
+        "authority_ref": authority_ref,
+        "notes": notes,
+        "integrity_hash_at_event": integrity_hash_at_event,
+    }
+
+
 def _custody_entry_hash(
     *,
     prev_hash: str,
@@ -192,19 +241,19 @@ def _custody_entry_hash(
     positional call would typecheck, hash cleanly, and be wrong.
     """
     return compute_entry_hash(
-        {
-            "prev": prev_hash,
-            "custody_event_id": str(custody_event_id),
-            "evidence_id": str(evidence_id),
-            "seq": sequence_number,
-            "event_type": event_type,
-            "occurred_at": ledger_timestamp(occurred_at),
-            "actor_user_id": ledger_uuid(actor_user_id),
-            "actor_role": actor_role,
-            "authority_ref": authority_ref,
-            "notes": notes,
-            "integrity_hash_at_event": integrity_hash_at_event,
-        }
+        custody_preimage_fields(
+            prev_hash=prev_hash,
+            custody_event_id=custody_event_id,
+            evidence_id=evidence_id,
+            sequence_number=sequence_number,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+            authority_ref=authority_ref,
+            notes=notes,
+            integrity_hash_at_event=integrity_hash_at_event,
+        )
     )
 
 
@@ -713,6 +762,89 @@ class EvidenceService:
     ) -> Sequence[EvidenceCustodyEvent]:
         await self.get_evidence(evidence_id, actor)
         return await self._uow.custody.list_for_evidence(evidence_id)
+
+    async def verify_custody_chain(
+        self, evidence_id: UUID, actor: CurrentUser
+    ) -> LedgerVerificationReport:
+        """Verify one evidence item's full chain of custody — ADR-0003 §6(a).
+
+        The authorized, audited entry point: :meth:`get_evidence` enforces access and records the
+        read, so an unauthorized caller never reaches the ledger. The verification itself is in
+        :meth:`reverify_custody_chain`, which the scheduled job calls without an actor.
+        """
+        await self.get_evidence(evidence_id, actor)
+        return await self.reverify_custody_chain(evidence_id)
+
+    async def reverify_custody_chain(self, evidence_id: UUID) -> LedgerVerificationReport:
+        """Verify one custody chain with no actor, no access check, and **no audit entry**.
+
+        This is the scheduled job's path (ADR-0003 §6(b)), and the missing audit entry is a
+        deliberate decision rather than an oversight. Every audit write is itself an append to the
+        *other* evidentiary ledger: it takes the chain lock, costs a KMS signature, and grows
+        ``platform.audit_log`` by one row. A health check that re-verifies a few hundred custody
+        chains on a timer would therefore write a few hundred audit entries per run, forever —
+        audit-log amplification driven by a process that discloses nothing to anybody, and which
+        would in time dominate the very ledger it is meant to be watching.
+
+        What makes that safe to omit: this reads ledger metadata (hashes, sequences, signature
+        envelopes) and never the evidence payload, so there is no disclosure to record. The run's
+        outcome is not lost — it goes to the metrics and the CRITICAL log line that constitute the
+        alarm. Anything reached by a *user* still goes through :meth:`verify_custody_chain`, which
+        audits normally.
+
+        All three layers run over **every** entry for this item, not a window: a custody chain is
+        bounded by the number of times one piece of evidence was touched, so there is no scale
+        argument for partial coverage, and a report that silently skipped entries would be
+        worthless in exactly the setting it exists for.
+
+        ``chain_entry_hashes`` is left to default (to the hashes of the entries just read), which is
+        correct precisely because this *is* the complete chain — unlike the audit ledger, where the
+        entry window and the anchor scope necessarily differ.
+
+        Read-only: verification alters nothing.
+        """
+        events = await self._uow.custody.list_for_evidence(evidence_id)
+        entries = [
+            LedgerEntryView(
+                sequence=event.sequence_number,
+                entry_hash=event.entry_hash,
+                prev_hash=event.prev_event_hash,
+                hash_algo=event.hash_algo,
+                preimage_version=event.preimage_version,
+                # Rebuilt with the same function the writer used, and only when the row claims
+                # a preimage version: a NULL marks a pre-Wave-1.2 row hashed over an incomplete
+                # field set; a complete preimage for it would report honest history as forged.
+                preimage_fields=(
+                    custody_preimage_fields(
+                        prev_hash=event.prev_event_hash,
+                        custody_event_id=event.custody_event_id,
+                        evidence_id=event.evidence_id,
+                        sequence_number=event.sequence_number,
+                        event_type=event.event_type,
+                        occurred_at=event.occurred_at,
+                        actor_user_id=event.actor_user_id,
+                        actor_role=event.actor_role,
+                        authority_ref=event.authority_ref,
+                        notes=event.notes,
+                        integrity_hash_at_event=event.integrity_hash_at_event,
+                    )
+                    if event.preimage_version is not None
+                    else None
+                ),
+                signature_envelope=event.signature,
+            )
+            for event in events
+        ]
+        return await LedgerVerifier(self._signer).verify_chain(
+            ledger=LEDGER_CUSTODY,
+            entries=entries,
+            # Custody anchors live in `platform.ledger_anchors` like the audit ledger's — one table
+            # discriminated by `ledger`, so there is one anchor-verification path rather than two.
+            anchors=await read_anchor_views(self._uow.session, LEDGER_CUSTODY),
+            # Every custody chain genuinely starts at the all-zero sentinel (CEM §4), so a first
+            # entry that does not is a missing head rather than a window boundary.
+            expect_genesis=True,
+        )
 
     async def record_custody_event(
         self, evidence_id: UUID, data: CustodyEventCreate, actor: CurrentUser, correlation_id: str

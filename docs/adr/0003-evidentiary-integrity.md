@@ -46,7 +46,10 @@ acceptance:
 | §1 Authenticated entries (**signatures**) | 1.2 | **Built** — `LedgerSigner` signs every audit and custody write under `KeyPurpose.EVIDENCE_ROOT` (Ed25519 by policy); `signature`/`sig_alg`/`key_id` carry real values. Fails closed: a write that cannot be signed aborts its transaction |
 | §3 External anchoring — **Merkle + WORM** | 1.3 | **Built** — `platform/crypto/{merkle,anchoring}.py`, `platform.ledger_anchors`, COMPLIANCE-mode Object Lock. Truncation and rollback are detected; proven against a live database in `test_ledger_anchoring_db.py` |
 | §3 External anchoring — **RFC-3161 timestamp** | 1.3 | **NOT built** — `tsa_token_ref` is reserved and null. WORM makes an anchor undeletable (which defeats truncation); a TSA makes it undatable-forward (which defeats backdating). Needs an ASN.1/CMS dependency and its own ADR |
-| §6 Verification Engine | 1.4 | **Not built** — `LedgerSigner.verify` exists and is the primitive it will call, but no endpoint or scheduled job invokes it |
+| §6 Verification Engine — **online report** | 1.4 | **Built** — `platform/crypto/verification.py` (pure, three-layer, three-state) behind `GET /api/v1/evidence/{id}/verify`; api-design.md §5.1. Proven against real tampering on a live database in `test_verification_db.py` |
+| §6 Verification Engine — **scheduled re-verification** | 1.4 | **Built** — `modules/ingestion/integrity_jobs.py`, an hourly arq cron job over the audit ledger and the most recently active custody chains. Alarms via Prometheus metrics + a `CRITICAL` log line; **not** via the notification module (see the amendment below) |
+
+**Every part of this ADR is now built except §3's RFC-3161 timestamp.** As of Wave 1.4 the guarantees are not merely constructed but *checked*: an endpoint reports on any chain on demand, and a scheduled job re-verifies both ledgers and alarms on a break. What remains open is backdating (§3's TSA half), which WORM does not address.
 
 **Context §1's "unkeyed" half and Context §2 are now closed; "unanchored" is not.** A complete
 preimage binds every field of an entry to its hash, catching an attacker who edits one row and
@@ -167,6 +170,34 @@ the moment crypto agility does its job — a SHA-256 digest is 64 hex characters
 is 96, so `prev || entry` stops being uniquely parseable once two algorithms coexist. It is built as
 an RFC 8785 canonical object over the same fields, plus a ledger discriminator so a signature made
 for one chain cannot be presented as valid for the other.
+
+## Amendment (2026-09-25) — §6's "alarms on any break" is a metric, not a notification
+
+§6(b) requires the scheduled job to "alarm on any break" without saying through what. Implemented as
+a Prometheus metric an Alertmanager rule fires on, plus a `CRITICAL` structured log line —
+`deployment-architecture.md`'s committed Prometheus/Grafana/Loki stack, and the two signals an
+on-call operator actually receives.
+
+**Deliberately not the `notification` module,** and the reason is worth recording so it is not
+"fixed" later by someone who assumes it was an omission. Every dispatch path in that module requires
+an explicit `recipient_user_id` carried on the triggering event, and `notification/events.py` states
+outright that a handler "cannot invent someone to notify." A ledger integrity failure has no user in
+its domain — it is addressed to security operations. There is no by-role user lookup anywhere in the
+codebase and `NotificationRule` resolution is unbuilt, so a notification handler for this would
+resolve zero recipients on every firing: code that looks like alerting while reaching nobody, which
+is strictly worse than no alerting at all.
+
+When recipient resolution exists (a by-role lookup, or ADR-0010's `case_members`), the job is where
+it gets wired in, and that will need an `integrity.verification_failed` event added to
+`event-driven-architecture.md` §25's catalog. No such event type is published today.
+
+**One scope limit to record.** The audit ledger's *entry-level* checks run over a bounded window of
+the most recent entries (default 5,000), because that ledger is global and grows without limit; its
+*anchor* checks run over the whole chain, because an anchor exists precisely to catch a deleted tail
+and a deleted tail is by definition not inside a window of surviving rows. Custody chains are
+verified in full — they are bounded by how many times one item was touched. The scheduled sweep
+covers the most recently active custody chains (default 250) rather than every chain ever written;
+any chain can be verified in full on demand through the API.
 
 ## Consequences
 

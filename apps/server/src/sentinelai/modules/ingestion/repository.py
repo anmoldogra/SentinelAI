@@ -12,7 +12,7 @@ from datetime import datetime
 from uuid import UUID
 
 from fastapi import Depends
-from sqlalchemy import or_, select, tuple_
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -128,6 +128,28 @@ class CustodyEventRepository:
         correctness guarantee — that is the unique index from ``202609080004_ingestion_chain``.
         """
         await lock_chain(self._session, CUSTODY_CHAIN, str(evidence_id))
+
+    async def recently_active_evidence_ids(self, *, limit: int) -> Sequence[UUID]:
+        """Evidence items whose custody chain changed most recently, newest activity first.
+
+        The scheduled re-verification job's work list (ADR-0003 §6(b)). Bounded on purpose: every
+        custody chain ever written is not a viable per-run scope, and a job that tried would stop
+        completing at all — which is the failure mode where nothing is verified while the schedule
+        still looks healthy.
+
+        Ordering by most recent activity is the useful heuristic rather than a guarantee of
+        coverage: tampering is most likely to be noticed soon after it happens, and a chain that has
+        not changed is already covered by its anchor. Chains outside the window are still verified
+        on demand through the API, and the anchor layer covers the whole ledger regardless of which
+        chains this returns.
+        """
+        result = await self._session.execute(
+            select(EvidenceCustodyEvent.evidence_id)
+            .group_by(EvidenceCustodyEvent.evidence_id)
+            .order_by(func.max(EvidenceCustodyEvent.occurred_at).desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
 
     async def last_entry(self, evidence_id: UUID) -> EvidenceCustodyEvent | None:
         result = await self._session.execute(

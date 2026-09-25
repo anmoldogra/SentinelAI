@@ -20,7 +20,9 @@ from fastapi import APIRouter, Depends, Header, Query, Request, status
 from sentinelai.modules.ingestion.exceptions import IntegrityVerificationFailedError
 from sentinelai.modules.ingestion.repository import IngestionUnitOfWork, get_ingestion_uow
 from sentinelai.modules.ingestion.schemas import (
+    AnchorFindingRead,
     AttributeSchemaRead,
+    ChainVerificationRead,
     ConnectorCreate,
     ConnectorRead,
     ConnectorUpdate,
@@ -30,6 +32,7 @@ from sentinelai.modules.ingestion.schemas import (
     EvidenceRead,
     EvidenceSupersedeCreate,
     UploadReservationRead,
+    VerificationFindingRead,
 )
 from sentinelai.modules.ingestion.service import EvidenceService, get_evidence_service
 from sentinelai.platform.auth.dependencies import CurrentUser, require_role
@@ -181,6 +184,68 @@ async def record_custody_event(
     )
     await uow.commit()
     return Envelope(data=CustodyEventRead.model_validate(event), meta=_meta(request))
+
+
+@router.get("/evidence/{evidence_id}/verify", response_model=Envelope[ChainVerificationRead])
+async def verify_chain_of_custody(
+    evidence_id: UUID,
+    request: Request,
+    current_user: CurrentUser = Depends(require_role("investigator", "compliance")),
+    service: EvidenceService = Depends(get_evidence_service),
+) -> Envelope[ChainVerificationRead]:
+    """Court-facing chain-of-custody verification report — ADR-0003 §6(a).
+
+    Distinct from ``POST /evidence/{id}/verify-integrity``, and both exist on purpose: that
+    one re-reads the stored payload and recomputes its content hash (ADR-0008 §3, one object),
+    while this one verifies the *custody ledger* — link continuity, entry-hash recomputation,
+    Ed25519
+    signatures, and Merkle-anchor inclusion across every entry. Payload integrity and ledger
+    integrity are different guarantees, and a caller usually wants to know about both separately.
+
+    ``GET`` and no commit: verification reads and computes, and alters nothing. The access check and
+    its audit record come from the service's evidence read, so an unauthorized caller never reaches
+    the ledger.
+
+    A ``failed`` verdict is still ``200``, not ``4xx``/``5xx``. The request succeeded — the
+    report is the answer, and the answer is bad news. Returning an error status would leave a
+    client unable to distinguish "this chain is broken" from "verification could not run", which
+    are opposite
+    conclusions for anyone deciding whether a case is still prosecutable.
+    """
+    report = await service.verify_custody_chain(evidence_id, current_user)
+    return Envelope(
+        data=ChainVerificationRead(
+            ledger=report.ledger,
+            state=str(report.state),
+            entry_count=report.entry_count,
+            verified_entries=report.verified_entries,
+            partial_entries=report.partial_entries,
+            failed_entries=report.failed_entries,
+            unanchored_entries=report.unanchored_entries,
+            findings=[str(f) for f in report.findings],
+            entries=[
+                VerificationFindingRead(
+                    sequence=e.sequence,
+                    entry_hash=e.entry_hash,
+                    state=str(e.state),
+                    findings=[str(f) for f in e.findings],
+                )
+                for e in report.entries
+            ],
+            anchors=[
+                AnchorFindingRead(
+                    anchor_id=a.anchor_id,
+                    state=str(a.state),
+                    expected_entry_count=a.expected_entry_count,
+                    covered_entries=a.covered_entries,
+                    worm_object_ref=a.worm_object_ref,
+                    findings=[str(f) for f in a.findings],
+                )
+                for a in report.anchors
+            ],
+        ),
+        meta=_meta(request),
+    )
 
 
 @router.post("/evidence/{evidence_id}/verify-integrity", response_model=Envelope[EvidenceRead])

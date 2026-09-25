@@ -65,6 +65,55 @@ async def _get_last_entry_hash(session: AsyncSession) -> str:
     return result.scalar_one_or_none() or _GENESIS_HASH
 
 
+def audit_preimage_fields(
+    *,
+    prev_hash: str,
+    audit_id: UUID,
+    occurred_at: datetime,
+    actor_user_id: UUID | None,
+    actor_role: str,
+    action: str,
+    module: str,
+    target_type: str | None,
+    target_id: UUID | None,
+    ip_address: str | None,
+    user_agent: str | None,
+    details: dict[str, Any] | None,
+) -> dict[str, object]:
+    """The exact field set hashed into an ``platform.audit_log`` entry — ADR-0003 §2.
+
+    Every column of ``platform.audit_log`` is covered except the four that cannot be: ``entry_hash``
+    (the hash's own output), and ``signature``/``key_id``/``sig_alg``/``anchor_ref``, which are
+    written after the hash exists — the signature covers the hash, and the anchor covers a Merkle
+    root built from many hashes. ``tests/unit/test_ledger_preimage.py`` enforces that list against
+    the live table definition, so a column added later cannot quietly escape the preimage.
+
+    **Public because verification needs it (Wave 1.4).** The Verification Engine has to rebuild this
+    mapping from a persisted row to recompute its hash, and it must be *the same* mapping the writer
+    used — two copies would drift, and the drift would surface as a chain that stops verifying for
+    no discoverable reason. One function, two callers: :func:`record_audit_event` on the way in and
+    :mod:`sentinelai.platform.auth.ledger_verification` on the way out.
+
+    Keyword-only: this takes eleven values of which four are ``str | None``, and a positional call
+    that transposed ``target_type`` and ``ip_address`` would still typecheck and still hash — just
+    to a different, wrong digest.
+    """
+    return {
+        "prev": prev_hash,
+        "audit_id": str(audit_id),
+        "occurred_at": ledger_timestamp(occurred_at),
+        "actor_user_id": ledger_uuid(actor_user_id),
+        "actor_role": actor_role,
+        "action": action,
+        "module": module,
+        "target_type": target_type,
+        "target_id": ledger_uuid(target_id),
+        "ip_address": ip_address,
+        "user_agent": user_agent,
+        "details": details,
+    }
+
+
 def _compute_hash(
     *,
     prev_hash: str,
@@ -80,33 +129,22 @@ def _compute_hash(
     user_agent: str | None,
     details: dict[str, Any] | None,
 ) -> str:
-    """Chain this entry onto the previous one over its complete persisted field set.
-
-    Every column of ``platform.audit_log`` is covered except the four that cannot be: ``entry_hash``
-    (this function's own output), and ``signature``/``key_id``/``sig_alg``/``anchor_ref``, which are
-    written after the hash exists — the signature covers the hash, and the anchor covers a Merkle
-    root built from many hashes. ``tests/unit/test_ledger_preimage.py`` enforces that list against
-    the live table definition, so a column added later cannot quietly escape the preimage.
-
-    Keyword-only: this takes eleven values of which four are ``str | None``, and a positional call
-    that transposed ``target_type`` and ``ip_address`` would still typecheck and still hash — just
-    to a different, wrong digest.
-    """
+    """Chain this entry onto the previous one over its complete persisted field set."""
     return compute_entry_hash(
-        {
-            "prev": prev_hash,
-            "audit_id": str(audit_id),
-            "occurred_at": ledger_timestamp(occurred_at),
-            "actor_user_id": ledger_uuid(actor_user_id),
-            "actor_role": actor_role,
-            "action": action,
-            "module": module,
-            "target_type": target_type,
-            "target_id": ledger_uuid(target_id),
-            "ip_address": ip_address,
-            "user_agent": user_agent,
-            "details": details,
-        }
+        audit_preimage_fields(
+            prev_hash=prev_hash,
+            audit_id=audit_id,
+            occurred_at=occurred_at,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+            action=action,
+            module=module,
+            target_type=target_type,
+            target_id=target_id,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            details=details,
+        )
     )
 
 

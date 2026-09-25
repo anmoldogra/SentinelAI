@@ -261,13 +261,14 @@ Full detail: `POST /api/v1/auth/login` and `GET /api/v1/admin/audit-log` in Sect
 | GET | `/api/v1/evidence/{evidence_id}/custody-events` | Full custody ledger for this item | investigator, compliance | N/A |
 | POST | `/api/v1/evidence/{evidence_id}/custody-events` | Record a manual custody event (`transferred`, `legal_hold_applied`, `legal_hold_released`, `disposed`) | supervisor, admin | Yes (key) |
 | POST | `/api/v1/evidence/{evidence_id}/verify-integrity` | Recompute and check hash against stored value | investigator | Yes |
+| GET | `/api/v1/evidence/{evidence_id}/verify` | Court-facing chain-of-custody verification report (ADR-0003 §6) | investigator, compliance | N/A |
 | POST | `/api/v1/evidence/{evidence_id}/supersede` | Create a corrected version, linked via `supersedes_evidence_id` | investigator | Yes (key) |
 | GET | `/api/v1/connectors` | List registered connectors | admin | N/A |
 | POST | `/api/v1/connectors` | Register a connector | admin | Yes (key) |
 | PATCH | `/api/v1/connectors/{connector_id}` | Update/deactivate a connector | admin | No (ETag) |
 | GET | `/api/v1/attribute-schemas` | List registered `(schema_version, category, artifact_type)` entries | any authenticated | N/A |
 
-Full detail for `POST /api/v1/evidence`, `GET /api/v1/evidence`, `GET /api/v1/evidence/{evidence_id}`, `GET /api/v1/evidence/{evidence_id}/custody-events`, `POST /api/v1/evidence/{evidence_id}/supersede` is in Section 5, which documents how these implement the Canonical Evidence Model directly.
+Full detail for `POST /api/v1/evidence`, `GET /api/v1/evidence`, `GET /api/v1/evidence/{evidence_id}`, `GET /api/v1/evidence/{evidence_id}/custody-events`, `POST /api/v1/evidence/{evidence_id}/supersede` is in Section 5, which documents how these implement the Canonical Evidence Model directly. `GET /api/v1/evidence/{evidence_id}/verify` is documented in Section 5.1.
 
 ### 4.3 `osint`
 
@@ -651,6 +652,89 @@ Idempotency-Key: a1b2...
 | Filtering / Sorting | N/A |
 | Events Published | `evidence.ingested` (for the new object) and `evidence.superseded` |
 | Audit Requirements | Custody event on **both** objects: `superseded` on the original, genesis `ingested` on the new one, cross-referencing each other's `evidence_id` in `notes` |
+
+### 5.1 Chain-of-Custody Verification (ADR-0003 §6)
+
+**`GET /api/v1/evidence/{evidence_id}/verify`**
+
+The court-facing verification report for one evidence item's full chain of custody. Added in modernization Wave 1.4; ADR-0003 §6(a) is the authority for its existence and its contents.
+
+**This is not `POST /evidence/{evidence_id}/verify-integrity`, and both endpoints exist deliberately.** They verify different things at different layers, and a caller usually wants both answers separately:
+
+| | `POST .../verify-integrity` | `GET .../verify` |
+|---|---|---|
+| Verifies | the stored **payload** — re-reads the object and recomputes its content hash | the custody **ledger** — links, entry hashes, signatures, anchors |
+| Authority | ADR-0008 §3 | ADR-0003 §6 |
+| Side effects | appends a custody event (`verified` or a MISMATCH record) and an audit row | none — read-only |
+| Method | `POST` (it mutates the ledger) | `GET` (it does not) |
+
+An intact payload on a forged ledger, and an intact ledger over a corrupted payload, are both possible and both matter.
+
+| Aspect | Specification |
+|---|---|
+| Authentication | Required |
+| Authorization | `investigator` (case-scoped) or `compliance` |
+| Idempotency | N/A (`GET`, no side effects) |
+| Pagination | N/A — a custody chain is bounded by the number of times one item was touched, and a partial report would be useless in the setting this endpoint exists for |
+| Filtering / Sorting | N/A |
+| Events Published | none |
+| Audit Requirements | The underlying evidence read is audited as an access exactly as `GET /evidence/{evidence_id}` is. The verification itself writes no additional audit entry — it alters nothing, and every audit write is itself an append to the other evidentiary ledger |
+
+**Response Body.** `{ data: ChainVerificationReport }` in the standard §2.4 envelope, with `200` for every completed verification — including a failing one.
+
+**A `failed` verdict is `200`, not `4xx`/`5xx`.** The request succeeded; the report is the answer and the answer is bad news. An error status would leave a client unable to distinguish *"this chain is broken"* from *"verification could not run"*, which are opposite conclusions for anyone deciding whether a case is still prosecutable. A `5xx` here means only that the verification could not be performed (KMS unreachable, for example) — never that tampering was found.
+
+```json
+{
+  "data": {
+    "ledger": "ingestion.evidence_custody_events",
+    "state": "partial",
+    "entry_count": 7,
+    "verified_entries": 6,
+    "partial_entries": 1,
+    "failed_entries": 0,
+    "unanchored_entries": 2,
+    "findings": ["unsigned_legacy_row"],
+    "entries": [
+      { "sequence": 1, "entry_hash": "9f3a...c21", "state": "partial", "findings": ["unsigned_legacy_row", "preimage_unavailable"] },
+      { "sequence": 2, "entry_hash": "4b71...08e", "state": "verified", "findings": [] }
+    ],
+    "anchors": [
+      {
+        "anchor_id": "3f2b...",
+        "state": "verified",
+        "expected_entry_count": 5,
+        "covered_entries": 5,
+        "worm_object_ref": "anchors/ingestion.evidence_custody_events/2026/09/08/3f2b....json",
+        "findings": []
+      }
+    ]
+  },
+  "meta": { "request_id": "...", "correlation_id": "..." }
+}
+```
+
+**`state` has three values, and a client MUST render all three distinctly.**
+
+| `state` | Meaning | How a client must present it |
+|---|---|---|
+| `verified` | Every entry was positively proven: it links, its hash recomputes from its own persisted fields, its signature verifies, and every anchor covering it reconciles | Proven |
+| `partial` | Nothing is wrong, but something is **not independently verifiable** — entries written before Wave 1.2 carry a null `preimage_version` and null `signature` and cannot be signed retroactively, because the bytes that should have been signed are gone | *Not independently verifiable*, never "tampered" |
+| `failed` | Something is positively wrong: an edited field, a broken link, an invalid signature, or an anchored range that no longer reconciles | Tampering detected |
+
+Collapsing `partial` into `verified` whitewashes an unsigned row; collapsing it into `failed` is a false accusation of tampering against honest history. This is the same three-way distinction `GET /evidence/{id}/custody-events` already requires callers to make on `preimage_version` (Section 5), stated here as an explicit verdict so a client does not have to derive it.
+
+**`findings` vocabulary.** Machine-readable and additive — a client must tolerate values it does not recognize, treating an unknown finding as significant rather than ignoring it. Present values:
+
+*Failures:* `link_broken`, `sequence_gap`, `sequence_duplicate`, `hash_mismatch`, `signature_invalid`, `genesis_missing`, `anchor_signature_invalid`, `anchor_root_mismatch`, `anchor_range_missing`, `anchor_entry_count_mismatch`.
+
+*Partials:* `unsigned_legacy_row`, `preimage_unavailable`, `unknown_preimage_version`, `unsupported_hash_algo`.
+
+The top-level `findings` is the distinct set across the whole chain; `entries[].findings` localizes each one to a sequence number, because a report is only actionable if a reviewer can say *which* entry is wrong and *how*.
+
+**`unanchored_entries` is not a failure.** Anchoring is batched, so the newest entries are legitimately uncommitted until the next batch is cut. A value that keeps climbing across reports means anchor batch cutting has stopped, which is an operational signal rather than an integrity one.
+
+**`worm_object_ref`** is returned so a reviewer can fetch the anchor document directly from WORM storage and verify the Merkle root **without this API and without the database** — which is the entire point of external anchoring, since the database is the thing being checked.
 
 ## 6. Investigation APIs: Entities, Relationships, Graph, AI Findings, Review
 

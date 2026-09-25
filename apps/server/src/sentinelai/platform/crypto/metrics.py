@@ -39,3 +39,43 @@ KMS_LEASE_RENEWALS = Counter(
     "Auth-token/lease renewals by result.",
     ["provider", "result"],
 )
+
+# ---------------------------------------------------------------------------------------
+# Ledger verification — ADR-0003 §6 (Wave 1.4)
+#
+# These are the alarm. ADR-0003 §6(b) requires the scheduled re-verification job to "alarm on any
+# break", and in this platform an alarm is a metric an Alertmanager rule fires on plus a CRITICAL
+# log line (`deployment-architecture.md` commits to the Prometheus/Grafana/Loki stack). It is
+# deliberately NOT a notification-module message: a ledger integrity failure is addressed to
+# security operations, and every notification dispatch path in this codebase requires an explicit
+# recipient_user_id that no part of the domain can supply for it. A notification that resolved zero
+# recipients would look like alerting while reaching nobody, which is worse than no alert at all.
+#
+# LEDGER_VERIFICATION_STATE is a Gauge rather than a Counter on purpose: alerting wants "is this
+# ledger broken right now", and a counter of historical failures cannot answer that after a restore.
+# ---------------------------------------------------------------------------------------
+LEDGER_VERIFICATIONS = Counter(
+    "sentinelai_ledger_verifications_total",
+    "Ledger verification runs by ledger and resulting state (verified/partial/failed).",
+    ["ledger", "state"],
+)
+LEDGER_VERIFICATION_STATE = Gauge(
+    "sentinelai_ledger_verification_state",
+    "Last verification verdict per ledger: 0=verified, 1=partial, 2=failed.",
+    ["ledger"],
+)
+LEDGER_VERIFICATION_FINDINGS = Counter(
+    "sentinelai_ledger_verification_findings_total",
+    "Individual verification findings by ledger and finding type.",
+    ["ledger", "finding"],
+)
+LEDGER_VERIFICATION_DURATION = Histogram(
+    "sentinelai_ledger_verification_seconds",
+    "Wall-clock duration of one ledger verification run.",
+    ["ledger"],
+)
+LEDGER_UNANCHORED_ENTRIES = Gauge(
+    "sentinelai_ledger_unanchored_entries",
+    "Entries not covered by any anchor — a steadily rising value means batch cutting has stopped.",
+    ["ledger"],
+)

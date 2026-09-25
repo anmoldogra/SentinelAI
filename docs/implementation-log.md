@@ -1523,3 +1523,139 @@ writer by checking event ordering. And the anchor bucket's Object Lock configura
 never *verified* on an existing bucket — a pre-existing non-WORM bucket with the right name would
 be silently accepted. That check belongs in the startup readiness probe, where a misconfigured
 bucket should stop the deployment; it is noted in `deployment-architecture.md` and not yet built.
+
+---
+
+## 2026-09-25 — IC-030: the Verification Engine (Wave 1.4, ADR-0003 §6)
+
+**Type:** Evidentiary-core capability. Waves 1.1-1.3 made tampering *detectable*; this makes it
+*detected*. One new endpoint, one scheduled job, no schema change, no migration.
+
+### The gap this closes, stated exactly
+
+Every guarantee the previous three waves built was **constructive**. Entries were correctly hashed,
+correctly signed, and correctly anchored — and nothing ever read them back. A forged or truncated
+ledger sitting in the database was indistinguishable from an intact one to anyone who never checked,
+which meant the honest description of the platform was "we could prove this in court if someone
+asked", not "we would know". `LedgerSigner.verify` existed as a primitive with no caller.
+
+### Three layers, and why none of them is redundant
+
+`platform/crypto/verification.py` runs all three per entry and merges the findings:
+
+1. **Link continuity** — each entry names its predecessor's `entry_hash`, and sequence advances by
+   exactly one. Catches a removed or reordered *interior* entry. No keys, no network.
+2. **Entry authenticity** — recompute `entry_hash` from the row's own persisted fields (catches an
+   edited column), then verify the signature envelope (catches an attacker who recomputed the whole
+   chain). The second is not optional: nothing about a hash requires a secret, so an attacker with
+   write access defeats layer 1 and the hash half of layer 2 together.
+   `test_a_recomputed_chain_is_still_caught_by_the_signatures` performs exactly that attack against
+   a live database — rewriting every hash and link downstream of a forged row — and asserts the
+   chain comes out structurally flawless before showing the signatures catching it.
+3. **Anchor inclusion** — recompute each published Merkle root over what the ledger holds now.
+   Catches a deleted **tail**, which layers 1 and 2 structurally cannot: delete the last N entries
+   and every survivor still links, still hashes, still verifies. Asserted in two halves for the same
+   reason as IC-029: first that the truncated chain verifies perfectly without anchors, then that the
+   anchor catches it anyway.
+
+### Three states, because two would be dishonest
+
+`verified` / `partial` / `failed`. The middle state carries rows written before Wave 1.2, which hold
+`preimage_version = NULL` and `signature = NULL` and can never be signed retroactively — the bytes
+that should have been signed are gone. Collapsing `partial` into `failed` would raise a tampering
+alarm over honest history on every run, which is how a real alarm gets muted; collapsing it into
+`verified` would whitewash an unsigned row. `partial` deliberately does **not** trip the job's alarm.
+
+Three more findings land in `partial` for the same reason: an unknown `preimage_version` (written by
+a future writer — guessing its field set would report a valid entry as forged), a `hash_algo` this
+build cannot compute (crypto agility means history stays verifiable under the algorithm it was
+*written* with), and a row whose preimage is unavailable at all.
+
+### The engine is pure, and that was forced as much as chosen
+
+It touches no database and knows nothing about evidence or cases. The import DAG requires it:
+`platform` may not import a module, so the custody ledger's field set has to arrive *from*
+`modules.ingestion`. `custody_preimage_fields` and `audit_preimage_fields` were extracted from the
+writers and made public for that — one function per ledger serving both directions, because two
+copies of a preimage would drift, and the drift would surface years later as a chain that stops
+verifying for no discoverable reason.
+
+It also made the tests possible: every verdict is provoked in `tests/unit/test_verification.py`
+without a database, and then re-proven against real tampered rows in
+`tests/integration/test_verification_db.py`.
+
+### Two scope decisions worth recording
+
+**The audit ledger is verified in two different scopes, and conflating them was a real bug I nearly
+shipped.** Entry-level checks run over a bounded window (default 5,000) because that ledger grows
+without limit. Anchor checks run over the **whole** chain's hash list, because an anchor exists to
+catch a deleted tail and a deleted tail is by definition not inside a window of surviving rows.
+Checking anchors against the window would report every older anchor as a missing range — a permanent
+false alarm — while missing the one thing anchors are for. `verify_chain` therefore takes
+`chain_entry_hashes` separately from `entries`, and two unit tests pin both directions (the correct
+behaviour, and the false alarm the separation prevents).
+
+**The scheduled job writes no audit entry per chain it checks.** Every audit write is itself an
+append to the other evidentiary ledger: it takes the chain lock, costs a KMS signature, and adds a
+row. A sweep over 250 custody chains would write 250 audit rows per run, forever — audit-log
+amplification driven by a process that discloses nothing to anybody, and which would in time
+dominate the ledger it is meant to be watching. Safe to omit because it reads ledger metadata, never
+payloads. Anything a *user* reaches still goes through the audited path.
+
+### What "alarm" means, and what it deliberately is not
+
+Prometheus metrics (`sentinelai_ledger_verification_state` as a gauge, so an alert rule can ask "is
+this ledger broken *now*" rather than counting history) plus a `CRITICAL` structured log line.
+
+**Not the notification module**, and this was checked before being decided rather than assumed.
+Every dispatch path there requires an explicit `recipient_user_id` from the event payload, and
+`notification/events.py` says outright that a handler "cannot invent someone to notify." A ledger
+integrity failure has no user in its domain. There is no by-role user lookup anywhere in the
+codebase and `NotificationRule` resolution is still `NotImplementedError`, so a handler for this
+would resolve zero recipients on every firing — code that looks like alerting while reaching nobody.
+Recorded as an ADR-0003 amendment so it is not "fixed" later by someone who assumes it was an
+omission. No `integrity.verification_failed` event type was added; §25's catalog is unchanged.
+
+The job completes normally after finding tampering. Raising would make arq retry a run whose verdict
+will not change and eventually dead-letter it, turning a standing alarm into silence.
+
+### A bug the tests found
+
+The engine caught `LedgerPreimageError` around the hash recompute but not `CanonicalizationError`,
+which is what `canonicalize` actually raises for an unrepresentable value. A single corrupt field
+would have propagated and denied a verdict on the *entire* chain — a denial-of-proof an attacker
+could trigger deliberately. Found by writing the test for it, not by reading the code.
+
+### Endpoint
+
+`GET /api/v1/evidence/{evidence_id}/verify`, documented as `api-design.md` §5.1. Distinct from the
+already-shipped `POST .../verify-integrity`, and both exist deliberately: that one re-reads the
+stored payload and recomputes its content hash (ADR-0008 §3, one object, mutates the ledger); this
+one verifies the custody ledger (ADR-0003 §6, read-only). An intact payload on a forged ledger and
+an intact ledger over a corrupted payload are both possible and both matter. A `failed` verdict
+returns `200` — the request succeeded and the report is the answer; an error status would leave a
+client unable to tell "this chain is broken" from "verification could not run".
+
+### Tests and gates
+
+**Tests: 47 new** (32 unit, 15 integration), all against real Ed25519. The integration suite
+performs real attacks on a live Postgres after dropping the ADR-0004 trigger: rewriting
+`actor_role`, rewriting the JSONB `details`, transplanting another entry's signature, recomputing
+the entire chain, deleting the tail, deleting an interior row, and forging an anchor row. It also
+carries the **false-positive control** — rewriting `details` with identical content in a different
+key order must still verify, which is the test that justifies JCS over `json.dumps` and would fail
+loudly if canonical encoding ever regressed.
+
+**Gates.** ruff (lint + format), `mypy --strict` (195 files), import-linter (2/2 kept), full suite
+**926 passed / 1 skipped** (up from 880/2; the one skip is the opt-in KMS benchmark). Platform
+coverage **91.94%** against the 90% floor, `verification.py` at **98%**.
+
+**Known gaps.** `ledger_verification.py` reads 50% in the *unit* run because its queries need
+Postgres; they are covered in `test_verification_db.py` — the same pattern as `chain_lock.py` in
+IC-029. The audit ledger's chain order still comes from `occurred_at`, a clock-based heuristic; it
+cannot mask tampering (a reordered pair changes the root either way) but a clock inversion could
+surface as an anchor mismatch on an intact ledger, and closing it needs a monotonic sequence column
+on `audit_log` — a schema change, so its own increment. And nothing still *cuts* anchor batches
+(IC-029's gap, unchanged): the verification engine checks whatever anchors exist, and in a
+deployment where no batch job runs, that is none.
+

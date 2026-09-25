@@ -151,6 +151,24 @@ def _no_audit(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_anchor_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anchor reads need a real session; return none for DB-less tests.
+
+    Same reasoning as ``_no_audit``: the fake UoW's ``session`` cannot execute SQL, and
+    ``read_anchor_views`` queries ``platform.ledger_anchors``. Returning an empty list means a
+    DB-less verification exercises the chain and signature layers only — the anchor layer is proven
+    where it has to be, against a real database, in ``tests/integration/test_verification_db.py``.
+    """
+
+    async def _none(*args: Any, **kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(
+        "sentinelai.modules.ingestion.service.read_anchor_views", _none, raising=False
+    )
+
+
 # --- ingestion fakes --------------------------------------------------------
 class _FakeEvidenceRepo:
     def __init__(self) -> None:

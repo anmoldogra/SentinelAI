@@ -13,10 +13,12 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from sentinelai.modules.case_management.jobs import generate_case_report
 from sentinelai.modules.forensics.jobs import process_artifact
+from sentinelai.modules.ingestion.integrity_jobs import reverify_evidentiary_ledgers
 from sentinelai.modules.ingestion.jobs import scan_uploaded_evidence
 from sentinelai.modules.investigation.jobs import run_correlation
 from sentinelai.modules.threat_intel.jobs import sync_feed_subscription
@@ -60,6 +62,18 @@ class WorkerSettings:
         sync_feed_subscription,
         process_artifact,
         run_correlation,
+    ]
+
+    # ADR-0003 §6(b): scheduled re-verification of both evidentiary ledgers. Hourly on the half
+    # hour, off the top of the hour where most other scheduled work clusters.
+    #
+    # `run_at_startup=False` deliberately: a deploy rollout restarts workers, and verifying both
+    # ledgers on every pod start would turn a routine rollout into a stampede of full-ledger reads.
+    # `max_tries=1` because a verification verdict does not change on retry — if the run itself
+    # failed (KMS down, database unreachable) the next scheduled firing is the right retry, and
+    # retrying a *completed* run that found tampering would re-alarm on the same finding.
+    cron_jobs: ClassVar[list[Any]] = [
+        cron(reverify_evidentiary_ledgers, minute=30, run_at_startup=False, max_tries=1),
     ]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     on_startup = on_startup
