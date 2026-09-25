@@ -228,7 +228,13 @@ class AuditLog(Base):
     """System-wide, hash-chained, insert-only audit trail (database-design.md §10)."""
 
     __tablename__ = "audit_log"
-    __table_args__ = ({"schema": _SCHEMA},)
+    # Mirrors `202609080003_platform_chain`. One successor per entry hash — the structural
+    # difference between a chain and a tree, and what makes a concurrent fork impossible rather
+    # than merely unlikely. Declared here so `create_all` in tests reproduces the real constraint.
+    __table_args__ = (
+        Index("uq_audit_log_prev_entry_hash", "prev_entry_hash", unique=True),
+        {"schema": _SCHEMA},
+    )
 
     audit_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     occurred_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)

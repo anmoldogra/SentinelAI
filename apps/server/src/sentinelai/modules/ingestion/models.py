@@ -18,6 +18,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     Numeric,
@@ -76,7 +77,19 @@ class Evidence(Base):
 
 class EvidenceCustodyEvent(Base):
     __tablename__ = "evidence_custody_events"
-    __table_args__ = ({"schema": _SCHEMA},)
+    # Mirrors `202609080004_ingestion_chain`. Scoped to `evidence_id` because every chain starts
+    # from the same all-zero genesis sentinel, so a global unique index on the link would permit
+    # exactly one evidence item to exist. Declared here so `create_all` in tests reproduces them.
+    __table_args__ = (
+        Index(
+            "uq_custody_events_evidence_prev_hash",
+            "evidence_id",
+            "prev_event_hash",
+            unique=True,
+        ),
+        Index("uq_custody_events_evidence_sequence", "evidence_id", "sequence_number", unique=True),
+        {"schema": _SCHEMA},
+    )
 
     custody_event_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), primary_key=True, default=uuid4

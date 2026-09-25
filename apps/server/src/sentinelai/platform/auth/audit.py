@@ -39,12 +39,26 @@ from sentinelai.platform.crypto.ledger import (
     ledger_timestamp,
     ledger_uuid,
 )
+from sentinelai.platform.db.chain_lock import AUDIT_CHAIN, lock_chain
 
 _GENESIS_HASH = "0" * 64
 
 
 async def _get_last_entry_hash(session: AsyncSession) -> str:
-    """Return the most recent chain hash, or the genesis hash for an empty ledger."""
+    """Take the chain lock, then return the current head hash (genesis for an empty ledger).
+
+    The lock is acquired **before** the read and held to the end of the transaction, so the head
+    this returns is still the head when the caller inserts. Without it, two writers read the same
+    head, both sign, and one loses on the unique index — correct, but only after paying for a KMS
+    round-trip it has to throw away. See ``platform.db.chain_lock``: the constraint is what makes
+    a fork impossible, this is what stops writers racing for it.
+
+    Ordering by ``occurred_at`` is a heuristic — clocks are not guaranteed monotonic — but it
+    cannot produce a fork. If it ever named a non-head row, the entry built on it would collide
+    with that row's real successor on ``uq_audit_log_prev_entry_hash`` and the transaction would
+    fail rather than branch.
+    """
+    await lock_chain(session, AUDIT_CHAIN)
     result = await session.execute(
         select(AuditLog.entry_hash).order_by(AuditLog.occurred_at.desc()).limit(1)
     )

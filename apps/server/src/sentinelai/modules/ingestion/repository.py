@@ -23,6 +23,7 @@ from sentinelai.modules.ingestion.models import (
     EvidenceCustodyEvent,
     IntakeRecord,
 )
+from sentinelai.platform.db.chain_lock import CUSTODY_CHAIN, lock_chain
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.db.uow import UnitOfWork
 from sentinelai.platform.events.outbox import OutboxWriter
@@ -117,6 +118,16 @@ class CustodyEventRepository:
             .order_by(EvidenceCustodyEvent.sequence_number.asc())
         )
         return result.scalars().all()
+
+    async def lock_chain(self, evidence_id: UUID) -> None:
+        """Serialize custody appends for one evidence item, for the rest of the transaction.
+
+        Locking lives in the repository because it is a persistence concern, and scoping it to
+        ``evidence_id`` means appends to different evidence items never queue behind each other.
+        ``platform.db.chain_lock`` explains why this is a liveness optimisation rather than the
+        correctness guarantee — that is the unique index from ``202609080004_ingestion_chain``.
+        """
+        await lock_chain(self._session, CUSTODY_CHAIN, str(evidence_id))
 
     async def last_entry(self, evidence_id: UUID) -> EvidenceCustodyEvent | None:
         result = await self._session.execute(

@@ -196,6 +196,14 @@ class _FakeCustodyRepo:
     def __init__(self) -> None:
         self.items: list[Any] = []
 
+    async def lock_chain(self, evidence_id: UUID) -> None:
+        """No-op: an in-memory list has no concurrent writers to serialize.
+
+        Present so the fake matches the real repository's interface. The behaviour this stands in
+        for is proven where it actually exists — against a real Postgres, in
+        `tests/integration/test_chain_concurrency_db.py`.
+        """
+
     async def add(self, event: Any) -> None:
         self.items.append(event)
 

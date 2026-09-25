@@ -250,6 +250,9 @@ class EvidenceService:
         authority_ref: str | None = None,
         notes: str | None = None,
     ) -> EvidenceCustodyEvent:
+        # Before the head read, and held to commit: the head this resolves must still be the head
+        # when the insert lands, and ADR-0003 §1 signing put a KMS round-trip in between.
+        await self._uow.custody.lock_chain(evidence_id)
         last = await self._uow.custody.last_entry(evidence_id)
         prev_hash = last.entry_hash if last is not None else _GENESIS_HASH
         sequence_number = (last.sequence_number + 1) if last is not None else 1
