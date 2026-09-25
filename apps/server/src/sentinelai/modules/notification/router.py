@@ -23,10 +23,19 @@ from sentinelai.modules.notification.schemas import (
 )
 from sentinelai.modules.notification.service import NotificationService, get_notification_service
 from sentinelai.platform.auth.dependencies import CurrentUser, get_current_user, require_role
+from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.shared.envelope import Envelope, ListEnvelope, Meta, Pagination
 from sentinelai.shared.pagination import PageParams, page_params
 
-router = APIRouter(prefix="/api/v1", tags=["notification"])
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["notification"],
+    # ADR-0005 §1: the entrypoint owns the transaction. The route class commits once on
+    # success and rolls back on any exception; `bind_session` publishes the request-scoped
+    # session for it. Declared here rather than per-handler so no handler can omit it.
+    route_class=TransactionalRoute,
+    dependencies=[Depends(bind_session)],
+)
 
 
 def _meta(request: Request) -> Meta:
@@ -57,7 +66,6 @@ async def mark_notification_read(
     uow: NotificationUnitOfWork = Depends(get_notification_uow),
 ) -> Envelope[NotificationRead]:
     notification = await service.mark_read(notification_id, current_user)
-    await uow.commit()  # ADR-0005: the entrypoint owns the transaction
     return Envelope(data=NotificationRead.model_validate(notification), meta=_meta(request))
 
 

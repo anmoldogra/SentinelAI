@@ -36,11 +36,20 @@ from sentinelai.modules.ingestion.schemas import (
 )
 from sentinelai.modules.ingestion.service import EvidenceService, get_evidence_service
 from sentinelai.platform.auth.dependencies import CurrentUser, require_role
+from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.shared.envelope import Envelope, ListEnvelope, Meta, Pagination
 from sentinelai.shared.exceptions import ValidationFailedError
 from sentinelai.shared.pagination import PageParams, page_params
 
-router = APIRouter(prefix="/api/v1", tags=["evidence"])
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["evidence"],
+    # ADR-0005 §1: the entrypoint owns the transaction. The route class commits once on
+    # success and rolls back on any exception; `bind_session` publishes the request-scoped
+    # session for it. Declared here rather than per-handler so no handler can omit it.
+    route_class=TransactionalRoute,
+    dependencies=[Depends(bind_session)],
+)
 
 
 def _meta(request: Request) -> Meta:
@@ -62,7 +71,6 @@ async def reserve_upload(
     reservation = await service.reserve_upload(
         payload["category"], payload["artifact_type"], current_user
     )
-    await uow.commit()  # ADR-0005: the entrypoint owns the transaction
     return Envelope(data=reservation, meta=_meta(request))
 
 
@@ -82,10 +90,11 @@ async def ingest_evidence(
         )
     except ValidationFailedError:
         # The rejection itself is a business fact: the intake record and the
-        # evidence.validation_failed outbox event must survive the 422 (§25.2).
+        # evidence.validation_failed outbox event must survive the 422 (§25.2). Committing here and
+        # re-raising is how a write survives an error response — ADR-0005's boundary rolls back on
+        # the way out, which is a no-op once this commit has landed.
         await uow.commit()
         raise
-    await uow.commit()
     return Envelope(data=EvidenceRead.model_validate(evidence), meta=_meta(request))
 
 
@@ -101,7 +110,6 @@ async def ingest_batch(
     # (never DB errors), so each failed item's intake record rides this commit while the
     # 207 body stays accurate per item (api-design §2.10).
     results = await service.ingest_batch(payload, current_user, request.state.correlation_id)
-    await uow.commit()
     return Envelope(data=results, meta=_meta(request))
 
 
@@ -147,7 +155,6 @@ async def download_evidence(
 ) -> Envelope[dict[str, str]]:
     # A GET with a deliberate write: the `accessed` custody event + audit row (api-design §4.2).
     url = await service.get_download_url(evidence_id, current_user)
-    await uow.commit()
     return Envelope(data={"download_url": url}, meta=_meta(request))
 
 
@@ -182,7 +189,6 @@ async def record_custody_event(
     event = await service.record_custody_event(
         evidence_id, payload, current_user, request.state.correlation_id
     )
-    await uow.commit()
     return Envelope(data=CustodyEventRead.model_validate(event), meta=_meta(request))
 
 
@@ -259,11 +265,11 @@ async def verify_integrity(
     try:
         evidence = await service.verify_integrity(evidence_id, current_user)
     except IntegrityVerificationFailedError:
-        # The MISMATCH custody-ledger entry + audit row must survive the 409 —
-        # a failed verification is auditable, never silent (ADR-0008 §3).
+        # The MISMATCH custody-ledger entry + audit row must survive the 409 — a failed verification
+        # is auditable, never silent (ADR-0008 §3). Same shape as the rejected-ingest case: commit
+        # the fact, re-raise, and ADR-0005's boundary rolls back nothing.
         await uow.commit()
         raise
-    await uow.commit()
     return Envelope(data=EvidenceRead.model_validate(evidence), meta=_meta(request))
 
 
@@ -283,7 +289,6 @@ async def supersede_evidence(
     evidence = await service.supersede_evidence(
         evidence_id, payload, current_user, request.state.correlation_id
     )
-    await uow.commit()
     return Envelope(data=EvidenceRead.model_validate(evidence), meta=_meta(request))
 
 
@@ -314,7 +319,6 @@ async def register_connector(
     connector = await service.register_connector(
         payload, current_user, request.state.correlation_id
     )
-    await uow.commit()
     return Envelope(data=ConnectorRead.model_validate(connector), meta=_meta(request))
 
 
@@ -329,7 +333,6 @@ async def update_connector(
     uow: IngestionUnitOfWork = Depends(get_ingestion_uow),
 ) -> Envelope[ConnectorRead]:
     connector = await service.update_connector(connector_id, payload, current_user, if_match)
-    await uow.commit()
     return Envelope(data=ConnectorRead.model_validate(connector), meta=_meta(request))
 
 

@@ -17,10 +17,19 @@ from sentinelai.modules.threat_intel.schemas import (
 )
 from sentinelai.modules.threat_intel.service import ThreatIntelService, get_threat_intel_service
 from sentinelai.platform.auth.dependencies import CurrentUser, require_role
+from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.shared.envelope import Envelope, ListEnvelope, Meta, Pagination
 from sentinelai.shared.pagination import PageParams, page_params
 
-router = APIRouter(prefix="/api/v1/threat-intel", tags=["threat-intel"])
+router = APIRouter(
+    prefix="/api/v1/threat-intel",
+    tags=["threat-intel"],
+    # ADR-0005 §1: the entrypoint owns the transaction. The route class commits once on
+    # success and rolls back on any exception; `bind_session` publishes the request-scoped
+    # session for it. Declared here rather than per-handler so no handler can omit it.
+    route_class=TransactionalRoute,
+    dependencies=[Depends(bind_session)],
+)
 
 
 def _meta(request: Request) -> Meta:

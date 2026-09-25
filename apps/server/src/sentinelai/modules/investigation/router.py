@@ -34,11 +34,20 @@ from sentinelai.modules.investigation.service import (
     relationship_etag,
 )
 from sentinelai.platform.auth.dependencies import CurrentUser, require_case_access, require_role
+from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.platform.tasks import TaskQueue, get_task_queue
 from sentinelai.shared.envelope import Envelope, ListEnvelope, Meta, Pagination
 from sentinelai.shared.pagination import PageParams, page_params
 
-router = APIRouter(prefix="/api/v1", tags=["investigation"])
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["investigation"],
+    # ADR-0005 §1: the entrypoint owns the transaction. The route class commits once on
+    # success and rolls back on any exception; `bind_session` publishes the request-scoped
+    # session for it. Declared here rather than per-handler so no handler can omit it.
+    route_class=TransactionalRoute,
+    dependencies=[Depends(bind_session)],
+)
 
 
 def _meta(request: Request) -> Meta:
@@ -72,7 +81,6 @@ async def create_entity(
     uow: InvestigationUnitOfWork = Depends(get_investigation_uow),
 ) -> Envelope[EntityRead]:
     entity = await service.create_entity(payload, current_user, request.state.correlation_id)
-    await uow.commit()  # ADR-0005: the entrypoint owns the transaction
     response.headers["ETag"] = entity_etag(entity)
     return Envelope(data=EntityRead.model_validate(entity), meta=_meta(request))
 
@@ -104,7 +112,6 @@ async def review_entity_status(
     entity = await service.review_entity_status(
         entity_id, payload.status, current_user, request.state.correlation_id, if_match
     )
-    await uow.commit()
     response.headers["ETag"] = entity_etag(entity)
     return Envelope(data=EntityRead.model_validate(entity), meta=_meta(request))
 
@@ -190,7 +197,6 @@ async def review_relationship_status(
         request.state.correlation_id,
         if_match,
     )
-    await uow.commit()
     response.headers["ETag"] = relationship_etag(relationship)
     return Envelope(data=RelationshipRead.model_validate(relationship), meta=_meta(request))
 
@@ -230,7 +236,6 @@ async def trigger_correlation_run(
     run = await service.trigger_correlation_run(
         case_id, current_user, request.state.correlation_id, task_queue
     )
-    await uow.commit()
     return Envelope(data=CorrelationRunRead.model_validate(run), meta=_meta(request))
 
 

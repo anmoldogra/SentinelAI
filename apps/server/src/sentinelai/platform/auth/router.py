@@ -22,10 +22,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sentinelai.platform.auth.schemas import LoginRequest, LoginResponse
 from sentinelai.platform.auth.service import AuthService, get_auth_service
 from sentinelai.platform.db.session import get_session
+from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.shared.envelope import Envelope, Meta
 from sentinelai.shared.exceptions import UnauthenticatedError
 
-router = APIRouter(prefix="/api/v1", tags=["auth"])
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["auth"],
+    # ADR-0005 §1: the entrypoint owns the transaction. The route class commits once on
+    # success and rolls back on any exception; `bind_session` publishes the request-scoped
+    # session for it. Declared here rather than per-handler so no handler can omit it.
+    route_class=TransactionalRoute,
+    dependencies=[Depends(bind_session)],
+)
 
 
 def _meta(request: Request) -> Meta:
@@ -54,11 +63,11 @@ async def login(
             user_agent=request.headers.get("user-agent"),
         )
     except UnauthenticatedError:
-        # Commit the `login_failed` audit entry, then let the handler turn this into a 401.
-        # Without this the rollback would erase the very record §5 requires.
+        # Commit the `login_failed` audit entry, then let the handler turn this into a 401. Without
+        # this, ADR-0005's boundary rollback would erase the very record security §5 requires; with
+        # it, that rollback has nothing left to undo.
         await session.commit()
         raise
-    await session.commit()  # ADR-0005: the entrypoint owns the transaction
 
     return Envelope(
         data=LoginResponse(access_token=token, expires_at=session_row.expires_at),

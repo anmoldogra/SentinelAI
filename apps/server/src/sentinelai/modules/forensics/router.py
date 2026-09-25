@@ -9,10 +9,19 @@ from fastapi import APIRouter, Depends, Request, status
 from sentinelai.modules.forensics.schemas import ArtifactCreate, ArtifactRead
 from sentinelai.modules.forensics.service import ForensicsService, get_forensics_service
 from sentinelai.platform.auth.dependencies import CurrentUser, require_role
+from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.shared.envelope import Envelope, ListEnvelope, Meta, Pagination
 from sentinelai.shared.pagination import PageParams, page_params
 
-router = APIRouter(prefix="/api/v1/forensics", tags=["forensics"])
+router = APIRouter(
+    prefix="/api/v1/forensics",
+    tags=["forensics"],
+    # ADR-0005 §1: the entrypoint owns the transaction. The route class commits once on
+    # success and rolls back on any exception; `bind_session` publishes the request-scoped
+    # session for it. Declared here rather than per-handler so no handler can omit it.
+    route_class=TransactionalRoute,
+    dependencies=[Depends(bind_session)],
+)
 
 
 def _meta(request: Request) -> Meta:

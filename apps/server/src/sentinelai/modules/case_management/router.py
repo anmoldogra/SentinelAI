@@ -45,11 +45,20 @@ from sentinelai.platform.auth.dependencies import (
     require_case_access,
     require_role,
 )
+from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.platform.tasks import TaskQueue, get_task_queue
 from sentinelai.shared.envelope import Envelope, ListEnvelope, Meta, Pagination
 from sentinelai.shared.pagination import PageParams, page_params
 
-router = APIRouter(prefix="/api/v1", tags=["cases"])
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["cases"],
+    # ADR-0005 §1: the entrypoint owns the transaction. The route class commits once on
+    # success and rolls back on any exception; `bind_session` publishes the request-scoped
+    # session for it. Declared here rather than per-handler so no handler can omit it.
+    route_class=TransactionalRoute,
+    dependencies=[Depends(bind_session)],
+)
 
 
 def _meta(request: Request) -> Meta:
@@ -92,7 +101,6 @@ async def create_case(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
 ) -> Envelope[CaseRead]:
     case = await service.create_case(payload, current_user, request.state.correlation_id)
-    await uow.commit()  # ADR-0005: the entrypoint owns the transaction
     response.headers["ETag"] = case_etag(case)
     return Envelope(data=CaseRead.model_validate(case), meta=_meta(request))
 
@@ -122,7 +130,6 @@ async def update_case(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
 ) -> Envelope[CaseRead]:
     case = await service.update_case(case_id, payload, current_user, if_match)
-    await uow.commit()
     response.headers["ETag"] = case_etag(case)
     return Envelope(data=CaseRead.model_validate(case), meta=_meta(request))
 
@@ -138,7 +145,6 @@ async def change_case_status(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
 ) -> Envelope[CaseRead]:
     case = await service.change_status(case_id, payload, current_user, request.state.correlation_id)
-    await uow.commit()
     response.headers["ETag"] = case_etag(case)
     return Envelope(data=CaseRead.model_validate(case), meta=_meta(request))
 
@@ -188,7 +194,6 @@ async def link_evidence(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
 ) -> Envelope[CaseEvidenceLinkRead]:
     link = await service.link_evidence(case_id, payload, current_user, request.state.correlation_id)
-    await uow.commit()
     return Envelope(data=CaseEvidenceLinkRead.model_validate(link), meta=_meta(request))
 
 
@@ -202,7 +207,6 @@ async def unlink_evidence(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
 ) -> Response:
     await service.unlink_evidence(case_id, evidence_id, current_user, request.state.correlation_id)
-    await uow.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -236,7 +240,6 @@ async def generate_report(
     report = await service.generate_report(
         case_id, payload, current_user, request.state.correlation_id, task_queue
     )
-    await uow.commit()
     # api-design.md §7: 202 with the report id to poll and a Location pointing at it.
     response.headers["Location"] = f"/api/v1/reports/{report.report_id}"
     return Envelope(
@@ -266,5 +269,4 @@ async def download_report(
     # A GET with a deliberate write: minting the URL records the disclosure in
     # platform.audit_log (api-design.md §7), so the entrypoint must commit (ADR-0005).
     url = await service.get_report_download_url(report_id, current_user)
-    await uow.commit()
     return Envelope(data={"download_url": url}, meta=_meta(request))

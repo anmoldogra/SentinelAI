@@ -1900,3 +1900,106 @@ and the Verification Engine with its scheduled re-verification (1.4). The next r
 verifying one custody chain reads the whole custody ledger's hash column (IC-031); the audit ledger
 has no monotonic sequence column, so a clock inversion wider than the cutter's watermark could surface
 as an anchor mismatch on an intact ledger.
+
+---
+
+## 2026-09-25 — IC-033: Wave 1.3c committed; Wave 2.1 transaction boundary (ADR-0005)
+
+**Type:** Release of the completed evidentiary core, then the first Wave 2 increment. One new platform
+module, twenty-four deletions across nine routers, no schema change, no migration.
+
+### Wave 1.3c shipped
+
+RFC 3161 timestamping (IC-032) committed as `7e3116d` and pushed. **Wave 1 — the evidentiary gate —
+is complete**: canonical encoding (1.1), complete signed preimages (1.2), server-computed integrity
+(1.5), chain-head serialization (1.3a), Merkle/WORM anchoring with a scheduled cutter (1.3b), RFC 3161
+timestamping (1.3c), and the Verification Engine with scheduled re-verification (1.4).
+
+### Wave 2.1: what was actually wrong
+
+ADR-0005's Context claimed 8 `self._uow.commit()` sites in `case_management/service.py` and warned
+about workflows producing two independent commits. **Neither was true any more.** A survey of every
+`.commit()` call in `src/` found none in any service: they sat in routers, job wrappers, the CLI, the
+event dispatcher and the auth router — all entrypoints. §2 was already satisfied, and §3 was too
+(every module's `OutboxWriter` already shares the service's session).
+
+§4's premise did not hold either. `POST /evidence/batch` runs the whole batch in **one** transaction;
+its per-item `207` results come from pre-flush domain validation, not per-item commits. There were no
+implicit per-item commits to remove and no savepoints to add. A per-item *database* error still aborts
+the whole batch, which is the correct outcome — it stops a `207` body claiming success for rows that
+were never committed.
+
+So I corrected the ADR's Context rather than implementing a fix for a problem that no longer existed.
+
+**What did remain was §1, half-done.** The commit was at the entrypoint, but hand-written in every
+handler — twenty-four `await uow.commit()` calls — and rollback was implicit, resting on
+`AsyncSession.close()` discarding an uncommitted transaction rather than being stated anywhere.
+
+That shape is a silent-data-loss hazard, and it is worth being precise about why. A handler that omits
+the call does not fail, log, or raise. The session closes, the transaction is discarded, and the
+endpoint returns `201` describing a row that does not exist. Nothing in the type system or the test
+suite notices unless some test happens to assert persistence. Twenty-four opportunities to make that
+mistake, and one more with every new endpoint.
+
+### The boundary
+
+`platform/db/transaction.py`: a `TransactionalRoute(APIRoute)` that commits once on success and rolls
+back on any exception, plus a `bind_session` router-level dependency that publishes the request-scoped
+session for it. Attached to all nine routers; the twenty-four handler commits are gone.
+
+**A route class rather than the `yield` dependency ADR-0005 §1 suggests, and the reason matters.**
+FastAPI runs dependency teardown *after* the response has been produced, so an exception from
+`commit()` there cannot become a `500` — it escapes with the response already begun, bypassing the
+registered exception handlers and the standard error envelope. The client is told the write succeeded
+when the transaction never committed. I verified that empirically with a throwaway app before
+designing around it, rather than following the ADR's wording into a bug; the deviation is recorded as
+an implementation note on the ADR.
+
+**A router-level dependency binds the session rather than `get_session` doing it**, because dependency
+overrides have to keep working. Tests routinely override `get_session` with a fake; a binding done
+inside the real `get_session` would simply not happen, and the boundary would then quietly commit
+nothing — the exact failure mode it exists to remove. The login test, which asserts commits against a
+fake session, passes unchanged, which is the evidence that this works.
+
+**Three endpoints still commit explicitly, and must.** A rejected ingest keeps its intake record and
+`evidence.validation_failed` event (§25.2), a failed integrity check keeps its MISMATCH custody entry
+(ADR-0008 §3), and a failed login keeps its `login_failed` audit row (security §5). Each commits and
+re-raises; the boundary's rollback then finds an already-committed transaction and does nothing. I
+considered an exception-class allowlist (`persists_writes = True` on `DomainError` subclasses) and
+rejected it: which writes survive which failure is a decision belonging to the endpoint that made
+them, not a global property of an HTTP status code.
+
+### Tests
+
+**10 new**, all against a real Postgres, because the guarantee under test is *absence* — what the
+database holds after a failed request — and a fake session would report whatever it was told. Each
+path asserts the audit entry **and** the outbox event together, since §16 makes them one atomic unit
+and a boundary that committed one but not the other would publish an event with no fact behind it.
+
+Covered: a successful request commits both with no handler commit anywhere; an unhandled exception
+after writing leaves nothing; a domain failure leaves nothing; a deliberate pre-commit survives the
+error response; a rolled-back request does not poison the next one on a pooled connection; a read-only
+route needs no transaction; and a failing commit does not report success — the property Deviation 1
+exists for.
+
+**One test was initially vacuous and I caught it by trying to make it fail.**
+`test_every_api_route_attaches_the_transaction_boundary` filtered `app.routes` directly and found
+*zero* `/api/v1` routes, so it passed while proving nothing: this FastAPI version does not flatten
+`include_router` into `app.routes` — each inclusion is an opaque wrapper exposing `original_router`.
+Walking that finds 77 routes, 73 guarded. The test now asserts a minimum route count before checking,
+so the vacuous shape cannot come back, and a companion test states that the four unguarded routes are
+exactly the health and metrics probes — an exclusion by decision rather than by oversight.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (199 files), import-linter (2/2 kept), full suite **1008 passed
+/ 2 skipped**. Platform coverage **91.35%** against the 90% floor; `transaction.py` 86% (the
+uncovered remainder is the rollback-failed and no-session-bound defensive branches).
+
+### Scope note
+
+The worker job wrappers and the event dispatcher already owned their transactions in the shape §1
+requires and were left alone. Wave 2.1's remaining ADR-0005 items are closed by correction rather than
+by code: §2/§3 were satisfied before this increment, and §4's per-item-commit premise does not apply
+to the batch endpoint as built. The next roadmap item is Wave 2.2 — dispatcher to worker with
+`SKIP LOCKED` and per-aggregate ordering (ADR-0006).
