@@ -24,7 +24,7 @@ from sentinelai.platform.storage.exceptions import (
     StorageError,
     StorageUnavailable,
 )
-from sentinelai.platform.storage.port import CompletedPart, ObjectHead
+from sentinelai.platform.storage.port import CompletedPart, ObjectHead, ObjectLockStatus
 
 # 8 MiB parts: above S3's 5 MiB minimum for non-final parts, small enough to bound memory.
 _PART_SIZE = 8 * 1024 * 1024
@@ -161,6 +161,34 @@ class MinioObjectStorage:
                     ObjectLockRetainUntilDate=retain_until,
                     **extra,
                 )
+
+    async def object_lock_status(self, bucket: str) -> ObjectLockStatus:
+        """Read the bucket's Object Lock configuration (ADR-0003 §3, deployment Part 7).
+
+        S3 and MinIO signal "this bucket has no Object Lock" by *erroring*
+        (``ObjectLockConfigurationNotFoundError``) rather than returning an empty configuration, so
+        that specific code is translated into ``enabled=False``. Any other ``ClientError`` is left
+        to
+        ``_mapped`` — a permissions failure must not be mistaken for a bucket without WORM, because
+        the readiness probe would then refuse to boot for the wrong stated reason.
+        """
+        with _mapped(bucket):
+            async with self._client() as s3:
+                try:
+                    response = await s3.get_object_lock_configuration(Bucket=bucket)
+                except ClientError as exc:
+                    if _error_code(exc) == "ObjectLockConfigurationNotFoundError":
+                        return ObjectLockStatus(enabled=False)
+                    raise  # translated by _mapped
+                config = response.get("ObjectLockConfiguration", {})
+                enabled = config.get("ObjectLockEnabled") == "Enabled"
+                # A default retention rule is optional. When present its mode is what would apply to
+                # a write that named none, so the probe checks it; our own writes always name
+                # COMPLIANCE explicitly.
+                default_mode = (
+                    config.get("Rule", {}).get("DefaultRetention", {}).get("Mode") or None
+                )
+                return ObjectLockStatus(enabled=enabled, default_mode=default_mode)
 
     async def put_stream(
         self,

@@ -129,6 +129,32 @@ class CustodyEventRepository:
         """
         await lock_chain(self._session, CUSTODY_CHAIN, str(evidence_id))
 
+    async def chain_hashes(self, *, before: datetime | None = None) -> list[str]:
+        """Every custody entry hash across the whole ledger, in one deterministic global order.
+
+        **Why global rather than per-evidence.** An anchor commits to a contiguous range of one
+        ordered list, and `platform.ledger_anchors` records that range by first/last entry hash
+        with no column saying *which* chain it scopes to. If anchors were cut per evidence item,
+        verifying item X would still read every custody anchor — including item Y's, whose
+        endpoints do not appear in X's chain — and report each one as a missing range. One global
+        order makes every anchor locatable by every verifier, with no schema change.
+
+        **The tiebreak is load-bearing.** `occurred_at` alone is not a total order: two custody
+        events for different evidence items can share a timestamp, and two processes would then
+        build different leaf orders and therefore different Merkle roots for the same ledger. Adding
+        `custody_event_id` makes the order total and reproducible, which is the whole requirement.
+
+        ``before`` excludes entries at or after a watermark. The cutter uses it so a write whose
+        clock ran slightly behind cannot land *inside* an already-anchored range and break its
+        contiguity — see `integrity_jobs.ANCHOR_WATERMARK_MINUTES`.
+        """
+        statement = select(EvidenceCustodyEvent.entry_hash).order_by(
+            EvidenceCustodyEvent.occurred_at, EvidenceCustodyEvent.custody_event_id
+        )
+        if before is not None:
+            statement = statement.where(EvidenceCustodyEvent.occurred_at < before)
+        return list((await self._session.execute(statement)).scalars().all())
+
     async def recently_active_evidence_ids(self, *, limit: int) -> Sequence[UUID]:
         """Evidence items whose custody chain changed most recently, newest activity first.
 

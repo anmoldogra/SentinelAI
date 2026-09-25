@@ -18,6 +18,7 @@ from arq.connections import RedisSettings
 
 from sentinelai.modules.case_management.jobs import generate_case_report
 from sentinelai.modules.forensics.jobs import process_artifact
+from sentinelai.modules.ingestion.anchor_jobs import cut_anchor_batches
 from sentinelai.modules.ingestion.integrity_jobs import reverify_evidentiary_ledgers
 from sentinelai.modules.ingestion.jobs import scan_uploaded_evidence
 from sentinelai.modules.investigation.jobs import run_correlation
@@ -28,6 +29,7 @@ from sentinelai.platform.db.session import async_session_factory, dispose_engine
 from sentinelai.platform.logging import configure_logging, log
 from sentinelai.platform.security.scanner import build_malware_scanner
 from sentinelai.platform.storage import build_object_storage
+from sentinelai.platform.storage.worm import WormMisconfigured, verify_worm_bucket
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
@@ -41,6 +43,32 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     # ADR-0008: object storage + the §25 malware scanner, built once per worker process.
     ctx["object_storage"] = build_object_storage(settings)
     ctx["malware_scanner"] = build_malware_scanner(settings)
+    # Settings go on the context so job functions read the same object the process validated,
+    # rather than re-importing the module-level singleton and diverging under test.
+    ctx["settings"] = settings
+
+    # ADR-0003 §3 / deployment Part 7: refuse to run the anchor cutter against a bucket that cannot
+    # hold COMPLIANCE-mode objects. This matters more in the worker than in the API, because the
+    # worker is the process that actually writes anchors — a non-WORM bucket here means every
+    # anchor it publishes is deletable by the insider anchoring exists to defend against, and
+    # nothing in the data would ever reveal it.
+    #
+    # Fails CLOSED in production, matching the KMS and bucket-bootstrap posture in the HTTP
+    # lifespan. Outside production it logs and continues, so a developer without a WORM-capable
+    # MinIO can still run the worker — the anchor job itself fails loudly if it tries to publish.
+    try:
+        await verify_worm_bucket(ctx["object_storage"], settings.storage_anchor_bucket)
+    except WormMisconfigured as exc:
+        log.error(
+            "worm_bucket_misconfigured", bucket=settings.storage_anchor_bucket, detail=str(exc)
+        )
+        if settings.is_production:
+            raise
+    except Exception as exc:  # unreachable endpoint, denied credentials - not a misconfiguration
+        log.error("worm_bucket_check_failed", error=type(exc).__name__)
+        if settings.is_production:
+            raise
+
     log.info("worker_startup", env=settings.app_env)
 
 
@@ -74,6 +102,21 @@ class WorkerSettings:
     # retrying a *completed* run that found tampering would re-alarm on the same finding.
     cron_jobs: ClassVar[list[Any]] = [
         cron(reverify_evidentiary_ledgers, minute=30, run_at_startup=False, max_tries=1),
+        # ADR-0003 §3: cut anchor batches every 4 hours, on the hour. Six runs a day bounds how long
+        # a newly-written entry stays uncommitted (and therefore how much history a truncation could
+        # reach) without turning the KMS into a bottleneck: each run costs exactly two signatures,
+        # one per ledger, regardless of how many entries the batch covers.
+        #
+        # Offset from the verification job's :30 so a re-verification never races the cutter it is
+        # checking the output of — the two are individually safe to interleave, but a report saying
+        # "N unanchored" is easier to reason about when it is not sampled mid-cut.
+        cron(
+            cut_anchor_batches,
+            hour={0, 4, 8, 12, 16, 20},
+            minute=0,
+            run_at_startup=False,
+            max_tries=3,
+        ),
     ]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     on_startup = on_startup

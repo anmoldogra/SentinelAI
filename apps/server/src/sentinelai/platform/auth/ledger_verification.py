@@ -31,6 +31,7 @@ That split is the whole reason ``verify_chain`` takes ``chain_entry_hashes`` sep
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Final
 
 from sqlalchemy import select
@@ -126,26 +127,35 @@ def audit_entry_view(row: AuditLog) -> LedgerEntryView:
     )
 
 
-async def read_audit_chain_hashes(session: AsyncSession) -> list[str]:
+async def read_audit_chain_hashes(
+    session: AsyncSession, *, before: datetime | None = None
+) -> list[str]:
     """Every audit entry hash in chain order — the anchor layer's input.
 
     One text column, so this stays cheap even on a large ledger. Ordered by ``occurred_at``, which
     is how the writer picks the head it chains onto
     (:func:`sentinelai.platform.auth.audit.record_audit_event`), so it reproduces write order.
 
-    The ordering is a heuristic, exactly as it is on the write path: clocks are not monotonic. It
-    cannot mask tampering — a reordered pair changes the recomputed Merkle root either way — but a
-    clock inversion between two entries could surface as an anchor mismatch on an intact ledger.
-    The chain-link uniqueness index from Wave 1.3 makes that the only remaining ordering ambiguity,
-    and closing it properly needs a monotonic sequence column on ``audit_log``, which is a schema
-    change and therefore its own increment.
+    ``audit_id`` is the tiebreak, and it is load-bearing rather than cosmetic: ``occurred_at``
+    alone is not a total order, so two processes could otherwise derive different leaf orders and
+    therefore different Merkle roots for the same ledger. With the tiebreak the order is total and
+    reproducible.
+
+    ``before`` excludes entries at or after a watermark. The anchor cutter uses it so a write whose
+    clock ran slightly behind cannot land *inside* an already-anchored range and break its
+    contiguity.
+
+    The ordering is still a heuristic in one respect, exactly as it is on the write path: clocks are
+    not monotonic. It cannot mask tampering — a reordered pair changes the recomputed Merkle root
+    either way — but a clock inversion wider than the cutter's watermark could surface as an anchor
+    mismatch on an intact ledger. The chain-link uniqueness index from Wave 1.3 makes that the only
+    remaining ordering ambiguity, and closing it properly needs a monotonic sequence column on
+    ``audit_log``, which is a schema change and therefore its own increment.
     """
-    rows = (
-        (await session.execute(select(AuditLog.entry_hash).order_by(AuditLog.occurred_at)))
-        .scalars()
-        .all()
-    )
-    return list(rows)
+    statement = select(AuditLog.entry_hash).order_by(AuditLog.occurred_at, AuditLog.audit_id)
+    if before is not None:
+        statement = statement.where(AuditLog.occurred_at < before)
+    return list((await session.execute(statement)).scalars().all())
 
 
 async def read_recent_audit_entries(

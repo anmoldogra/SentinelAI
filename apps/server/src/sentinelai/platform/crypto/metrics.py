@@ -74,6 +74,21 @@ LEDGER_VERIFICATION_DURATION = Histogram(
     "Wall-clock duration of one ledger verification run.",
     ["ledger"],
 )
+LEDGER_ANCHORS_CUT = Counter(
+    "sentinelai_ledger_anchors_cut_total",
+    "Anchors published to WORM storage, by ledger.",
+    ["ledger"],
+)
+LEDGER_ANCHORED_ENTRIES = Counter(
+    "sentinelai_ledger_anchored_entries_total",
+    "Ledger entries newly committed to an anchor, by ledger.",
+    ["ledger"],
+)
+LEDGER_ANCHOR_BATCH_DURATION = Histogram(
+    "sentinelai_ledger_anchor_batch_seconds",
+    "Wall-clock duration of cutting one anchor batch.",
+    ["ledger"],
+)
 LEDGER_UNANCHORED_ENTRIES = Gauge(
     "sentinelai_ledger_unanchored_entries",
     "Entries not covered by any anchor — a steadily rising value means batch cutting has stopped.",

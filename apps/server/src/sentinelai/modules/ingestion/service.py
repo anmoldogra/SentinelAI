@@ -797,10 +797,6 @@ class EvidenceService:
         argument for partial coverage, and a report that silently skipped entries would be
         worthless in exactly the setting it exists for.
 
-        ``chain_entry_hashes`` is left to default (to the hashes of the entries just read), which is
-        correct precisely because this *is* the complete chain — unlike the audit ledger, where the
-        entry window and the anchor scope necessarily differ.
-
         Read-only: verification alters nothing.
         """
         events = await self._uow.custody.list_for_evidence(evidence_id)
@@ -841,6 +837,14 @@ class EvidenceService:
             # Custody anchors live in `platform.ledger_anchors` like the audit ledger's — one table
             # discriminated by `ledger`, so there is one anchor-verification path rather than two.
             anchors=await read_anchor_views(self._uow.session, LEDGER_CUSTODY),
+            # The WHOLE custody ledger in global order, not just this item's entries, and this is
+            # not an optimisation detail — it is required for correctness. Anchors are cut over the
+            # global custody order (`CustodyEventRepository.chain_hashes`) because
+            # `platform.ledger_anchors` has no column scoping a range to one evidence item. Passing
+            # only this item's chain would leave every *other* item's anchor unlocatable, and each
+            # one would be reported as a missing range: a false tampering verdict on every evidence
+            # item as soon as a second one is anchored.
+            chain_entry_hashes=await self._uow.custody.chain_hashes(),
             # Every custody chain genuinely starts at the all-zero sentinel (CEM §4), so a first
             # entry that does not is a missing head rather than a window boundary.
             expect_genesis=True,

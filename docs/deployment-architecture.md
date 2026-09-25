@@ -347,11 +347,20 @@ A point-in-time restore silently erases every ledger entry written after the res
 
 Anchors are written with S3 Object Lock in **COMPLIANCE** mode, which cannot be bypassed by any principal, including the account root. Three deployment consequences follow, and none of them is optional:
 
-1. **Object Lock is fixed at bucket creation.** A bucket created without it can never be upgraded, so the anchor bucket must be provisioned with `ObjectLockEnabledForBucket` from the start. `ensure_worm_bucket` does this on first use; a pre-existing non-WORM bucket with the anchor bucket's name is a misconfiguration that must fail the deployment rather than be tolerated.
+1. **Object Lock is fixed at bucket creation.** A bucket created without it can never be upgraded, so the anchor bucket must be provisioned with `ObjectLockEnabledForBucket` from the start. `ensure_worm_bucket` does this on first use; a pre-existing non-WORM bucket with the anchor bucket's name is a misconfiguration that must fail the deployment rather than be tolerated. **This is now enforced, not merely documented:** `platform/storage/worm.py`'s readiness probe runs in the startup path of both the API and the worker, queries the bucket's Object Lock configuration, and raises in production if Object Lock is absent or the default retention mode is GOVERNANCE. Outside production it logs and fails `/startupz`, so a misconfigured environment never reports healthy to Kubernetes. The bucket and its retention are configured by `STORAGE_ANCHOR_BUCKET` and `STORAGE_ANCHOR_RETENTION_YEARS`.
 2. **COMPLIANCE mode is deliberate, and GOVERNANCE mode is not an acceptable substitute.** Governance retention can be bypassed by a principal holding `s3:BypassGovernanceRetention` — which is precisely the privileged insider the anchors defend against. An anchor a sufficiently-privileged operator can delete anchors nothing.
 3. **Retention outlives the evidence.** The default is 10 years (`DEFAULT_RETENTION_YEARS`). An anchor whose lock expires before the evidence it commits to stops proving anything at exactly the moment a long-running case would need it. Retention on this bucket must be set from the *evidentiary* retention policy, never from a storage-cost policy — and note that COMPLIANCE-mode objects cannot be deleted early to reclaim space, which is the point.
 
 Backup replication of the anchor bucket must preserve the lock state; a replica that drops retention is a copy an insider can edit.
+
+### Anchor production is a scheduled job, and its silence is a failure mode
+
+Anchors are cut by `cut_anchor_batches` in the worker's `cron_jobs`, every four hours. Two operational consequences:
+
+1. **No worker means no anchors.** The API can serve, ingest evidence, and write both ledgers with no worker running at all — and every entry written in that period stays uncommitted, so a truncation covering it would be undetectable. A deployment profile that scales the worker to zero silently disables the truncation defence. Treat worker availability as an evidentiary control, not just a throughput one.
+2. **Watch `sentinelai_ledger_unanchored_entries`.** It is a gauge, published by the re-verification job. A value that climbs monotonically across runs means batch cutting has stopped while writes continue — which is exactly the state above, and the only external signal of it. An alert rule on sustained growth belongs alongside the `sentinelai_ledger_verification_state` rule, and is cheaper to act on than discovering the gap during a case.
+
+The cutter never anchors entries newer than a 15-minute watermark (clock-skew safety, ADR-0003's 2026-09-25b amendment), so a steady-state deployment should show a small, *non-zero*, non-growing unanchored count. Zero is not the target; unbounded growth is the alarm.
 
 # Part 8 — Database Deployment
 

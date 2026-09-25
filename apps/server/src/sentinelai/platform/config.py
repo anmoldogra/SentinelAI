@@ -88,6 +88,18 @@ class Settings(BaseSettings):
     storage_secret_key: SecretStr = SecretStr("minioadmin")
     # SigV4 requires a region even on MinIO, which ignores its value (ADR-0008).
     storage_region: str = "us-east-1"
+    # Merkle-root anchors (ADR-0003 §3). A SEPARATE bucket, never the evidence one: S3 Object Lock
+    # is fixed at bucket creation and cannot be added later, so the anchor bucket has to be created
+    # WORM from the start while the evidence bucket deliberately is not (evidence is promoted,
+    # superseded, and quarantined — all of which need ordinary object semantics).
+    # `deployment-architecture.md` Part 7 covers provisioning; the startup probe in
+    # `platform/storage/worm.py` refuses to boot production against a bucket that is not
+    # COMPLIANCE-capable.
+    storage_anchor_bucket: str = "sentinelai-anchors"
+    # How long an anchor's Object Lock retention runs. Must come from the *evidentiary* retention
+    # policy, never a storage-cost policy: an anchor whose lock expires before the evidence it
+    # commits to stops proving anything at exactly the moment a long-running case needs it.
+    storage_anchor_retention_years: int = 10
 
     # --- notification delivery (security-architecture §25) ---
     # log (Phase 1: the in-app notification row is the durable delivery) | smtp | slack, later.

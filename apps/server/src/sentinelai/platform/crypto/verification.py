@@ -282,7 +282,11 @@ class LedgerVerifier:
         failed = sum(1 for e in per_entry if e.state is VerificationState.FAILED)
 
         anchored = self._anchored_entry_hashes(chain_entry_hashes=hashes, anchors=anchors)
-        unanchored = sum(1 for h in hashes if h not in anchored)
+        # Counted over `entries`, not over the whole chain: this number answers "how much of what
+        # this report covers is not yet committed to an anchor". Counting over `chain_entry_hashes`
+        # would make a per-evidence custody report quote a figure for the entire custody ledger,
+        # which is both useless to the reader and alarming for no reason.
+        unanchored = sum(1 for e in entries if e.entry_hash not in anchored)
 
         state = _merge(
             [e.state for e in per_entry] + [a.state for a in anchor_findings],

@@ -222,6 +222,16 @@ class _FakeCustodyRepo:
         `tests/integration/test_chain_concurrency_db.py`.
         """
 
+    async def chain_hashes(self, *, before: Any | None = None) -> list[str]:
+        """The whole fake ledger's entry hashes, in insertion order.
+
+        Insertion order stands in for the real query's `(occurred_at, custody_event_id)` ordering:
+        the fake appends in the order events are recorded, which is the same sequence. `before` is
+        accepted and ignored — the watermark exists to absorb clock skew between processes, and an
+        in-memory list has neither.
+        """
+        return [event.entry_hash for event in self.items]
+
     async def add(self, event: Any) -> None:
         self.items.append(event)
 

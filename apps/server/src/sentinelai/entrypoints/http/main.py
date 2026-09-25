@@ -51,6 +51,7 @@ from sentinelai.platform.logging import configure_logging, log
 from sentinelai.platform.migrations.currency import check_migrations_current
 from sentinelai.platform.security.scanner import build_malware_scanner
 from sentinelai.platform.storage import build_object_storage
+from sentinelai.platform.storage.worm import WormMisconfigured, verify_worm_bucket
 
 # Registered in database-design.md §5 DAG order.
 _MODULE_ROUTERS = (
@@ -117,6 +118,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.is_production:
             raise
 
+    # WORM readiness (ADR-0003 §3, deployment-architecture.md Part 7). The anchor bucket is
+    # checked, never created, here: `ensure_worm_bucket` belongs to the worker that writes anchors,
+    # and an API pod racing to create an evidentiary bucket is not a behaviour worth having. What
+    # this catches is the dangerous case — a pre-existing bucket with that name and no Object
+    # Lock, or a GOVERNANCE default that a privileged insider could bypass. Either makes every
+    # anchor deletable, and nothing in the data would ever show it.
+    #
+    # Gated into `/startupz` rather than only logged, so a non-production deployment that is
+    # misconfigured never looks healthy to Kubernetes. Fails CLOSED in production, same posture as
+    # the KMS check below.
+    worm_ready = False
+    try:
+        await verify_worm_bucket(app.state.object_storage, settings.storage_anchor_bucket)
+        worm_ready = True
+    except WormMisconfigured as exc:
+        log.error(
+            "worm_bucket_misconfigured", bucket=settings.storage_anchor_bucket, detail=str(exc)
+        )
+        if settings.is_production:
+            raise
+    except Exception as exc:
+        # "We could not check" is not "it is misconfigured": an unreachable endpoint or denied
+        # credentials gets its own log event, because the operator response is completely different.
+        log.error("worm_bucket_check_failed", error=type(exc).__name__)
+        if settings.is_production:
+            raise
+
     # KMS (ADR-0009): construct + verify reachability. Fail CLOSED in production — a signing
     # subsystem that cannot reach its keys must not serve requests that would need to sign.
     app.state.kms = create_kms(settings)
@@ -149,8 +177,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "config_validated": True,
         "kms_started": kms_started,
         "buckets_ready": buckets_ready,
+        "worm_ready": worm_ready,
         "migrations_current": migrations_current,
-        "complete": kms_started and buckets_ready and migrations_current,
+        "complete": kms_started and buckets_ready and worm_ready and migrations_current,
     }
     log.info("http_startup_complete", **app.state.startup)
 

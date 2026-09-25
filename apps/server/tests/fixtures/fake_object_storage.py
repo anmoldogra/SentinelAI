@@ -12,8 +12,8 @@ from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 from uuid import uuid4
 
-from sentinelai.platform.storage.exceptions import ObjectNotFound
-from sentinelai.platform.storage.port import CompletedPart, ObjectHead
+from sentinelai.platform.storage.exceptions import BucketNotFound, ObjectNotFound
+from sentinelai.platform.storage.port import CompletedPart, ObjectHead, ObjectLockStatus
 
 
 class FakeObjectStorage:
@@ -27,12 +27,29 @@ class FakeObjectStorage:
         # WORM retention per object, so a test can assert an anchor was written under a
         # real lock rather than merely written.
         self.retentions: dict[tuple[str, str], datetime] = {}
+        # Per-bucket Object Lock configuration, settable by a test that needs a misconfigured
+        # bucket (ADR-0003 §3's readiness probe).
+        self.lock_status: dict[str, ObjectLockStatus] = {}
 
     async def ensure_bucket(self, bucket: str) -> None:
         self._buckets.add(bucket)
 
     async def ensure_worm_bucket(self, bucket: str) -> None:
         self._buckets.add(bucket)
+        # Created WORM, matching the real adapter: `create_bucket(ObjectLockEnabledForBucket=True)`.
+        # A test that wants a misconfigured bucket sets `lock_status` explicitly instead.
+        self.lock_status.setdefault(bucket, ObjectLockStatus(enabled=True))
+
+    async def object_lock_status(self, bucket: str) -> ObjectLockStatus:
+        """Report whatever a test configured, defaulting to "exists, no Object Lock".
+
+        The default is deliberately the *unsafe* answer for a bucket made by the ordinary
+        `ensure_bucket` path — that is what the real adapter reports too, and defaulting to the safe
+        answer would make the readiness probe's tests pass for the wrong reason.
+        """
+        if bucket not in self._buckets:
+            raise BucketNotFound(bucket)
+        return self.lock_status.get(bucket, ObjectLockStatus(enabled=False))
 
     async def put_immutable(
         self,

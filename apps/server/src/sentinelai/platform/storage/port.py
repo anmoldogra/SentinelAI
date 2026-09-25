@@ -22,6 +22,28 @@ from typing import Protocol
 
 
 @dataclass(frozen=True, slots=True)
+class ObjectLockStatus:
+    """A bucket's S3 Object Lock configuration — ADR-0003 §3.
+
+    ``enabled`` is whether Object Lock is turned on at all. It is fixed at bucket creation and can
+    never be added afterwards, which is why a misconfigured bucket is a provisioning failure rather
+    than something the application can repair.
+
+    ``default_mode`` is the bucket's *default* retention mode (``"COMPLIANCE"``, ``"GOVERNANCE"``,
+    or
+    ``None`` when no default rule is set). It is distinct from the mode used on a given write:
+    :meth:`ObjectStorage.put_immutable` names ``COMPLIANCE`` per object, so a bucket with no default
+    rule is correct. A bucket whose default is ``GOVERNANCE`` is not, because governance retention
+    is
+    bypassable by a principal holding ``s3:BypassGovernanceRetention`` — precisely the privileged
+    insider anchoring defends against.
+    """
+
+    enabled: bool
+    default_mode: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ObjectHead:
     """Metadata for a stored object (the result of a ``head`` request)."""
 
@@ -78,6 +100,16 @@ class ObjectStorage(Protocol):
         Takes ``bytes`` rather than a stream: the objects written this way are anchors — a few
         hundred bytes — and a single atomic PUT is both simpler and the only form that carries
         the lock headers.
+        """
+        ...
+
+    async def object_lock_status(self, bucket: str) -> ObjectLockStatus:
+        """Report ``bucket``'s Object Lock configuration, for the startup readiness probe.
+
+        Returns ``ObjectLockStatus(enabled=False)`` for a bucket that exists without Object Lock —
+        that is a legitimate answer, not an error, and it is the one the probe must be able to see
+        in
+        order to refuse the boot. A bucket that does not exist raises ``BucketNotFound``.
         """
         ...
 

@@ -1659,3 +1659,120 @@ on `audit_log` — a schema change, so its own increment. And nothing still *cut
 (IC-029's gap, unchanged): the verification engine checks whatever anchors exist, and in a
 deployment where no batch job runs, that is none.
 
+---
+
+## 2026-09-25 — IC-031: anchor batch cutting + WORM startup enforcement (ADR-0003 §3, operational)
+
+**Type:** Operational completion of the evidentiary core. Two scheduled/boot-time components, one
+config addition, no schema change, no migration. **Two latent defects in IC-030 found and fixed.**
+
+### What was actually broken
+
+IC-029 shipped anchoring as "a library plus a store, not a running job". IC-030 shipped a verification
+engine that checks whatever anchors exist. Nothing ever created one. So the state before this increment
+was: a correct Merkle implementation, a correct WORM writer, a correct verifier — and, in any real
+deployment, **zero anchors**, which means the truncation defence was fully built and completely
+unarmed. Every anchoring test in the repository published its anchor by hand.
+
+### The cutter
+
+`modules/ingestion/anchor_jobs.py`, registered at `hour={0,4,8,12,16,20}`. Reads each ledger in its
+canonical global order, takes the contiguous tail no anchor covers, publishes one anchor over it.
+Three properties carry the weight:
+
+**Contiguous, forward-only intervals.** An anchor commits to a range of one ordered list, so scattered
+gaps are not anchorable; the boundary only moves forward, resolved as the *furthest* anchored position
+rather than the newest anchor by timestamp (two concurrent cuts must not move it backwards).
+
+**A 15-minute watermark.** Ordering is by `occurred_at` and clocks are not monotonic. Without the lag,
+a write whose clock ran behind could commit *after* a cut but sort *before* its boundary, changing the
+recomputed root for a ledger nobody touched — a false tampering alarm on healthy data, which is
+precisely how a real alarm gets muted.
+
+**An unresolvable boundary refuses the cut.** This one I got wrong first and the integration test
+caught it. If an existing anchor's `last_entry_hash` is gone from the chain, the ledger has been
+truncated. My initial `_unanchored_tail` logged a warning and left the boundary at `-1` — meaning
+"anchor everything" — which would publish a fresh, correctly-signed anchor over the surviving doctored
+history. That does not merely fail to detect the truncation, it **launders it into proof**. Only the
+`uq_ledger_anchors_ledger_range` unique index stopped it, as an `IntegrityError`. Now the function
+returns `None` (refuse) as a state distinct from `[]` (nothing new), and the job skips that ledger with
+a `CRITICAL`-adjacent error, leaving the failing anchor on record for the verifier.
+
+### Two latent IC-030 defects this exposed
+
+**1. Custody verification would have broken the moment a second item was anchored.** IC-030's
+`verify_custody_chain` passed only that evidence item's entries as the chain, while
+`read_anchor_views` returns *every* custody anchor. `platform.ledger_anchors` has no column scoping a
+range to a subject, so item Y's anchor endpoints do not appear in item X's chain — and would have been
+reported `ANCHOR_RANGE_MISSING`: a false tampering verdict on every evidence item. It never fired
+because no anchors existed. Fixed by cutting custody anchors over a **global** order
+(`occurred_at, custody_event_id` — the tiebreak is required for a reproducible Merkle root) and passing
+that global hash list as `chain_entry_hashes`. The alternative, a subject column on `ledger_anchors`,
+is a schema change and would have been an invented field; recorded as the scaling trade-off it is.
+
+**2. `unanchored_entries` was counted over the wrong set.** It iterated `chain_entry_hashes`, so once
+that became the global ledger a per-evidence report would have quoted a figure for the entire custody
+ledger. Now counted over the entries the report actually covers.
+
+Both were found by building the thing that would have triggered them, not by re-reading the code.
+
+### WORM enforcement at boot
+
+`platform/storage/worm.py`, in the startup path of **both** entrypoints. The gap it closes is specific:
+`ensure_worm_bucket` deliberately does not verify an *existing* bucket, because Object Lock is fixed at
+creation and cannot be repaired by the application. So a pre-existing, correctly-named, non-WORM bucket
+is the dangerous case — creation is skipped, writes may succeed, and every anchor in it is deletable
+with nothing in the data to reveal it.
+
+Refuses a bucket without Object Lock, and refuses a GOVERNANCE default (bypassable by
+`s3:BypassGovernanceRetention` — exactly the insider being defended against). A bucket with *no*
+default rule passes, because `put_immutable` names COMPLIANCE per write; rejecting that would reject
+the correct configuration. "We could not check" (unreachable endpoint, denied credentials) is kept
+distinct from "it is misconfigured" — different operator responses, so different exception types.
+
+**Fails closed in production; outside production it logs and gates `/startupz`.** That is a deliberate
+departure from the literal instruction to "fail the boot sequence" and it matches the existing KMS and
+bucket-bootstrap posture: hard-failing everywhere would stop every developer without a WORM-capable
+MinIO from running the server, and a degraded start is already visible to Kubernetes through the
+startup probe. `worm_ready` is now part of the `/startupz` gate.
+
+### The MinIO WORM gap, closed
+
+IC-029's `ensure_worm_bucket` and `put_immutable` had **zero test coverage** — every anchoring test used
+`FakeObjectStorage`, which records a dict entry and has no notion of a lock. The entire truncation
+guarantee rested on code CI never executed. Four new tests now run against live MinIO: Object Lock is
+enabled on a WORM-created bucket, absent on an ordinary one (MinIO signals this by *erroring*, so the
+adapter's translation is pinned too), the readiness probe accepts one and rejects the other, and a
+COMPLIANCE-locked object's version **cannot be deleted** while retention holds, with bytes intact.
+
+### Tests and gates
+
+**Tests: 24 new** (6 unit probe, 4 live-MinIO WORM, 14 cutter — 9 against a live database, 5 unit on
+the boundary calculation). The end-to-end assertion is the one that matters: after a real cut the
+Verification Engine reports the ledger `verified` with `unanchored_entries == 0`, and after a
+truncation of that same anchored range it reports `failed` with `ANCHOR_RANGE_MISSING`.
+
+One test helper had to be deleted rather than fixed: it backdated `occurred_at` to get entries behind
+the watermark, but `occurred_at` is *inside* the audit preimage, so the `UPDATE` changed every
+`entry_hash` and the ledger legitimately failed verification. The helper was measuring its own
+corruption. Those tests now pass `watermark_minutes=0`; the watermark has its own dedicated tests.
+
+**Gates.** ruff (lint + format), `mypy --strict` (197 files), import-linter (2/2 kept), full suite
+**952 passed / 1 skipped** (up from 928/1; the skip is the opt-in KMS benchmark). Platform coverage
+**91.92%** against the 90% floor; `worm.py` 100%, `verification.py` 100%.
+
+### Known gaps
+
+**Worker availability is now an evidentiary control.** No worker means no anchors, and entries written
+in that window are permanently uncommitted — a deployment profile that scales the worker to zero
+silently disables truncation detection. Recorded in `deployment-architecture.md` along with the signal
+to alert on (`sentinelai_ledger_unanchored_entries` growing monotonically). Steady state should show a
+small, non-zero, non-growing count; zero is not the target, unbounded growth is the alarm.
+
+**Verifying one custody chain now reads the whole custody ledger's hash column**, a consequence of the
+global anchor order. One indexed text column, acceptable at current scale; removing it needs a subject
+column on `ledger_anchors` and is its own increment.
+
+**Still open in Wave 1:** RFC-3161 timestamping (1.3c), which closes backdating only. `tsa_token_ref`
+remains explicitly null. And the audit ledger still has no monotonic sequence column, so a clock
+inversion wider than the watermark could surface as an anchor mismatch on an intact ledger.

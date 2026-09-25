@@ -44,7 +44,7 @@ acceptance:
 | §4 Server-computed integrity hashing | 1.5 | **Built** — landed early (out of dependency order) as `09e4f14`; ADR-0008 §3 |
 | §2 Complete preimage (all persisted fields) | 1.2 | **Built** — `platform/crypto/ledger.py`; both ledgers hash every persisted column under JCS and stamp `hash_algo`/`preimage_version`. Enforced by a table-driven test against the live schema |
 | §1 Authenticated entries (**signatures**) | 1.2 | **Built** — `LedgerSigner` signs every audit and custody write under `KeyPurpose.EVIDENCE_ROOT` (Ed25519 by policy); `signature`/`sig_alg`/`key_id` carry real values. Fails closed: a write that cannot be signed aborts its transaction |
-| §3 External anchoring — **Merkle + WORM** | 1.3 | **Built** — `platform/crypto/{merkle,anchoring}.py`, `platform.ledger_anchors`, COMPLIANCE-mode Object Lock. Truncation and rollback are detected; proven against a live database in `test_ledger_anchoring_db.py` |
+| §3 External anchoring — **Merkle + WORM** | 1.3 | **Built and running** — `platform/crypto/{merkle,anchoring}.py`, `platform.ledger_anchors`, COMPLIANCE-mode Object Lock. Anchors are **produced** by a 4-hourly cutter (`modules/ingestion/anchor_jobs.py`) and enforced at boot by a WORM readiness probe (`platform/storage/worm.py`). Truncation and rollback detected end to end, against a live database and a live MinIO Object Lock bucket |
 | §3 External anchoring — **RFC-3161 timestamp** | 1.3 | **NOT built** — `tsa_token_ref` is reserved and null. WORM makes an anchor undeletable (which defeats truncation); a TSA makes it undatable-forward (which defeats backdating). Needs an ASN.1/CMS dependency and its own ADR |
 | §6 Verification Engine — **online report** | 1.4 | **Built** — `platform/crypto/verification.py` (pure, three-layer, three-state) behind `GET /api/v1/evidence/{id}/verify`; api-design.md §5.1. Proven against real tampering on a live database in `test_verification_db.py` |
 | §6 Verification Engine — **scheduled re-verification** | 1.4 | **Built** — `modules/ingestion/integrity_jobs.py`, an hourly arq cron job over the audit ledger and the most recently active custody chains. Alarms via Prometheus metrics + a `CRITICAL` log line; **not** via the notification module (see the amendment below) |
@@ -198,6 +198,49 @@ and a deleted tail is by definition not inside a window of surviving rows. Custo
 verified in full — they are bounded by how many times one item was touched. The scheduled sweep
 covers the most recently active custody chains (default 250) rather than every chain ever written;
 any chain can be verified in full on demand through the API.
+
+## Amendment (2026-09-25b) — anchors are cut on a schedule, and the bucket is checked at boot
+
+IC-029 shipped anchoring as "a library plus a store, not a running job", and IC-030 shipped a verifier
+that checks whatever anchors exist. In a deployment where nothing cut a batch, that was **none** — so
+every piece worked and together they proved nothing. Two operational components close that.
+
+**The cutter** (`modules/ingestion/anchor_jobs.py`, 4-hourly) reads each ledger in its canonical global
+order, finds the contiguous tail no anchor covers, and publishes one anchor over it. Three properties
+are load-bearing:
+
+- **Anchors are contiguous, forward-only intervals.** An anchor commits to a range of one ordered
+  list, so scattered gaps cannot be anchored — the boundary only ever moves forward.
+- **A watermark (15 minutes) holds back the newest entries.** Ordering is by `occurred_at` and clocks
+  are not monotonic; without the lag, a write whose clock ran behind could be committed after a cut
+  but sort before its boundary, changing the recomputed root for a ledger nobody touched. That is a
+  false tampering alarm on healthy data, which is how a real alarm gets ignored.
+- **An unresolvable boundary refuses the cut.** If an existing anchor's `last_entry_hash` is no longer
+  in the chain, the ledger has been truncated. The cutter must not fall back to "nothing is anchored"
+  and publish a fresh commitment over the survivors: that would be a valid, correctly-signed anchor
+  attesting to the attacker's version of events — laundering a truncation into proof rather than
+  failing to detect it. The run stops and leaves the failing anchor on record for the verifier.
+
+**Custody anchors are cut over a global order, not per evidence item**, and this follows from §5's
+schema rather than from preference. `platform.ledger_anchors` records a range by first/last entry hash
+with no column scoping it to a subject. Per-item anchors would therefore be unlocatable by any other
+item's verification, and each would be reported as a missing range — a false failure on every evidence
+item as soon as a second one was anchored. One global order (`occurred_at, custody_event_id`, the
+tiebreak being required for a reproducible Merkle root) makes every anchor locatable by every verifier
+with no schema change. The cost is that verifying one custody chain reads the whole ledger's hash
+column; scoping anchors by subject would remove that, and is a schema change worth its own increment.
+
+**The readiness probe** (`platform/storage/worm.py`) runs in both entrypoints' startup. `ensure_worm_bucket`
+deliberately does not verify an *existing* bucket, because Object Lock is fixed at creation and cannot
+be repaired — which makes a pre-existing, correctly-named, non-WORM bucket the dangerous case: creation
+is skipped, writes may succeed, and every anchor in it is deletable with nothing in the data to reveal
+it. The probe refuses a bucket without Object Lock, and refuses one whose default retention is
+GOVERNANCE (bypassable by `s3:BypassGovernanceRetention` — exactly the insider being defended against).
+A bucket with no default rule passes, because `put_immutable` names COMPLIANCE on every write.
+
+It **fails closed in production** and, outside production, logs and gates `/startupz` so a degraded
+start is never silent — the same posture as the existing KMS and bucket-bootstrap checks, which keeps
+local development runnable without a WORM-capable MinIO.
 
 ## Consequences
 
