@@ -74,6 +74,7 @@ from sentinelai.platform.crypto.ledger import (
     ledger_timestamp,
     ledger_uuid,
 )
+from sentinelai.platform.crypto.tsa import load_trust_anchors
 from sentinelai.platform.crypto.verification import (
     LedgerEntryView,
     LedgerVerificationReport,
@@ -831,7 +832,12 @@ class EvidenceService:
             )
             for event in events
         ]
-        return await LedgerVerifier(self._signer).verify_chain(
+        return await LedgerVerifier(
+            self._signer,
+            # Wave 1.3c: needed to verify any RFC 3161 token an anchor carries. Empty when
+            # timestamping is unconfigured, which is the air-gapped case and all pre-1.3c history.
+            tsa_trust_anchors=load_trust_anchors(settings.tsa_trust_anchors_pem),
+        ).verify_chain(
             ledger=LEDGER_CUSTODY,
             entries=entries,
             # Custody anchors live in `platform.ledger_anchors` like the audit ledger's — one table

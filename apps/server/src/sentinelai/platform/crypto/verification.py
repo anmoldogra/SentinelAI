@@ -47,9 +47,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Final
 from uuid import UUID
+
+from cryptography import x509
 
 from sentinelai.platform.crypto.anchoring import verify_batch_against_anchor
 from sentinelai.platform.crypto.canonical import CanonicalizationError
@@ -59,6 +62,11 @@ from sentinelai.platform.crypto.ledger import (
     LedgerPreimageError,
     LedgerSigner,
     compute_entry_hash,
+)
+from sentinelai.platform.crypto.tsa import (
+    TsaError,
+    VerifiedTimestamp,
+    verify_timestamp_token,
 )
 
 # The all-zero sentinel every chain starts from (CEM §4). Stored literally on the genesis entry and
@@ -99,6 +107,9 @@ class Finding(StrEnum):
     ANCHOR_ROOT_MISMATCH = "anchor_root_mismatch"
     ANCHOR_RANGE_MISSING = "anchor_range_missing"
     ANCHOR_ENTRY_COUNT_MISMATCH = "anchor_entry_count_mismatch"
+    # A token was presented and does not verify. A FAILURE, never a partial: a forged timestamp is
+    # an active attempt to misdate evidence, and downgrading it to "no timestamp" would reward it.
+    TSA_TOKEN_INVALID = "tsa_token_invalid"
 
     # --- partials: nothing is wrong, but nothing is proven either ---------------------------
     UNSIGNED_LEGACY_ROW = "unsigned_legacy_row"
@@ -175,6 +186,9 @@ class AnchorView:
     entry_count: int
     signature_envelope: bytes | None
     worm_object_ref: str
+    # RFC 3161 token over ``merkle_root`` (Wave 1.3c). ``None`` for an anchor cut with timestamping
+    # disabled, which every anchor written before 1.3c also is.
+    tsa_token: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +211,18 @@ class AnchorFinding:
     covered_entries: int
     worm_object_ref: str
     findings: tuple[Finding, ...] = ()
+    # Whether a third party attests to WHEN this anchor was made, and what it attested to.
+    #
+    # An untimestamped anchor deliberately produces NO finding and does not change ``state``. It is
+    # a weaker true statement, not a defect: WORM already makes the anchor undeletable, so
+    # non-truncation holds regardless. Degrading every such anchor to ``partial`` would flip every
+    # ledger written before Wave 1.3c - and every air-gapped deployment, permanently - from
+    # ``verified`` to ``partial``, draining the meaning out of the one state that is supposed to say
+    # "something here cannot be proven". The absence is reported as a property to read, not an alarm
+    # to silence.
+    timestamped: bool = False
+    tsa_gen_time: datetime | None = None
+    tsa_signer: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +243,9 @@ class LedgerVerificationReport:
     entries: tuple[EntryFinding, ...] = ()
     anchors: tuple[AnchorFinding, ...] = ()
     unanchored_entries: int = 0
+    # Anchors carrying no RFC 3161 token. Not a failure (see ``AnchorFinding.timestamped``), but the
+    # number a reader needs to know how much of this history is proof against backdating.
+    untimestamped_anchors: int = 0
     findings: tuple[Finding, ...] = field(default=())
 
     @property
@@ -233,8 +262,16 @@ class LedgerVerifier:
     worker.
     """
 
-    def __init__(self, signer: LedgerSigner) -> None:
+    def __init__(
+        self, signer: LedgerSigner, *, tsa_trust_anchors: Sequence[x509.Certificate] = ()
+    ) -> None:
         self._signer = signer
+        # Empty is the normal state for an air-gapped deployment and for any history predating Wave
+        # 1.3c. A token present *with* an empty trust store is the one case that must not pass
+        # quietly - `verify_timestamp_token` refuses it, and that surfaces as TSA_TOKEN_INVALID
+        # rather than as a silent skip, because "we cannot check this token" is not "this token is
+        # fine".
+        self._tsa_trust_anchors = list(tsa_trust_anchors)
 
     async def verify_chain(
         self,
@@ -301,6 +338,7 @@ class LedgerVerifier:
             entries=tuple(per_entry),
             anchors=tuple(anchor_findings),
             unanchored_entries=unanchored,
+            untimestamped_anchors=sum(1 for a in anchor_findings if not a.timestamped),
             findings=tuple(sorted({f for e in per_entry for f in e.findings})),
         )
 
@@ -438,6 +476,21 @@ class LedgerVerifier:
             ):
                 findings.append(Finding.ANCHOR_SIGNATURE_INVALID)
 
+            # RFC 3161 (Wave 1.3c): verify the token against the root it claims to cover. The
+            # nonce is deliberately not checked here - it is not persisted with the anchor, and was
+            # checked once at issue time. Re-verifying an archived token years later is the primary
+            # use of this path.
+            timestamp: VerifiedTimestamp | None = None
+            if anchor.tsa_token is not None:
+                try:
+                    timestamp = verify_timestamp_token(
+                        anchor.tsa_token,
+                        message=anchor.merkle_root.encode("ascii"),
+                        trust_anchors=self._tsa_trust_anchors,
+                    )
+                except TsaError:
+                    findings.append(Finding.TSA_TOKEN_INVALID)
+
             results.append(
                 AnchorFinding(
                     anchor_id=anchor.anchor_id,
@@ -446,6 +499,9 @@ class LedgerVerifier:
                     covered_entries=len(covered),
                     worm_object_ref=anchor.worm_object_ref,
                     findings=tuple(findings),
+                    timestamped=timestamp is not None,
+                    tsa_gen_time=timestamp.gen_time if timestamp else None,
+                    tsa_signer=timestamp.signer_subject if timestamp else None,
                 )
             )
         return results

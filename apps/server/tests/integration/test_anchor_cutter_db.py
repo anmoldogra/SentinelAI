@@ -18,6 +18,7 @@ Skips cleanly when no Postgres is reachable. Never fakes a pass.
 
 from __future__ import annotations
 
+import base64
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -43,10 +44,13 @@ from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.ledger_verification import (
     AuditLedgerVerificationService,
     read_anchor_views,
+    read_audit_chain_hashes,
 )
 from sentinelai.platform.auth.models import AuditLog, LedgerAnchor
 from sentinelai.platform.config import settings
+from sentinelai.platform.crypto.anchoring import AnchorBatch, LedgerAnchorService
 from sentinelai.platform.crypto.ledger import LEDGER_AUDIT, LEDGER_CUSTODY, LedgerSigner
+from sentinelai.platform.crypto.tsa import VerifiedTimestamp, verify_timestamp_token
 from sentinelai.platform.crypto.verification import (
     AnchorView,
     Finding,
@@ -54,6 +58,7 @@ from sentinelai.platform.crypto.verification import (
 )
 from sentinelai.platform.db.base import Base
 from tests.fixtures.fake_object_storage import FakeObjectStorage
+from tests.fixtures.fake_tsa import FakeTsa
 from tests.fixtures.kms import kms_for_tests
 
 _URL = os.getenv("TEST_DATABASE_URL", settings.database_url)
@@ -412,3 +417,155 @@ def test_an_unresolvable_anchor_endpoint_refuses_the_cut_entirely() -> None:
 def test_a_batch_is_capped_so_one_run_cannot_anchor_everything_forever() -> None:
     chain = [f"h{i}" for i in range(MAX_ENTRIES_PER_ANCHOR + 50)]
     assert len(_unanchored_tail(chain, [])) == MAX_ENTRIES_PER_ANCHOR
+
+
+# ---------------------------------------------------------------------------------------
+# RFC 3161 through the database — ADR-0003 §3, Wave 1.3c.
+#
+# The unit tests prove the token verifier and the anchor-service integration. What only a real
+# database can prove is that the token survives `tsa_token_ref` — a `Text` column holding base64 of
+# binary DER — and comes back byte-identical. A base64 slip there would produce anchors whose
+# timestamps fail verification for a reason that has nothing to do with the timestamp.
+# ---------------------------------------------------------------------------------------
+
+
+class _DbFakeAuthority:
+    """A ``TimestampAuthority`` over the in-process TSA, for the cutter's context."""
+
+    def __init__(self, tsa: FakeTsa) -> None:
+        self._tsa = tsa
+
+    async def timestamp(self, message: bytes) -> tuple[bytes, VerifiedTimestamp]:
+        return self._tsa.token_for(message), VerifiedTimestamp(
+            gen_time=datetime.now(UTC),
+            serial_number=7,
+            hash_algo="sha256",
+            signer_subject="CN=SentinelAI Test TSA",
+            policy=None,
+        )
+
+
+async def _cut_with_tsa(
+    sessions: async_sessionmaker[AsyncSession], storage: FakeObjectStorage, tsa: FakeTsa
+) -> None:
+    """Run one cut with timestamping wired in, bypassing `build_timestamp_authority`.
+
+    The factory builds an HTTP client, and a test that exercised it would need a listening socket.
+    What matters here is the persistence path, so the authority is injected directly.
+    """
+    service = LedgerAnchorService(
+        kms_for_tests(),
+        storage,
+        bucket=settings.storage_anchor_bucket,
+        timestamp_authority=_DbFakeAuthority(tsa),
+    )
+    async with sessions() as session:
+        chain = await read_audit_chain_hashes(session)
+        anchor = await service.publish(AnchorBatch(ledger=LEDGER_AUDIT, entry_hashes=tuple(chain)))
+        session.add(
+            LedgerAnchor(
+                anchor_id=anchor.anchor_id,
+                ledger=anchor.ledger,
+                merkle_root=anchor.merkle_root,
+                merkle_hash_algo=anchor.merkle_hash_algo,
+                first_entry_hash=anchor.first_entry_hash,
+                last_entry_hash=anchor.last_entry_hash,
+                entry_count=anchor.entry_count,
+                created_at=anchor.created_at,
+                signature=anchor.signature.envelope,
+                sig_alg=anchor.signature.sig_alg,
+                key_id=anchor.signature.key_id,
+                worm_object_ref=anchor.worm_object_ref,
+                tsa_token_ref=(
+                    base64.b64encode(anchor.tsa_token).decode("ascii")
+                    if anchor.tsa_token is not None
+                    else None
+                ),
+            )
+        )
+        await session.commit()
+
+
+async def test_a_timestamped_anchor_round_trips_through_the_database_and_verifies(
+    sessions: async_sessionmaker[AsyncSession], storage: FakeObjectStorage
+) -> None:
+    """The persisted path: token in, base64 through a Text column, token out, verified."""
+    await _write_audit_entries(sessions, 4)
+    tsa = FakeTsa()
+    await _cut_with_tsa(sessions, storage, tsa)
+
+    async with sessions() as session:
+        stored = (await session.execute(select(LedgerAnchor))).scalars().one()
+        assert stored.tsa_token_ref, "the token must be persisted, not dropped"
+
+        report = await AuditLedgerVerificationService(
+            session, LedgerSigner(kms_for_tests()), tsa_trust_anchors=tsa.trust_anchors
+        ).verify()
+
+    assert report.state is VerificationState.VERIFIED
+    assert report.anchors[0].timestamped is True
+    assert report.anchors[0].tsa_gen_time is not None
+    assert report.untimestamped_anchors == 0
+
+
+async def test_the_persisted_token_is_byte_identical_to_what_was_issued(
+    sessions: async_sessionmaker[AsyncSession], storage: FakeObjectStorage
+) -> None:
+    """Base64 in a Text column is the only lossy-looking step in the chain; pin it."""
+    await _write_audit_entries(sessions, 2)
+    tsa = FakeTsa()
+    await _cut_with_tsa(sessions, storage, tsa)
+
+    async with sessions() as session:
+        stored = (await session.execute(select(LedgerAnchor))).scalars().one()
+        anchors = await read_anchor_views(session, LEDGER_AUDIT)
+
+    assert anchors[0].tsa_token == base64.b64decode(stored.tsa_token_ref or "")
+    # And it still verifies against the root, straight out of the database.
+    verified = verify_timestamp_token(
+        anchors[0].tsa_token or b"",
+        message=anchors[0].merkle_root.encode("ascii"),
+        trust_anchors=tsa.trust_anchors,
+    )
+    assert verified.signer_subject == "CN=SentinelAI Test TSA"
+
+
+async def test_an_anchor_cut_without_a_tsa_persists_a_null_token(
+    sessions: async_sessionmaker[AsyncSession], storage: FakeObjectStorage
+) -> None:
+    """The air-gapped path through the real cutter: NULL, and the ledger still verifies.
+
+    NULL must be distinguishable from a stored-but-broken token — the verifier reports the first as
+    untimestamped and the second as failed, and conflating them would hide a forgery.
+    """
+    await _write_audit_entries(sessions, 3)
+
+    await cut_anchor_batches(_ctx(sessions, storage), watermark_minutes=0)
+
+    async with sessions() as session:
+        stored = (await session.execute(select(LedgerAnchor))).scalars().one()
+        assert stored.tsa_token_ref is None
+        report = await AuditLedgerVerificationService(
+            session, LedgerSigner(kms_for_tests())
+        ).verify()
+
+    assert report.state is VerificationState.VERIFIED
+    assert report.anchors[0].timestamped is False
+    assert report.untimestamped_anchors == 1
+
+
+async def test_a_persisted_token_from_an_untrusted_tsa_fails_verification(
+    sessions: async_sessionmaker[AsyncSession], storage: FakeObjectStorage
+) -> None:
+    """A stored token verified against the wrong roots must fail, not be silently skipped."""
+    await _write_audit_entries(sessions, 3)
+    issuer = FakeTsa()
+    await _cut_with_tsa(sessions, storage, issuer)
+
+    async with sessions() as session:
+        report = await AuditLedgerVerificationService(
+            session, LedgerSigner(kms_for_tests()), tsa_trust_anchors=FakeTsa().trust_anchors
+        ).verify()
+
+    assert report.state is VerificationState.FAILED
+    assert Finding.TSA_TOKEN_INVALID in report.anchors[0].findings

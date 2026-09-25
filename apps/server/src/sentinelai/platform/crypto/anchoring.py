@@ -37,6 +37,12 @@ from sentinelai.platform.crypto.canonical import canonicalize
 from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.crypto.ledger import LedgerSignature, LedgerSigner
 from sentinelai.platform.crypto.merkle import MERKLE_HASH_ALGO, build_tree
+from sentinelai.platform.crypto.tsa import (
+    TimestampAuthority,
+    TsaError,
+    VerifiedTimestamp,
+)
+from sentinelai.platform.logging import log
 from sentinelai.platform.storage.port import ObjectStorage
 
 # Envelope version for the published anchor document. Independent of the ledger signature
@@ -81,6 +87,17 @@ class PublishedAnchor:
     created_at: datetime
     signature: LedgerSignature
     worm_object_ref: str
+    # RFC 3161 token over `merkle_root` (Wave 1.3c). ``None`` when timestamping is disabled, which
+    # is the air-gapped default and a legitimate state: the anchor still proves non-truncation via
+    # WORM, it just carries no third-party proof of *when* it was made.
+    tsa_token: bytes | None = None
+    tsa_gen_time: datetime | None = None
+    tsa_serial_number: int | None = None
+    tsa_signer: str | None = None
+
+    @property
+    def is_timestamped(self) -> bool:
+        return self.tsa_token is not None
 
 
 def anchor_object_key(ledger: str, anchor_id: UUID, created_at: datetime) -> str:
@@ -113,6 +130,25 @@ def anchor_document(anchor: PublishedAnchor) -> bytes:
             "signature": base64.b64encode(anchor.signature.envelope).decode(),
             "sig_alg": anchor.signature.sig_alg,
             "key_id": anchor.signature.key_id,
+            # The RFC 3161 token travels INSIDE the WORM document, not only in the database row.
+            # The whole point of the document standing alone is that an auditor holding the object
+            # and the public keys can verify it without the database - and "when was this
+            # committed" is exactly the question they most need answered without trusting us.
+            # Omitted entirely rather than written as null when absent, so the document's shape
+            # says plainly whether a timestamp was ever obtained.
+            **(
+                {
+                    "tsa_token": base64.b64encode(anchor.tsa_token).decode(),
+                    "tsa_gen_time": (
+                        anchor.tsa_gen_time.astimezone(UTC).isoformat().replace("+00:00", "Z")
+                        if anchor.tsa_gen_time
+                        else None
+                    ),
+                    "tsa_serial_number": anchor.tsa_serial_number,
+                }
+                if anchor.tsa_token is not None
+                else {}
+            ),
         }
     )
 
@@ -132,11 +168,16 @@ class LedgerAnchorService:
         *,
         bucket: str,
         retention_years: int = DEFAULT_RETENTION_YEARS,
+        timestamp_authority: TimestampAuthority | None = None,
     ) -> None:
         self._signer = LedgerSigner(kms)
         self._storage = storage
         self._bucket = bucket
         self._retention_years = retention_years
+        # ``None`` is the air-gapped configuration and is expressed by absence rather than by a
+        # flag,
+        # so there is no `if enabled` branch inside the publish path to get wrong.
+        self._tsa = timestamp_authority
 
     async def publish(self, batch: AnchorBatch, *, now: datetime | None = None) -> PublishedAnchor:
         """Build the root, sign it, and write it to WORM. Returns what to record.
@@ -168,6 +209,30 @@ class LedgerAnchorService:
             prev_hash=first,
             entry_hash=tree.root,
         )
+        # RFC 3161 (Wave 1.3c). Timestamped over the Merkle root's own bytes - the same value the
+        # anchor signature covers - so the token attests to exactly what the anchor commits to, and
+        # an auditor needs no extra context to know what was timestamped.
+        #
+        # **Fails OPEN, and only here.** Every other failure in this method aborts the anchor: an
+        # unsigned anchor or an unpublished WORM object would be a lie. An untimestamped anchor is
+        # not a lie, it is a weaker true statement - it still proves non-truncation, which is the
+        # attack WORM exists to stop. Aborting the cut because a third party was unreachable would
+        # mean an outage at someone else's TSA stops this platform committing to its own evidence,
+        # trading the guarantee we control for the one we do not. The absence is recorded, never
+        # inferred: `tsa_token` stays None and the verifier reports the anchor as untimestamped.
+        tsa_token: bytes | None = None
+        verified: VerifiedTimestamp | None = None
+        if self._tsa is not None:
+            try:
+                tsa_token, verified = await self._tsa.timestamp(tree.root.encode("ascii"))
+            except TsaError as exc:
+                log.warning(
+                    "anchor_timestamp_unavailable",
+                    ledger=batch.ledger,
+                    error=type(exc).__name__,
+                    detail=str(exc),
+                )
+
         anchor = PublishedAnchor(
             anchor_id=anchor_id,
             ledger=batch.ledger,
@@ -179,6 +244,10 @@ class LedgerAnchorService:
             created_at=created_at,
             signature=signature,
             worm_object_ref=anchor_object_key(batch.ledger, anchor_id, created_at),
+            tsa_token=tsa_token,
+            tsa_gen_time=verified.gen_time if verified else None,
+            tsa_serial_number=verified.serial_number if verified else None,
+            tsa_signer=verified.signer_subject if verified else None,
         )
         try:
             await self._storage.put_immutable(

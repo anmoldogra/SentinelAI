@@ -33,6 +33,7 @@ about, so it wins the KMS round-trip if the run is killed midway.
 
 from __future__ import annotations
 
+import base64
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
@@ -58,6 +59,7 @@ from sentinelai.platform.crypto.metrics import (
     LEDGER_ANCHORED_ENTRIES,
     LEDGER_ANCHORS_CUT,
 )
+from sentinelai.platform.crypto.tsa import build_timestamp_authority
 from sentinelai.platform.crypto.verification import AnchorView
 from sentinelai.platform.db.session import async_session_factory
 from sentinelai.platform.logging import log
@@ -129,9 +131,14 @@ def _anchor_row(anchor: PublishedAnchor) -> LedgerAnchor:
         sig_alg=anchor.signature.sig_alg,
         key_id=anchor.signature.key_id,
         worm_object_ref=anchor.worm_object_ref,
-        # Reserved until the RFC-3161 client lands (ADR-0003 §3, Wave 1.3c). Explicitly null
-        # rather than omitted, so a verifier meeting this row knows it was never populated.
-        tsa_token_ref=None,
+        # RFC 3161 token (Wave 1.3c), base64 of the DER because the column is `Text`. Explicitly
+        # null when timestamping is disabled, so a verifier meeting this row can tell "no token was
+        # ever obtained" from "a token was obtained and is wrong" — different findings entirely.
+        tsa_token_ref=(
+            base64.b64encode(anchor.tsa_token).decode("ascii")
+            if anchor.tsa_token is not None
+            else None
+        ),
     )
 
 
@@ -162,6 +169,16 @@ async def cut_anchor_batches(
         storage,
         bucket=settings.storage_anchor_bucket,
         retention_years=settings.storage_anchor_retention_years,
+        # None when TSA_ENABLED is false, which is the air-gapped configuration. The anchor cut
+        # proceeds either way — timestamping is additive proof of *when*, and its absence does not
+        # weaken the non-truncation guarantee WORM provides (ADR-0003 §3, Wave 1.3c).
+        timestamp_authority=build_timestamp_authority(
+            enabled=settings.tsa_enabled,
+            url=settings.tsa_url,
+            trust_anchors_pem=settings.tsa_trust_anchors_pem,
+            hash_algo=settings.tsa_hash_algorithm,
+            timeout_seconds=settings.tsa_timeout_seconds,
+        ),
     )
     watermark = datetime.now(UTC) - timedelta(minutes=watermark_minutes)
     cut = 0

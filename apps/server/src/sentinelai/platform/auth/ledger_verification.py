@@ -30,10 +30,12 @@ That split is the whole reason ``verify_chain`` takes ``chain_entry_hashes`` sep
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Final
 
+from cryptography import x509
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -81,6 +83,12 @@ async def read_anchor_views(session: AsyncSession, ledger: str) -> list[AnchorVi
             entry_count=row.entry_count,
             signature_envelope=row.signature,
             worm_object_ref=row.worm_object_ref,
+            # Wave 1.3c. The column holds the base64 of the DER token, not a pointer to it: the
+            # token is a few hundred bytes, and a reference to something stored elsewhere would be
+            # one more thing that can go missing between an anchor and its proof of time. Base64
+            # because the column is `Text` (ADR-0003 §5) and changing an evidentiary table's column
+            # type is a migration this does not need.
+            tsa_token=base64.b64decode(row.tsa_token_ref) if row.tsa_token_ref else None,
         )
         for row in rows
     ]
@@ -183,9 +191,18 @@ class AuditLedgerVerificationService:
     judging.
     """
 
-    def __init__(self, session: AsyncSession, signer: LedgerSigner) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        signer: LedgerSigner,
+        *,
+        tsa_trust_anchors: Sequence[x509.Certificate] = (),
+    ) -> None:
         self._session = session
-        self._verifier = LedgerVerifier(signer)
+        # Empty by default: a deployment with no TSA configured has no anchors, and every anchor cut
+        # before Wave 1.3c carries no token either. A token present with an empty store is refused
+        # by the engine rather than skipped — see `LedgerVerifier.__init__`.
+        self._verifier = LedgerVerifier(signer, tsa_trust_anchors=tsa_trust_anchors)
 
     async def verify(
         self, *, entry_window: int = DEFAULT_AUDIT_ENTRY_WINDOW

@@ -43,6 +43,7 @@ from sentinelai.platform.auth.ledger_verification import (
     AuditLedgerVerificationService,
     summarize_findings,
 )
+from sentinelai.platform.config import settings as default_settings
 from sentinelai.platform.crypto.ledger import LEDGER_CUSTODY, LedgerSigner
 from sentinelai.platform.crypto.metrics import (
     LEDGER_UNANCHORED_ENTRIES,
@@ -51,6 +52,7 @@ from sentinelai.platform.crypto.metrics import (
     LEDGER_VERIFICATION_STATE,
     LEDGER_VERIFICATIONS,
 )
+from sentinelai.platform.crypto.tsa import load_trust_anchors
 from sentinelai.platform.crypto.verification import (
     LedgerVerificationReport,
     VerificationState,
@@ -131,12 +133,15 @@ async def reverify_evidentiary_ledgers(
     kms = ctx["kms"]
     signer = LedgerSigner(kms)
     storage = ctx.get("object_storage") or build_object_storage()
+    settings = ctx.get("settings") or default_settings
 
     failed_ledgers = 0
     async with session_factory() as session:
         # --- the audit ledger: windowed entries, anchors over the whole chain ---
         started = time.monotonic()
-        audit_report = await AuditLedgerVerificationService(session, signer).verify()
+        audit_report = await AuditLedgerVerificationService(
+            session, signer, tsa_trust_anchors=load_trust_anchors(settings.tsa_trust_anchors_pem)
+        ).verify()
         _record(audit_report, elapsed=time.monotonic() - started)
         failed_ledgers += int(audit_report.is_failed)
 

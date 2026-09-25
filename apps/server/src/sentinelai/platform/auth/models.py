@@ -278,8 +278,14 @@ class LedgerAnchor(Base):
     # Where the anchor was published, outside this database. This is what makes the commitment
     # survive a database an attacker controls.
     worm_object_ref: Mapped[str] = mapped_column(Text, nullable=False)
-    # RFC-3161 token reference — null until the TSA client lands. See the class docstring for
-    # what its absence costs.
+    # RFC 3161 timestamp token over `merkle_root`, base64-encoded (Wave 1.3c). Despite the `_ref`
+    # name it holds the token itself: it is a few hundred bytes, and a pointer to a token stored
+    # elsewhere would be one more thing that can go missing between an anchor and its proof of time.
+    # The same token is also written into the WORM anchor document, so it survives the database.
+    #
+    # NULL means no token was ever obtained — timestamping disabled (the air-gapped default), or an
+    # anchor cut before Wave 1.3c. A verifier must report that as *untimestamped*, which is a weaker
+    # true statement, and never confuse it with a token that fails to verify.
     tsa_token_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

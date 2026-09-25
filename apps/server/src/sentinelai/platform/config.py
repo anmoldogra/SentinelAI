@@ -101,6 +101,20 @@ class Settings(BaseSettings):
     # commits to stops proving anything at exactly the moment a long-running case needs it.
     storage_anchor_retention_years: int = 10
 
+    # --- RFC 3161 trusted timestamping (ADR-0003 §3, Wave 1.3c) ---
+    # OFF by default, and that default is deliberate rather than lazy: enabling it opens an outbound
+    # HTTP path from the worker to a third party, which is a decision a deployment must make
+    # explicitly. With it off, anchors are still cut, still signed, still WORM-published — they just
+    # do not carry third-party proof of *when*, which is exactly the residual ADR-0003 documents.
+    tsa_enabled: bool = False
+    tsa_url: str = ""
+    tsa_timeout_seconds: float = 10.0
+    tsa_hash_algorithm: str = "sha256"
+    # PEM bundle of trust anchors for verifying timestamp tokens. Without at least one, a token
+    # cannot be verified at all — `verify_timestamp_token` refuses an empty trust store rather than
+    # passing everything, because a token checked against nothing attests to nothing.
+    tsa_trust_anchors_pem: str = ""
+
     # --- notification delivery (security-architecture §25) ---
     # log (Phase 1: the in-app notification row is the durable delivery) | smtp | slack, later.
     notification_sender_provider: str = "log"
@@ -176,10 +190,39 @@ class Settings(BaseSettings):
         testing are permissive; production-grade profiles fail closed. Error messages name the
         offending field only — never the secret value.
         """
+        # The zero-egress invariant is checked FIRST and for every profile, including development.
+        # `deployment-architecture.md`'s rule 6 ("air-gapped deployments must have zero configured
+        # or
+        # observed egress paths — verify, don't assume") is not a production-only concern: a
+        # developer running the air-gapped profile locally is usually doing so precisely to prove
+        # the
+        # absence of egress, and a TSA URL silently ignored in that run would make the exercise
+        # worthless. So this fails closed everywhere the profile claims to be air-gapped.
+        if self.is_air_gapped and self.tsa_enabled:
+            raise ConfigurationError(
+                f"invalid configuration for profile '{self.app_env}': TSA_ENABLED is true, but an "
+                "air-gapped deployment must have no configured egress path. RFC 3161 timestamping "
+                "requires reaching a third-party authority; disable it (TSA_ENABLED=false) and "
+                "rely on WORM anchoring, which needs no network beyond the object store "
+                "(ADR-0003 §3)."
+            )
+
         if not self.is_production:
             return
 
         problems: list[str] = []
+
+        # Enabled-but-unconfigured is a silent no-op: the anchor cutter would try to timestamp,
+        # fail,
+        # and degrade to untimestamped anchors on every cut while the config claims otherwise.
+        if self.tsa_enabled:
+            if not self.tsa_url.strip():
+                problems.append("TSA_URL must be set when TSA_ENABLED is true")
+            if not self.tsa_trust_anchors_pem.strip():
+                problems.append(
+                    "TSA_TRUST_ANCHORS_PEM must be set when TSA_ENABLED is true — a token verified "
+                    "against an empty trust store attests to nothing"
+                )
 
         if self.kms_provider == "dev":
             problems.append("KMS_PROVIDER must not be 'dev' in a production-grade profile")

@@ -1776,3 +1776,127 @@ column on `ledger_anchors` and is its own increment.
 **Still open in Wave 1:** RFC-3161 timestamping (1.3c), which closes backdating only. `tsa_token_ref`
 remains explicitly null. And the audit ledger still has no monotonic sequence column, so a clock
 inversion wider than the watermark could surface as an anchor mismatch on an intact ledger.
+
+---
+
+## 2026-09-25 — IC-032: RFC 3161 timestamping (Wave 1.3c, ADR-0003 §3) — Wave 1 complete
+
+**Type:** Evidentiary-core capability, the last item in Wave 1. One new dependency, one new platform
+module, integration into the anchor cut and the Verification Engine. No schema change, no migration.
+
+### What this closes
+
+WORM made an anchor *undeletable*, so truncation is detectable. It said nothing about *when* the
+anchor was made. An attacker holding both the application and the clock could doctor history, publish
+a fresh anchor over it, and claim it was old. They could never replace an anchor already in WORM — so
+this was a narrow residual rather than the hole truncation was — but it was the last one.
+
+A timestamp token closes it because the attesting signature is made by someone else, over our digest,
+at a time we do not control.
+
+### The dependency, and why the choice was not obvious
+
+`cryptography` was already a dependency and cannot do this: its `pkcs7` module signs, decrypts and
+loads certificates, but exposes **no CMS verification entry point**, and has no TSP support at all. I
+checked before adding anything, because if it could, hand-assembling verification would have been the
+wrong call.
+
+Chose `asn1crypto`, used **only as a DER codec**. Pure Python, no build toolchain, so it installs
+identically into an air-gapped mirror; ships complete `tsp` and `cms` definitions; it is the ASN.1
+layer beneath `oscrypto`/`certvalidator`. Rejected `rfc3161ng` (pulls `pyopenssl`, thinly maintained
+for an evidentiary path) and `pyasn1` plus hand-written schemas (hand-writing ASN.1 for a security
+boundary is the "lighter version of a security control" the security doc warns about). Every signature
+check and certificate parse stays in `cryptography`. Recorded as an ADR-0003 amendment per CLAUDE.md.
+
+One asn1crypto quirk cost real debugging and is now documented: `TimeStampResp` declares
+`timeStampToken` **required**, while RFC 3161 §2.4.2 makes it OPTIONAL. A real rejection carries
+status only, so parsing one through asn1crypto's class raises — and the only useful diagnostic, *why*
+the TSA refused, surfaced as "malformed response". A test caught it. `tsa.py` defines a lenient
+structure for that case.
+
+### Verification is the whole module
+
+Obtaining a token is an HTTP POST. An unverified token proves nothing — it is bytes a hostile server
+or proxy can return at will. So `verify_timestamp_token` checks: response status; CMS `signed_data`
+wrapping `tst_info` with content present (not detached); the timestamped digest is *our* digest under
+the algorithm the token names; the nonce matches; exactly one `SignerInfo`; the `content-type` and
+`message-digest` signed attributes bind the signature to *this* TSTInfo; the signature over the DER
+`SignedAttrs` verifies; the signer's EKU is `id-kp-timeStamping` and **nothing else**, marked critical
+(RFC 3161 §2.3); the certificate was valid at `genTime`; and it chains to a configured trust anchor.
+SHA-1 imprints are refused outright — a timestamp over a collidable digest attests to nothing even
+when the token itself verifies.
+
+Two subtleties that a naive implementation gets wrong, both now pinned by tests. The signature covers
+the DER **SET OF** `SignedAttrs`, not the implicit `[0]` tagging it carries inside `SignerInfo` —
+`untag()` is what produces the bytes that were actually signed, and signing the tagged form fails
+against every real TSA. And `ParsableOctetString.native` **auto-parses** the encapsulated content into
+a dict; the message-digest attribute covers `.contents`, the raw DER. Using `.native` there would
+digest the wrong bytes — which is how you get a verifier that accepts everything.
+
+### Limits, stated rather than implied
+
+**No revocation checking.** No CRL, no OCSP. Both need network calls an air-gapped deployment cannot
+make and that would turn verification of *archived* evidence into a live-connectivity problem. A token
+signed by a certificate revoked after issue still verifies here. The mitigation is operational: the
+trust anchor set is the deployment's control surface. Path building is bounded the same way — direct
+to an anchor, or through at most the intermediates the token carried.
+
+**Air-gapped deployments keep the backdating residual by design.** Timestamping is off by default, and
+an air-gapped or classified profile with `TSA_ENABLED=true` **fails to start**. That check runs for
+*every* profile, not just production: a developer running the air-gapped profile is usually doing so
+to prove the absence of egress, and a silently-ignored TSA URL would make the exercise worthless. RFC
+3161 requires reaching a third party; an air-gapped deployment must have no path to one. Those
+deployments keep exactly the description this ADR gave every deployment before today.
+
+### Two decisions about failure
+
+**Timestamping fails OPEN — the only thing in `publish` that does.** An unsigned anchor or an
+unwritten WORM object is a lie, so both abort. An untimestamped anchor is a weaker *true* statement.
+Aborting because someone else's TSA is down would let a third party's outage stop this platform
+committing to its own evidence.
+
+**A missing token is not a finding; an invalid one is a failure.** Every pre-1.3c anchor and every
+air-gapped anchor carries no token, so degrading those to `partial` would flip correct ledgers to a
+hedged verdict permanently and drain the meaning from the one state that means "this cannot be
+proven". Reported as `AnchorFinding.timestamped` plus a report-level `untimestamped_anchors` count. A
+token that is present and does not verify is `tsa_token_invalid`, a hard failure — downgrading a
+forgery to "no timestamp" would mean an attacker could attach junk and lose nothing. A token present
+with an *empty* trust store also fails: "we cannot check this" is not "this is fine".
+
+### Tests
+
+**38 new** (24 TSA lifecycle/verification, 8 HTTP transport, 11 anchor integration, 4 persisted-DB —
+overlapping counts across files). `tests/fixtures/fake_tsa.py` mints **real** CMS `SignedData` with a
+real certificate chain and real RSA signatures; a stub returning canned bytes would have made every
+rejection assertion vacuous. Each fault is injected individually — wrong digest, replayed nonce,
+missing EKU, non-critical EKU, extra EKU, expired certificate, absent certificates, corrupted
+signature, untrusted chain, empty trust store, garbage DER, rejection response — because verifying a
+good token proves almost nothing on its own.
+
+The HTTP client is driven through `httpx.MockTransport`, not a socket: a test reaching a public TSA
+would be slow, flaky, and a genuine egress path in a build whose point is that air-gapped works.
+
+One helper had to be deleted rather than fixed, for the same reason as IC-031's: backdating
+`occurred_at` to move entries behind the anchor watermark changes the audit preimage and breaks every
+`entry_hash`, so the test would have been measuring its own corruption.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (198 files), import-linter (2/2 kept), full suite **990 passed /
+2 skipped** (up from 952/1; the extra skip is the Vault contract test, whose container I removed after
+IC-031). Platform coverage **91.42%** against the 90% floor; `verification.py` 100%, `anchoring.py`
+99%, `tsa.py` 84% — the uncovered remainder in `tsa.py` is defensive branches for malformed ASN.1
+shapes the fake TSA cannot construct.
+
+### Wave 1 is complete
+
+Every item in `docs/modernization-roadmap.md` Wave 1 — the evidentiary gate — is now built, running,
+and verified: canonical encoding (1.1), complete signed preimages (1.2), server-computed integrity
+(1.5), chain-head serialization (1.3a), Merkle/WORM anchoring (1.3b), RFC 3161 timestamping (1.3c),
+and the Verification Engine with its scheduled re-verification (1.4). The next roadmap item is Wave
+2.1, the request-scoped transaction boundary (ADR-0005).
+
+**Standing gaps carried forward, unchanged by this increment:** no worker means no anchors (IC-031);
+verifying one custody chain reads the whole custody ledger's hash column (IC-031); the audit ledger
+has no monotonic sequence column, so a clock inversion wider than the cutter's watermark could surface
+as an anchor mismatch on an intact ledger.

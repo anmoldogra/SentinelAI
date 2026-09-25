@@ -45,11 +45,11 @@ acceptance:
 | §2 Complete preimage (all persisted fields) | 1.2 | **Built** — `platform/crypto/ledger.py`; both ledgers hash every persisted column under JCS and stamp `hash_algo`/`preimage_version`. Enforced by a table-driven test against the live schema |
 | §1 Authenticated entries (**signatures**) | 1.2 | **Built** — `LedgerSigner` signs every audit and custody write under `KeyPurpose.EVIDENCE_ROOT` (Ed25519 by policy); `signature`/`sig_alg`/`key_id` carry real values. Fails closed: a write that cannot be signed aborts its transaction |
 | §3 External anchoring — **Merkle + WORM** | 1.3 | **Built and running** — `platform/crypto/{merkle,anchoring}.py`, `platform.ledger_anchors`, COMPLIANCE-mode Object Lock. Anchors are **produced** by a 4-hourly cutter (`modules/ingestion/anchor_jobs.py`) and enforced at boot by a WORM readiness probe (`platform/storage/worm.py`). Truncation and rollback detected end to end, against a live database and a live MinIO Object Lock bucket |
-| §3 External anchoring — **RFC-3161 timestamp** | 1.3 | **NOT built** — `tsa_token_ref` is reserved and null. WORM makes an anchor undeletable (which defeats truncation); a TSA makes it undatable-forward (which defeats backdating). Needs an ASN.1/CMS dependency and its own ADR |
+| §3 External anchoring — **RFC-3161 timestamp** | 1.3c | **Built** — `platform/crypto/tsa.py`: DER `TimeStampReq`, full CMS `SignedData` verification (digest, nonce, signed attributes, signer signature, timestamping EKU, validity-at-genTime, chain to configured anchors). Tokens are requested over each Merkle root, persisted in `tsa_token_ref` and in the WORM document, and re-verified by the Verification Engine. Disabled by default; **refused outright in air-gapped/classified profiles** |
 | §6 Verification Engine — **online report** | 1.4 | **Built** — `platform/crypto/verification.py` (pure, three-layer, three-state) behind `GET /api/v1/evidence/{id}/verify`; api-design.md §5.1. Proven against real tampering on a live database in `test_verification_db.py` |
 | §6 Verification Engine — **scheduled re-verification** | 1.4 | **Built** — `modules/ingestion/integrity_jobs.py`, an hourly arq cron job over the audit ledger and the most recently active custody chains. Alarms via Prometheus metrics + a `CRITICAL` log line; **not** via the notification module (see the amendment below) |
 
-**Every part of this ADR is now built except §3's RFC-3161 timestamp.** As of Wave 1.4 the guarantees are not merely constructed but *checked*: an endpoint reports on any chain on demand, and a scheduled job re-verifies both ledgers and alarms on a break. What remains open is backdating (§3's TSA half), which WORM does not address.
+**Every part of this ADR is now built.** As of Wave 1.4 the guarantees are not merely constructed but *checked* — an endpoint reports on any chain on demand, and a scheduled job re-verifies both ledgers and alarms on a break. Wave 1.3c closes the last residual, backdating, with RFC 3161 timestamping. The one remaining limitation is deliberate and documented below: air-gapped deployments cannot reach a TSA at all, so they retain the backdating residual by design, and no deployment gets revocation checking.
 
 **Context §1's "unkeyed" half and Context §2 are now closed; "unanchored" is not.** A complete
 preimage binds every field of an entry to its hash, catching an attacker who edits one row and
@@ -241,6 +241,95 @@ A bucket with no default rule passes, because `put_immutable` names COMPLIANCE o
 It **fails closed in production** and, outside production, logs and gates `/startupz` so a degraded
 start is never silent — the same posture as the existing KMS and bucket-bootstrap checks, which keeps
 local development runnable without a WORM-capable MinIO.
+
+## Amendment (2026-09-25c) — RFC 3161 timestamping, and the `asn1crypto` dependency
+
+§3's second half is built. This records the dependency decision CLAUDE.md requires, and the two
+limitations that a reader must not have to discover from the code.
+
+### Dependency: `asn1crypto`, used only as a codec
+
+`cryptography` (already a dependency) cannot verify CMS `SignedData` — its `pkcs7` module signs,
+decrypts, and loads certificates, but exposes no verification entry point, and it has no TSP support
+at all. So a codec was needed. The candidates:
+
+| Option | Verdict |
+|---|---|
+| **`asn1crypto`** | **Chosen.** Pure Python, no build toolchain and no native extension, so it installs identically into an air-gapped mirror. Ships complete `tsp` (TimeStampReq/Resp, TSTInfo) and `cms` (ContentInfo/SignedData) definitions. Widely deployed as the ASN.1 layer beneath `oscrypto`/`certvalidator` |
+| `rfc3161ng` | Rejected. Higher-level and would have written less code, but it pulls `pyopenssl` (whose maintainers direct new work to `cryptography`) and is thinly maintained for something on an evidentiary path |
+| `pyasn1` + hand-written TSP/CMS schemas | Rejected. Hand-writing ASN.1 definitions for a security boundary is exactly the "lighter version of a security control" `security-architecture.md` warns against |
+| Hand-rolled DER | Rejected outright, for the same reason IC-029 deferred this work in the first place |
+
+**The split is the point:** `asn1crypto` parses and encodes DER and does nothing else. Every signature
+check and every certificate parse goes through `cryptography`. No signature verification is
+hand-rolled.
+
+One quirk worth recording because it produces a misleading error: `asn1crypto.tsp.TimeStampResp`
+declares `timeStampToken` **required**, while RFC 3161 §2.4.2 makes it OPTIONAL. A real rejection
+carries status only, so parsing one through asn1crypto's class raises — and the useful diagnostic
+(*why* the TSA refused) would surface as "malformed response", sending an operator to debug the wrong
+thing. `platform/crypto/tsa.py` defines a lenient structure for exactly this.
+
+### What the verifier checks
+
+Response status; CMS content type is `signed_data` wrapping `tst_info` with content present (not
+detached); the timestamped digest is *our* digest under the algorithm the token names; the nonce
+matches what was sent; exactly one `SignerInfo`; the `content-type` and `message-digest` signed
+attributes bind the signature to *this* TSTInfo; the signature over the DER `SignedAttrs` verifies;
+the signer certificate carries `id-kp-timeStamping` as its **only** EKU, marked critical (§2.3); the
+certificate was valid at `genTime`; and it chains to a configured trust anchor. SHA-1 imprints are
+refused — a timestamp over a collidable digest attests to nothing even when the token verifies.
+
+### Limitation 1: no revocation checking
+
+No CRL fetch, no OCSP. Both require network calls that an air-gapped deployment cannot make and that
+would turn verification of *archived* evidence into a live-connectivity problem. The consequence is
+real: a token signed by a certificate revoked after issue still verifies. The mitigation is
+operational — the trust anchor set is the deployment's control surface, so a TSA that should no
+longer be trusted is removed from configuration — and every anchor still carries the WORM and Merkle
+guarantees, which do not depend on the TSA at all. Path building is likewise bounded: the signer is
+verified against the trust anchors directly, or through at most the intermediates the token carried.
+
+### Limitation 2: air-gapped deployments keep the backdating residual, by design
+
+Timestamping is **off by default**, and an air-gapped or classified profile that sets
+`TSA_ENABLED=true` **fails to start** — checked for every profile, not only production, because a
+developer running the air-gapped profile is usually doing so to prove the absence of egress, and a
+silently-ignored TSA URL would make that exercise worthless. This is `deployment-architecture.md`'s
+zero-egress rule applied literally: RFC 3161 requires reaching a third party, and an air-gapped
+deployment must have no path to one.
+
+Those deployments therefore keep the narrow residual §3 describes: an attacker holding both the
+application and the clock could publish a fresh anchor over doctored history and claim it is old.
+They still cannot replace an anchor already in WORM. The honest description of an air-gapped
+deployment is *"tamper-evident and non-repudiable against modification and removal; not proof against
+backdating"* — which is what this ADR said of every deployment before 1.3c.
+
+### Timestamping fails OPEN, and it is the only thing in `publish` that does
+
+An unsigned anchor or an unwritten WORM object is a lie, so both abort the cut. An untimestamped
+anchor is a weaker *true* statement — it still proves non-truncation. Aborting a cut because a third
+party's TSA was unreachable would let someone else's outage stop this platform committing to its own
+evidence, trading the guarantee we control for the one we do not. The absence is always recorded,
+never inferred: `tsa_token_ref` stays NULL and the Verification Engine reports the anchor as
+untimestamped.
+
+**A missing token is not a finding and does not degrade a verdict.** Every anchor cut before 1.3c and
+every anchor in every air-gapped deployment carries none; degrading those to `partial` would flip
+correct ledgers to a hedged verdict permanently and drain the meaning out of the one state that is
+supposed to mean "this cannot be proven". It is reported as `AnchorFinding.timestamped` and a
+report-level `untimestamped_anchors` count. A token that is *present and invalid* is a
+`tsa_token_invalid` **failure** — downgrading a forgery to "no timestamp" would mean an attacker could
+attach junk and lose nothing.
+
+### Storage
+
+`tsa_token_ref` holds base64 of the DER token, not a pointer. The token is a few hundred bytes, and a
+reference to something stored elsewhere would be one more thing that can go missing between an anchor
+and its proof of time. Base64 because the column is `Text` (§5) and changing an evidentiary table's
+column type is a migration this does not need. The same token is also written into the WORM anchor
+document, so an auditor holding only the object and the public keys can answer "when was this
+committed?" without the database — the database being the thing under suspicion.
 
 ## Consequences
 

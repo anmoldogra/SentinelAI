@@ -29,6 +29,11 @@ dependencies = [
     "redis>=5.0",
     "argon2-cffi>=23.1",
     "cryptography>=43",
+    # ASN.1 codec for RFC 3161 timestamping (ADR-0003 §3, Wave 1.3c). Pure-Python, no build
+    # toolchain and no native extension, so it installs identically into an air-gapped mirror.
+    # Used ONLY to encode/parse DER (TimeStampReq/Resp, CMS SignedData, TSTInfo) — every signature
+    # and certificate check stays in `cryptography`, which is the audited implementation.
+    "asn1crypto>=1.5",
     "pyjwt[crypto]>=2.8",
     "prometheus-client>=0.20",
     "prometheus-fastapi-instrumentator>=7.0",
@@ -111,6 +116,13 @@ disallow_untyped_defs = true
 # so the storage adapter can use it under strict mypy without per-call ignores.
 [[tool.mypy.overrides]]
 module = ["aioboto3.*", "aiobotocore.*", "botocore.*", "boto3.*"]
+ignore_missing_imports = true
+
+# asn1crypto ships no py.typed marker. Its values are dict-like ASN.1 objects whose element types
+# are only knowable at runtime, so the TSA client annotates its own boundaries and treats the codec
+# as untyped rather than scattering per-call ignores through `platform/crypto/tsa.py`.
+[[tool.mypy.overrides]]
+module = ["asn1crypto.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
