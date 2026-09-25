@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 
 import aioboto3
@@ -121,6 +122,45 @@ class MinioObjectStorage:
                     if _http_status(exc) != 404:
                         raise  # translated by _mapped
                     await s3.create_bucket(Bucket=bucket)
+
+    async def ensure_worm_bucket(self, bucket: str) -> None:
+        """Create the bucket with Object Lock enabled if absent (ADR-0003 §3, ADR-0008).
+
+        Object Lock is fixed at creation, so an existing non-WORM bucket cannot be upgraded here.
+        This does **not** verify that an existing bucket has it — that check needs
+        ``get_object_lock_configuration`` and belongs in a startup readiness probe, where a
+        misconfigured bucket should stop the deployment rather than be silently tolerated.
+        """
+        with _mapped(bucket):
+            async with self._client() as s3:
+                try:
+                    await s3.head_bucket(Bucket=bucket)
+                except ClientError as exc:
+                    if _http_status(exc) != 404:
+                        raise  # translated by _mapped
+                    await s3.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
+
+    async def put_immutable(
+        self,
+        bucket: str,
+        key: str,
+        data: bytes,
+        *,
+        retain_until: datetime,
+        content_type: str | None = None,
+    ) -> None:
+        """Single atomic PUT under a COMPLIANCE-mode retention lock."""
+        extra: dict[str, Any] = {"ContentType": content_type} if content_type else {}
+        with _mapped(bucket, key):
+            async with self._client() as s3:
+                await s3.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=data,
+                    ObjectLockMode="COMPLIANCE",
+                    ObjectLockRetainUntilDate=retain_until,
+                    **extra,
+                )
 
     async def put_stream(
         self,

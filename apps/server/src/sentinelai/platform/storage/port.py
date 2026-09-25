@@ -50,6 +50,37 @@ class ObjectStorage(Protocol):
         """Create ``bucket`` if it does not already exist (idempotent)."""
         ...
 
+    async def ensure_worm_bucket(self, bucket: str) -> None:
+        """Create ``bucket`` with S3 Object Lock enabled, if it does not exist.
+
+        Separate from :meth:`ensure_bucket` because Object Lock **cannot be turned on after
+        creation** — it is fixed at create time. A bucket made by the ordinary path can never
+        become a WORM bucket, so the two are different operations rather than a flag.
+        """
+        ...
+
+    async def put_immutable(
+        self,
+        bucket: str,
+        key: str,
+        data: bytes,
+        *,
+        retain_until: datetime,
+        content_type: str | None = None,
+    ) -> None:
+        """Write an object that cannot be modified or deleted until ``retain_until``.
+
+        Uses Object Lock in **COMPLIANCE** mode, not GOVERNANCE: governance retention can be
+        bypassed by a principal holding ``s3:BypassGovernanceRetention``, which is exactly the
+        privileged insider ADR-0003 §3 exists to defend against. An anchor a DBA-equivalent can
+        delete anchors nothing.
+
+        Takes ``bytes`` rather than a stream: the objects written this way are anchors — a few
+        hundred bytes — and a single atomic PUT is both simpler and the only form that carries
+        the lock headers.
+        """
+        ...
+
     async def put_stream(
         self,
         bucket: str,

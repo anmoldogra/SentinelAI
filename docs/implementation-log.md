@@ -1394,3 +1394,132 @@ the time — so they stay null forever and a verifier must report them as *not i
 verifiable*, distinct from both verified and forged. That distinction is already implemented in
 `LedgerSigner.verify` (a missing envelope returns `False`, and callers check the column to tell
 the two apart) and in the console's `partial` status from IC-027.
+
+---
+
+## 2026-09-08 — IC-029: chain-head race fix + external Merkle anchoring (Wave 1.3, ADR-0003 §3)
+
+**Type:** Evidentiary-core correctness and security. One concurrency defect closed, one new
+integrity mechanism built. Three migrations, two new platform modules, no API change.
+
+### Part 1 — the chain-head race
+
+IC-028 flagged this and made it worse; it is fixed here. Appending to a hash chain is a
+read-modify-write with no atomicity: read the head, build an entry naming it, insert. Two writers
+reading the same head both produce valid entries and the ledger becomes a **tree** — two
+contradictory histories, each internally consistent, with nothing in the data to say which is real.
+Signing widened the window from sub-millisecond to a KMS round-trip.
+
+**Two mechanisms doing different jobs, and the distinction is the design.**
+
+*Unique indexes make a fork impossible.* `audit_log(prev_entry_hash)` unique means each entry hash
+has at most one successor — the structural difference between a chain and a tree. Custody gets the
+same on `(evidence_id, prev_event_hash)`, scoped to the evidence item because every chain starts
+from the same genesis sentinel and a global index would permit exactly one evidence item to exist,
+plus `(evidence_id, sequence_number)` which CEM §4 has always *claimed* was monotonic without
+anything enforcing it. This is the correctness guarantee, and it holds against a writer that
+bypasses the service layer entirely.
+
+*The advisory lock stops writers wasting work racing for that constraint.* `pg_advisory_xact_lock`,
+taken before the head read, released on commit **or rollback** — a session-scoped lock leaked by an
+exception would wedge the chain until the connection was recycled. Keyed per-chain via blake2b
+rather than `hash()`, which is salted per process: two workers would otherwise compute different
+keys for the same chain, and the lock would look present while doing nothing.
+
+**Proven by mutation, not assertion.** Disabling the lock and re-running the suite produced exactly
+the predicted result: `test_concurrent_appends_serialize_into_one_unbroken_chain` failed with an
+`IntegrityError` from the unique index. The chain did not fork — it failed closed. That single
+experiment demonstrates both halves at once, and it is why the tests are worth trusting.
+
+The head query still orders by `occurred_at`, which is a heuristic — clocks are not monotonic. It
+cannot cause a fork: an entry built on a non-head row collides with that row's real successor and
+the transaction dies. Worth knowing, not worth a bigger change.
+
+### Part 2 — external anchoring
+
+**The gap, stated exactly: signatures prove no entry was *changed*; anchors prove none was
+*removed*.** Delete the tail of a ledger, or restore yesterday's backup, and every surviving entry
+still verifies, every signature is still valid, every link still points at a real predecessor.
+Nothing inside the database can detect it, because the evidence of what is missing is exactly what
+was removed. `test_truncating_the_tail_is_detected` asserts that internal consistency explicitly
+before showing the anchor catching it anyway — the point is not that the chain looks broken, it is
+that it looks perfect.
+
+`platform/crypto/merkle.py` — RFC 6962-style, and the two properties a naive implementation gets
+wrong are tested by name. Leaves are `0x00`-prefixed and interior nodes `0x01`, without which an
+interior digest can be presented as a leaf. Odd nodes are **promoted, not duplicated**: duplicating
+is CVE-2012-2459, where `[a,b,c]` and `[a,b,c,c]` produce one root. Order is committed to, not just
+membership — a reordered custody chain is a different history.
+
+`platform/crypto/anchoring.py` — builds the root, signs it under the evidence key, writes a
+self-describing document to WORM. The document stands alone deliberately: an auditor holding only
+the object and the public key can verify it without the database, which is the whole point, since
+the database is the thing being checked. The object is written **before** the anchor row is
+recorded; a row pointing at an object that was never written would be a database claiming an anchor
+exists when it does not.
+
+WORM is real Object Lock in **COMPLIANCE** mode, not GOVERNANCE — governance retention is
+bypassable by a principal holding `s3:BypassGovernanceRetention`, which is precisely the privileged
+insider being defended against. The storage port had no Object Lock support at all despite Wave 0.3
+being marked built, so `ensure_worm_bucket` and `put_immutable` were added.
+
+### Two architectural conflicts found and resolved
+
+**1. `anchor_ref` cannot live on the ledger rows, and ADR-0003 §5 says it does.** An anchor exists
+*after* the entries it covers, so recording it there is an `UPDATE` — which ADR-0004's append-only
+trigger rejects unconditionally on exactly those tables. The two ADRs contradict each other.
+Resolved in favour of ADR-0004 (never weaken append-only for bookkeeping convenience): the
+relationship lives in a new append-only `platform.ledger_anchors` table keyed by entry-hash range.
+The `anchor_ref` columns stay permanently null and are left in place rather than dropped, so a
+verifier meeting an old row knows they were never populated. Recorded as an amendment to ADR-0003
+rather than silently worked around.
+
+**2. ADR-0003 §1's signed message is ambiguous as literally written.** `(sequence || prev ||
+entry_hash)` stops being uniquely parseable the moment crypto agility does its job, since a SHA-256
+digest is 64 hex characters and a SHA-384 is 96. Already built as canonical JSON in IC-028; the ADR
+is now amended to say so rather than disagreeing with the code.
+
+### What is deliberately NOT built: the RFC-3161 TSA client
+
+Task 3 asked for a timestamping authority client. It is not here, and the reason is not effort.
+
+WORM and a TSA defeat **different attacks**, and only one of them was the stated objective.
+WORM makes an anchor *undeletable* — that is what closes truncation and rollback, and it is done.
+A TSA makes an anchor *undatable-forward*, closing a narrower residual: an attacker holding both
+the application and the clock publishing a fresh anchor over a doctored history and claiming it is
+old. They still cannot replace an anchor already in WORM.
+
+Building it properly means DER-encoding a `TimeStampReq` and, far harder, **verifying** the CMS
+`SignedData` token that comes back. An unverified token proves nothing, and hand-rolling CMS
+verification is exactly the "lighter version of a security control" `security-architecture.md`
+warns against. It needs an ASN.1/CMS dependency (`asn1crypto` or `rfc3161ng`), which per CLAUDE.md
+is an ADR-worthy decision — and it needs an answer for air-gapped deployments, which ADR-0003's own
+Status already says cannot be closed generically because there is no reachable public TSA. That is
+a scoped increment with a design decision in it, not a loose end.
+
+`tsa_token_ref` is reserved and null. `ADR-0003`'s status table now lists the two halves of §3
+separately so the distinction cannot be lost.
+
+### Scope note
+
+Anchoring is a **library plus a store, not a running job.** `LedgerAnchorService` and the anchor
+table exist and are proven end to end, but nothing schedules batch cutting yet, and no endpoint
+reports anchor status. That is the Verification Engine (Wave 1.4), which is where a scheduled
+re-verification and a court-facing report belong. Today the mechanism is exercised only by tests.
+
+**Tests: 75 new** (56 unit, 19 integration). The integration suite performs the real attacks
+against a live Postgres: `DELETE` on the ledger after dropping the append-only trigger (which a
+superuser can do — and which is exactly why ADR-0003 says the database alone is never the
+guarantee), and a restore-to-older-snapshot.
+
+**Gates.** ruff (lint + format), `mypy --strict` (192 files), import-linter (2/2 kept), full suite
+**880 passed / 2 skipped** (up from 805). Platform coverage **92.11%** against the 90% floor;
+`merkle.py` 100%, `anchoring.py` 98%, `ledger.py` 100%.
+
+**Known gaps.** `chain_lock.py` sits at 71% line coverage in the *unit* run because taking a
+Postgres advisory lock cannot be unit-tested without Postgres; it is fully exercised in
+`test_chain_concurrency_db.py`, including a test that asserts the lock genuinely blocks a second
+writer by checking event ordering. And the anchor bucket's Object Lock configuration is created but
+never *verified* on an existing bucket — a pre-existing non-WORM bucket with the right name would
+be silently accepted. That check belongs in the startup readiness probe, where a misconfigured
+bucket should stop the deployment; it is noted in `deployment-architecture.md` and not yet built.

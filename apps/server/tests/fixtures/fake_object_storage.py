@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import AsyncIterator, Sequence
+from datetime import datetime
 from uuid import uuid4
 
 from sentinelai.platform.storage.exceptions import ObjectNotFound
@@ -23,9 +24,33 @@ class FakeObjectStorage:
         self._content_types: dict[tuple[str, str], str | None] = {}
         self._buckets: set[str] = set()
         self._multipart: dict[str, tuple[str, str, dict[int, bytes]]] = {}
+        # WORM retention per object, so a test can assert an anchor was written under a
+        # real lock rather than merely written.
+        self.retentions: dict[tuple[str, str], datetime] = {}
 
     async def ensure_bucket(self, bucket: str) -> None:
         self._buckets.add(bucket)
+
+    async def ensure_worm_bucket(self, bucket: str) -> None:
+        self._buckets.add(bucket)
+
+    async def put_immutable(
+        self,
+        bucket: str,
+        key: str,
+        data: bytes,
+        *,
+        retain_until: datetime,
+        content_type: str | None = None,
+    ) -> None:
+        """Stores the object and records the retention it was written under.
+
+        The retention is kept rather than discarded so a test can assert an anchor was written
+        with a real lock, not merely written — the difference between WORM and an ordinary PUT is
+        the whole point of the method.
+        """
+        self._objects[(bucket, key)] = data
+        self.retentions[(bucket, key)] = retain_until
 
     async def put_stream(
         self, bucket: str, key: str, data: AsyncIterator[bytes], *, content_type: str | None = None

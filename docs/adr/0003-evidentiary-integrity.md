@@ -44,7 +44,8 @@ acceptance:
 | §4 Server-computed integrity hashing | 1.5 | **Built** — landed early (out of dependency order) as `09e4f14`; ADR-0008 §3 |
 | §2 Complete preimage (all persisted fields) | 1.2 | **Built** — `platform/crypto/ledger.py`; both ledgers hash every persisted column under JCS and stamp `hash_algo`/`preimage_version`. Enforced by a table-driven test against the live schema |
 | §1 Authenticated entries (**signatures**) | 1.2 | **Built** — `LedgerSigner` signs every audit and custody write under `KeyPurpose.EVIDENCE_ROOT` (Ed25519 by policy); `signature`/`sig_alg`/`key_id` carry real values. Fails closed: a write that cannot be signed aborts its transaction |
-| §3 External anchoring (Merkle + RFC-3161) | 1.3 | **Not built** |
+| §3 External anchoring — **Merkle + WORM** | 1.3 | **Built** — `platform/crypto/{merkle,anchoring}.py`, `platform.ledger_anchors`, COMPLIANCE-mode Object Lock. Truncation and rollback are detected; proven against a live database in `test_ledger_anchoring_db.py` |
+| §3 External anchoring — **RFC-3161 timestamp** | 1.3 | **NOT built** — `tsa_token_ref` is reserved and null. WORM makes an anchor undeletable (which defeats truncation); a TSA makes it undatable-forward (which defeats backdating). Needs an ASN.1/CMS dependency and its own ADR |
 | §6 Verification Engine | 1.4 | **Not built** — `LedgerSigner.verify` exists and is the primitive it will call, but no endpoint or scheduled job invokes it |
 
 **Context §1's "unkeyed" half and Context §2 are now closed; "unanchored" is not.** A complete
@@ -62,11 +63,14 @@ an older backup, leaves a shorter chain in which every remaining entry still ver
 Nothing in the database can detect that, because the evidence of the missing entries is exactly
 what was removed. Only §3's externally-anchored monotonic root closes it, and that is Wave 1.3.
 
-**PRD SR-4 is therefore substantially met but not complete.** "Tamper-evident even to an
-administrator with direct database access" now holds for any modification to an entry that exists.
-It does not yet hold for the removal of entries. The honest description of the ledgers today is
-**"tamper-evident and non-repudiable against modification; not yet proof against truncation"** —
-and a court-facing verification report must say so until Wave 1.3 lands.
+**PRD SR-4 now holds against modification *and* removal, with one caveat.** Signatures make an
+altered entry detectable; WORM-published Merkle roots make a deleted one detectable, because the
+commitment lives outside the database the attacker controls. The remaining caveat is **time**: with
+no RFC-3161 token, an attacker holding both the application and the clock could publish a fresh
+anchor over a doctored history. They cannot replace an anchor *already* in WORM, so this is a
+narrow residual rather than the open hole truncation was. The honest description today is
+**"tamper-evident and non-repudiable against modification and removal; not yet proof against
+backdating"**.
 
 **One consequence to carry forward.** Signing happens inside the caller's transaction and fails
 closed, so a KMS outage stops every audited write rather than allowing an unsigned one. That is
@@ -135,6 +139,34 @@ Evidentiary ledgers become **authenticated, externally-anchored, crypto-agile** 
 6. **Verification Engine.** A first-class subsystem: (a) an online endpoint returning a
    court-facing verification report for an evidence item's full chain; (b) a scheduled job
    that re-verifies chains, signatures, and anchor roots and alarms on any break.
+
+## Amendment (2026-09-08) — `anchor_ref` cannot live on the ledger rows
+
+§5 lists `anchor_ref` among the agility columns on both ledgers. **That placement is not
+implementable, and the conflict is with ADR-0004.** An anchor necessarily exists *after* the
+entries it commits to — a Merkle root cannot be computed over rows that have not been written — so
+recording it on those rows would require an `UPDATE`. ADR-0004's append-only trigger rejects
+`UPDATE` on exactly these tables, unconditionally.
+
+Resolved in favour of ADR-0004: **never weaken append-only to make bookkeeping convenient.** The
+entry→anchor relationship lives in a separate append-only table, `platform.ledger_anchors`, which
+records the covered range by entry hash. The `anchor_ref` columns on both ledgers remain
+permanently `NULL`; they are left in place rather than dropped so a verifier meeting an old row
+knows the column was never populated, and because dropping a column from an evidentiary table is
+itself a schema change on a signed history.
+
+One table serves both ledgers, discriminated by a `ledger` column carrying the same value the
+signed message uses. Anchoring is generic over what it commits to, and duplicating the table into
+`ingestion` would duplicate the verification code with it. There is no foreign key to either chain:
+`ingestion` is another module's schema and `database-design.md` §5 forbids cross-schema FKs, so the
+reference is by entry hash and validated at the application layer.
+
+**A second correction to §1's wording.** The ADR specifies the signed message as
+`(sequence || prev_entry_hash || entry_hash)`. Implemented as a raw concatenation that is ambiguous
+the moment crypto agility does its job — a SHA-256 digest is 64 hex characters and a SHA-384 digest
+is 96, so `prev || entry` stops being uniquely parseable once two algorithms coexist. It is built as
+an RFC 8785 canonical object over the same fields, plus a ledger discriminator so a signature made
+for one chain cannot be presented as valid for the other.
 
 ## Consequences
 

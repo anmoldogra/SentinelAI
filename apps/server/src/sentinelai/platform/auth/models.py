@@ -224,6 +224,65 @@ class IdentityProviderLink(Base):
     idp_subject: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class LedgerAnchor(Base):
+    """One externally-published commitment to a range of ledger entries (ADR-0003 §3).
+
+    **Why this is a table and not a column.** ADR-0003 §5 lists `anchor_ref` among the agility
+    columns on both ledgers, but that placement cannot work: an anchor necessarily exists *after*
+    the entries it covers, so writing it back would be an ``UPDATE`` — and ADR-0004's append-only
+    trigger rejects those unconditionally on exactly these tables. The `anchor_ref` columns
+    therefore stay permanently null, and the entry→anchor relationship lives here instead, where
+    it is itself append-only. That contradiction is recorded in ADR-0003 rather than worked around
+    silently.
+
+    **Why one table serves both ledgers.** `ledger` is a discriminator holding the same values the
+    signed message uses (`platform.audit_log`, `ingestion.evidence_custody_events`). Anchoring is
+    generic over what it commits to, so duplicating this into `ingestion` would duplicate the
+    verification code with it. There is no foreign key to either ledger: `ingestion` is another
+    module's schema, and database-design.md §5 forbids cross-schema FKs — the reference is by
+    entry hash, validated at the application layer.
+
+    **What a row proves, and what it does not.** It proves that at the moment of writing, the
+    platform committed to this exact sequence of entries under a key an insider does not hold, and
+    published that commitment to storage they cannot rewrite. It does **not** prove *when*: that
+    needs an RFC-3161 timestamp token from a third party, which is `tsa_token_ref` and is not yet
+    populated. Without it, an attacker who controls the clock and the application could in
+    principle backdate a replacement anchor — but not one already written to WORM.
+    """
+
+    __tablename__ = "ledger_anchors"
+    __table_args__ = (
+        # One anchor per contiguous range per ledger. Re-anchoring the same range would create two
+        # commitments to the same entries, and a verifier meeting both would have no way to say
+        # which is authoritative.
+        Index("uq_ledger_anchors_ledger_range", "ledger", "first_entry_hash", unique=True),
+        Index("ix_ledger_anchors_ledger_created_at", "ledger", "created_at"),
+        {"schema": _SCHEMA},
+    )
+
+    anchor_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    # Which chain this commits to — the same discriminator the signed message carries.
+    ledger: Mapped[str] = mapped_column(Text, nullable=False)
+    merkle_root: Mapped[str] = mapped_column(Text, nullable=False)
+    merkle_hash_algo: Mapped[str] = mapped_column(Text, nullable=False)
+    # The covered range, by entry hash rather than by row id: an entry hash is the thing the tree
+    # actually commits to, and it survives a restore that renumbered nothing but lost rows.
+    first_entry_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    last_entry_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    entry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    # The signed root — same envelope format as a ledger entry's signature (crypto.ledger).
+    signature: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    sig_alg: Mapped[str] = mapped_column(Text, nullable=False)
+    key_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Where the anchor was published, outside this database. This is what makes the commitment
+    # survive a database an attacker controls.
+    worm_object_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    # RFC-3161 token reference — null until the TSA client lands. See the class docstring for
+    # what its absence costs.
+    tsa_token_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class AuditLog(Base):
     """System-wide, hash-chained, insert-only audit trail (database-design.md §10)."""
 

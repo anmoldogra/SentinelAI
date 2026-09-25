@@ -337,6 +337,22 @@ Two `StorageClass`es: `fast-ssd` (low-latency block storage for Postgres — the
 
 Implements `database-design.md` §12 exactly: continuous WAL archiving + daily base backups (CloudNativePG's native `Backup`/`ScheduledBackup` CRDs), MinIO bucket replication to the backup target, and volume-level snapshots (via the CSI driver's `VolumeSnapshot` API) as a fast-restore complement to logical backups — snapshots restore an entire PVC quickly for infrastructure failures; logical backups restore to an arbitrary point in time for data-level incidents. Both respect legal hold (Part 14 details the restore/validation procedure).
 
+### Restoring an evidentiary database is an integrity event, not just an availability one
+
+A point-in-time restore silently erases every ledger entry written after the restore point. The restored database is **internally flawless** — a real, complete, self-consistent ledger, just an older one — so hash and signature checks all pass. This is the *accidental* form of the truncation attack ADR-0003 §3 exists to detect, and an operator running a routine restore will not notice it.
+
+**Therefore: after any restore of a database containing `platform.audit_log` or `ingestion.evidence_custody_events`, re-verification against the external anchors is mandatory before the system is returned to service.** The anchors live in the WORM anchor bucket, not in the database, so they survive the restore and will report exactly which committed entries are now missing. Treat a mismatch as an evidentiary incident (§48's incident response), not as a restore defect to be tidied away — the entries are genuinely gone, and any case relying on them needs to know.
+
+### The anchor bucket is not an ordinary bucket
+
+Anchors are written with S3 Object Lock in **COMPLIANCE** mode, which cannot be bypassed by any principal, including the account root. Three deployment consequences follow, and none of them is optional:
+
+1. **Object Lock is fixed at bucket creation.** A bucket created without it can never be upgraded, so the anchor bucket must be provisioned with `ObjectLockEnabledForBucket` from the start. `ensure_worm_bucket` does this on first use; a pre-existing non-WORM bucket with the anchor bucket's name is a misconfiguration that must fail the deployment rather than be tolerated.
+2. **COMPLIANCE mode is deliberate, and GOVERNANCE mode is not an acceptable substitute.** Governance retention can be bypassed by a principal holding `s3:BypassGovernanceRetention` — which is precisely the privileged insider the anchors defend against. An anchor a sufficiently-privileged operator can delete anchors nothing.
+3. **Retention outlives the evidence.** The default is 10 years (`DEFAULT_RETENTION_YEARS`). An anchor whose lock expires before the evidence it commits to stops proving anything at exactly the moment a long-running case would need it. Retention on this bucket must be set from the *evidentiary* retention policy, never from a storage-cost policy — and note that COMPLIANCE-mode objects cannot be deleted early to reclaim space, which is the point.
+
+Backup replication of the anchor bucket must preserve the lock state; a replica that drops retention is a copy an insider can edit.
+
 # Part 8 — Database Deployment
 
 ## Primary, Replica, HA
