@@ -37,7 +37,6 @@ from sentinelai.modules.ingestion.events import (
 )
 from sentinelai.modules.ingestion.exceptions import (
     ConnectorNotFoundError,
-    EvidenceAlreadySupersededError,
     EvidenceNotFoundError,
     EvidencePayloadMissingError,
     IntegrityVerificationFailedError,
@@ -95,7 +94,15 @@ from sentinelai.platform.storage import (
     get_object_storage,
     parse_object_uri,
 )
-from sentinelai.shared.exceptions import LegalHoldViolationError, ValidationFailedError
+from sentinelai.shared.cem import (
+    CUSTODY_EVENT_TYPES as _CUSTODY_EVENT_TYPES,
+)
+from sentinelai.shared.cem import (
+    INTEGRITY_ALGORITHMS,
+    PUBLIC_SOURCE_AUTHORITY,
+    CustodyEventType,
+)
+from sentinelai.shared.exceptions import ValidationFailedError
 from sentinelai.shared.pagination import PageParams, decode_cursor, encode_cursor
 
 # CEM §5 evidence categories.
@@ -121,25 +128,12 @@ _LEGAL_AUTHORITY_REQUIRED = frozenset(
         "cloud_evidence",
     }
 )
-_PUBLIC_SOURCE_SENTINEL = "public_source_no_authority_required"
-_ALLOWED_INTEGRITY_ALGORITHMS = frozenset({"SHA-256", "SHA-3-256", "SHA-512"})
-# CEM §4 custody event-type enum.
-CUSTODY_EVENT_TYPES = frozenset(
-    {
-        "collected",
-        "ingested",
-        "accessed",
-        "exported",
-        "transferred",
-        "analyzed",
-        "integrity_reverified",
-        "linked_to_case",
-        "unlinked_from_case",
-        "legal_hold_applied",
-        "legal_hold_released",
-        "disposed",
-    }
-)
+# The custody vocabulary, the integrity-algorithm set and the public-source sentinel are CEM
+# vocabulary, and they now live in `shared/cem.py` where the value objects enforce them (ADR-0011
+# §2). This module kept private copies until Wave 2.4; with `CustodyEventType` performing the check,
+# a second copy here would be a set that drifts from the one actually enforced. Re-exported because
+# `CUSTODY_EVENT_TYPES` is part of this module's published surface.
+CUSTODY_EVENT_TYPES = _CUSTODY_EVENT_TYPES
 # §13 clock-skew tolerance value is unspecified in the docs — assumption.
 _CLOCK_SKEW = timedelta(minutes=5)
 _GENESIS_HASH = "0" * 64
@@ -457,18 +451,18 @@ class EvidenceService:
                         "message": "hash+algorithm required for payload-bearing evidence",
                     }
                 )
-            elif data.integrity_algorithm not in _ALLOWED_INTEGRITY_ALGORITHMS:
+            elif data.integrity_algorithm not in INTEGRITY_ALGORITHMS:
                 errors.append(
                     {
                         "field": "integrity_algorithm",
-                        "message": f"must be one of {sorted(_ALLOWED_INTEGRITY_ALGORITHMS)}",
+                        "message": f"must be one of {sorted(INTEGRITY_ALGORITHMS)}",
                     }
                 )
         if data.category in _LEGAL_AUTHORITY_REQUIRED and not data.legal_authority_ref:
             errors.append(
                 {
                     "field": "legal_authority_ref",
-                    "message": f"required for {data.category} (or '{_PUBLIC_SOURCE_SENTINEL}')",
+                    "message": f"required for {data.category} (or '{PUBLIC_SOURCE_AUTHORITY}')",
                 }
             )
         return errors
@@ -860,20 +854,15 @@ class EvidenceService:
         self, evidence_id: UUID, data: CustodyEventCreate, actor: CurrentUser, correlation_id: str
     ) -> EvidenceCustodyEvent:
         evidence = await self.get_evidence(evidence_id, actor)
-        if data.event_type not in CUSTODY_EVENT_TYPES:
-            raise ValidationFailedError(
-                [{"field": "event_type", "message": f"unknown custody event '{data.event_type}'"}]
-            )
-        # Legal-hold gate on any disposal/purge path (security §39).
-        if data.event_type == "disposed" and evidence.legal_hold:
-            raise LegalHoldViolationError("evidence is under legal hold and cannot be disposed")
-        # Legal hold is ledger-derived (ADR-0015 / ADR-0004 §4): the custody event appended
-        # below IS the state transition. Never an UPDATE — the ADR-0004 trigger forbids it;
-        # the overlay keeps this in-memory instance consistent without dirtying it.
-        if data.event_type == "legal_hold_applied":
-            set_committed_value(evidence, "legal_hold", True)
-        elif data.event_type == "legal_hold_released":
-            set_committed_value(evidence, "legal_hold", False)
+        # ADR-0011 §1/§2: the vocabulary check is the value object's (an unknown type cannot be
+        # constructed) and the legal-hold gate is the aggregate's. The service orchestrates —
+        # ledger append, outbox, audit — and cannot put the item into an illegal state.
+        event_type = CustodyEventType(data.event_type)
+        hold_state = evidence.apply_custody_event(event_type)
+        if hold_state is not None:
+            # `set_committed_value` writes the attribute as if loaded, so the unit of work never
+            # marks it dirty and never emits the UPDATE the ADR-0004 trigger would reject.
+            set_committed_value(evidence, "legal_hold", hold_state)
         event = await self._append_custody(
             evidence_id,
             data.event_type,
@@ -906,7 +895,7 @@ class EvidenceService:
                 [{"field": "payload_ref", "message": "evidence has no stored payload to verify"}]
             )
         algorithm = evidence.integrity_algorithm or "SHA-256"
-        if algorithm not in _ALLOWED_INTEGRITY_ALGORITHMS:
+        if algorithm not in INTEGRITY_ALGORITHMS:
             raise ValidationFailedError(
                 [
                     {
@@ -1086,9 +1075,13 @@ class EvidenceService:
         if original is None:
             raise EvidenceNotFoundError()
         # Derived check (ADR-0015): superseded means a replacement row exists — the genesis
-        # `status` column never changes.
-        if await self._uow.evidence.has_replacement(evidence_id):
-            raise EvidenceAlreadySupersededError(f"evidence {evidence_id} is already superseded")
+        # ADR-0011 §1: the aggregate refuses a second supersession. The *query* stays here because
+        # the fact lives in another row and an aggregate that loaded it would need a session; the
+        # *decision* is the aggregate's. The `status` column is deliberately not consulted — CEM §12
+        # makes `superseded` derived (ADR-0015), so the genesis value would lie.
+        original.assert_supersedable(
+            already_superseded=await self._uow.evidence.has_replacement(evidence_id)
+        )
 
         ingested_at = datetime.now(UTC)
         errors = self._validate(data.replacement, ingested_at)

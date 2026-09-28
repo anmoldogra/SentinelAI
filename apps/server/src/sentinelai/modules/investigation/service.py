@@ -29,8 +29,16 @@ from sentinelai.modules.investigation.events import (
 from sentinelai.modules.investigation.exceptions import (
     CorrelationRunNotFoundError,
     EntityNotFoundError,
-    FindingAlreadyReviewedError,
     RelationshipNotFoundError,
+)
+from sentinelai.modules.investigation.models import (
+    STATUS_CONFIRMED as _STATUS_CONFIRMED,
+)
+from sentinelai.modules.investigation.models import (
+    STATUS_PROPOSED as _STATUS_PROPOSED,
+)
+from sentinelai.modules.investigation.models import (
+    STATUS_REJECTED as _STATUS_REJECTED,
 )
 from sentinelai.modules.investigation.models import (
     CorrelationRun,
@@ -51,13 +59,14 @@ from sentinelai.platform.auth.dependencies import CurrentUser
 from sentinelai.platform.crypto import get_kms
 from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.tasks import TaskQueue
-from sentinelai.shared.exceptions import PreconditionFailedError, ValidationFailedError
+from sentinelai.shared.exceptions import PreconditionFailedError
 from sentinelai.shared.pagination import PageParams, decode_cursor, encode_cursor
 
-STATUS_PROPOSED = "proposed"
-STATUS_CONFIRMED = "confirmed"
-STATUS_REJECTED = "rejected"
-_REVIEW_DISPOSITIONS = frozenset({STATUS_CONFIRMED, STATUS_REJECTED})
+# The status vocabulary and the review machine belong to the finding aggregates (ADR-0011 §1,
+# models.py). Re-exported here because the router and schemas already import these names.
+STATUS_PROPOSED = _STATUS_PROPOSED
+STATUS_CONFIRMED = _STATUS_CONFIRMED
+STATUS_REJECTED = _STATUS_REJECTED
 
 
 def entity_etag(entity: Entity) -> str:
@@ -162,13 +171,12 @@ class InvestigationService:
         entity = await self._uow.entities.get_by_id(entity_id)
         if entity is None:
             raise EntityNotFoundError()
-        _require_disposition(disposition)
+        # ETag stays here: optimistic concurrency is an HTTP concern with no domain meaning, and
+        # it must be checked before the aggregate mutates anything.
         if _normalize_etag(expected_etag) != _normalize_etag(entity_etag(entity)):
             raise PreconditionFailedError("entity was modified concurrently (ETag mismatch)")
-        if entity.status != STATUS_PROPOSED:
-            raise FindingAlreadyReviewedError(f"entity is already {entity.status}")
-        previous = entity.status
-        entity.status = disposition
+        # ADR-0011 §1: the vocabulary and the review-once rule are the aggregate's.
+        previous = entity.review(disposition)
         await self._uow.entity_revisions.add(
             EntityRevision(
                 entity_id=entity_id,
@@ -220,15 +228,8 @@ class InvestigationService:
         select its eligible evidence, so it has the owner to hand. Omitting it publishes the
         event without a recipient, and the notification consumer ignores it rather than failing.
         """
-        if not evidence_ids:
-            raise ValidationFailedError(
-                [
-                    {
-                        "field": "evidence_ids",
-                        "message": "a relationship requires ≥1 supporting evidence",
-                    }
-                ]
-            )
+        # ADR-0011 §1: the aggregate owns the invariant; this is where CEM §13 puts it.
+        Relationship.assert_supporting_evidence(len(evidence_ids))
         relationship = Relationship(
             type=rel_type,
             from_entity_id=from_entity_id,
@@ -291,13 +292,13 @@ class InvestigationService:
         relationship = await self._uow.relationships.get_by_id(relationship_id)
         if relationship is None:
             raise RelationshipNotFoundError()
-        _require_disposition(disposition)
         if _normalize_etag(expected_etag) != _normalize_etag(relationship_etag(relationship)):
             raise PreconditionFailedError("relationship was modified concurrently (ETag mismatch)")
-        if relationship.status != STATUS_PROPOSED:
-            raise FindingAlreadyReviewedError(f"relationship is already {relationship.status}")
-        previous = relationship.status
-        relationship.status = disposition
+        # ADR-0011 §1: the aggregate owns the review machine. The ≥1-supporting-evidence rule is
+        # NOT checked here — CEM §1.6/§13 make it an *existence* invariant enforced at creation, so
+        # an unsupported finding cannot reach review, and rejecting one that somehow did is the
+        # correct outcome rather than an error.
+        previous = relationship.review(disposition)
         await self._uow.relationship_revisions.add(
             RelationshipRevision(
                 relationship_id=relationship_id,
@@ -368,18 +369,6 @@ class InvestigationService:
         raise NotImplementedError(
             "get_case_graph is blocked on the case→evidence bridge (database-design §3.5 "
             "has no case↔evidence table) — Phase 8 report"
-        )
-
-
-def _require_disposition(disposition: str) -> None:
-    if disposition not in _REVIEW_DISPOSITIONS:
-        raise ValidationFailedError(
-            [
-                {
-                    "field": "status",
-                    "message": f"disposition must be one of {sorted(_REVIEW_DISPOSITIONS)}",
-                }
-            ]
         )
 
 

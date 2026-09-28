@@ -2219,3 +2219,158 @@ substantive guarantee. §3 would additionally require the owning module's databa
 cross-module forgery need two independent compromises; it belongs with an ADR-0004 grant narrowing.
 
 Next roadmap item is Wave 2.4 — rich aggregates and value objects (ADR-0011).
+
+---
+
+## 2026-09-28 — IC-036: Wave 2.3 committed; Wave 2.4 rich aggregates and value objects (ADR-0011)
+
+**Type:** Release of Wave 2.3, then a domain-model refactor. No migration, no schema change, no API
+contract change — every error code, field name and message is preserved. Enforcement *moved*;
+behaviour did not.
+
+### Wave 2.3 shipped
+
+The signed outbox (IC-035) committed as `0ca0543` and pushed. ADR-0007 is Accepted with §3 (writer
+restriction) recorded as not built.
+
+### Wave 2.4: what was wrong
+
+Invariants that are *legal* guarantees lived in `if` statements inside service methods. The
+legal-hold gate on disposal (security-architecture.md §39), the already-superseded check, the
+review-once rule behind PRD FR-7.3's human-in-the-loop promise — each was enforced at exactly one
+call site. A second code path that appended a custody event would have bypassed the hold gate
+silently, and nothing in the type system or the model would have objected. `Case` was the lone
+exception, made rich back in IC-011.
+
+Alongside that, CEM vocabulary was raw `str` everywhere: an integrity hash was a string plus a
+separate algorithm string with no guarantee they agreed, and a confidence was whatever the call site
+remembered to validate.
+
+### What was checked before building
+
+`Case` already satisfies §1, so this wave did not touch it. Two ADR-0011 claims did not survive
+checking:
+
+**§1's method sketch presumes mutable state.** It proposes `record_custody(...)`, `supersede(...)`
+and `apply_legal_hold(...)`. ADR-0004's trigger rejects an `UPDATE` on the evidence table outright,
+and ADR-0015 makes `status` and `legal_hold` derived from the custody ledger — so an
+`apply_legal_hold` that sets a column is a method that cannot exist here. The built shape expresses
+the same rules for an append-only store: `assert_can_record_custody`, `apply_custody_event` (returns
+the new hold state for the caller to write with `set_committed_value`, never dirtying the instance),
+`assert_supersedable`.
+
+**§1's "≥1 supporting evidence" is not a review rule.** The ADR's Context calls it "the CEM §13
+'≥1 supporting evidence' rule", which reads as a rule about findings generally, and I implemented it
+as a guard on confirmation. A unit test failed and sent me to the source: CEM §1.6 says "No Entity or
+Relationship may **exist** without at least one supporting evidence reference" and §13's table says
+*Reject*. It is an existence invariant, enforced at creation — which `create_relationship` already
+did inline.
+
+Checking it at confirmation was wrong twice over. Too late, because the unsupported row already
+exists by then. And perverse, because it would refuse to let an analyst **reject** an unsupported
+finding — the exact outcome the rule wants. The guard is now
+`Relationship.assert_supporting_evidence(count)`, a classmethod (it is asked before the instance
+exists) taking a count (the supporting rows are written in the same transaction; there is nothing to
+query yet). CEM §13 grants entities an explicit exception — a pre-registered entity needs no
+`MENTIONS` edge — so `Entity` creation deliberately does not call it. The repository's
+`count_for_relationship`, added for the wrong design, was deleted.
+
+### Two vocabularies that had already drifted
+
+Writing the value objects surfaced a live defect. `shared/cem.py` defined
+`PUBLIC_SOURCE_AUTHORITY = "public-source"` — a literal that appears **nowhere** in the CEM. §13's
+validation table and both worked examples say `public_source_no_authority_required`, `apps/web`'s
+`PUBLIC_SOURCE_SENTINEL` hardcodes that string, and the ingest validator has always accepted exactly
+it. `LegalAuthorityRef.is_public_source` would have returned `False` for the only sentinel the API
+accepts. The value object now quotes the model verbatim; it is a wire value in an evidentiary record,
+not a name to restyle.
+
+The same check found `CUSTODY_EVENT_TYPES` and the integrity-algorithm set defined in **both**
+`shared/cem.py` and `ingestion/service.py`. With `CustodyEventType` performing the vocabulary check,
+the service's copies were dead and free to diverge from the ones actually enforced. The service now
+imports them and re-exports `CUSTODY_EVENT_TYPES` for its published surface. Both rejection messages
+are byte-identical to before, so no client sees a change.
+
+### The aggregates are the ORM classes
+
+`Evidence`, `Entity` and `Relationship` follow the pattern `Case` set: behaviour on the declarative
+class, not a parallel domain object behind a mapper. A declarative instance is an ordinary Python
+object until it meets a session, so every invariant is exercised with no database, no fixtures and no
+engine — the property ADR-0011's Consequences actually ask for. So the "aggregate↔ORM mapping layer"
+the ADR anticipates was **not** built: it would add a translation step on every read and write plus a
+second place for the shape of an evidence record to drift, to buy purity for invariants already
+expressible where the data is.
+
+`Entity` and `Relationship` share the review machine through a `_Reviewable` mixin rather than each
+carrying a copy. They are separate aggregates with separate tables and separate revision ledgers, but
+the rule is one rule, and two copies are two chances to drift on a guarantee the PRD makes
+explicitly. Inside `review()` the vocabulary check comes **before** the state check, so a caller
+sending nonsense is told it is not a disposition rather than that the finding is already reviewed —
+which would be a confusing answer to a request that was malformed regardless of state.
+
+### What the aggregates deliberately do not own
+
+**Queries.** `assert_supersedable` takes a flag, `assert_supporting_evidence` takes a count. An
+aggregate that loaded either needs a session, which makes it untestable without a database and hides
+a query inside an invariant check. The query stays in the service; the decision is the aggregate's.
+
+**ETag / optimistic concurrency.** Still checked in the service, before the aggregate is asked to
+mutate anything. It is an HTTP concern with no domain meaning.
+
+### Value-object decisions worth recording
+
+**`IntegrityHash` length-matches the algorithm.** A 64-character digest labelled SHA-512 is not a
+truncated SHA-512; it is a SHA-256 with the wrong label, and every verifier trusts the label.
+
+**`CustodyEventType.legal_hold_state` is three-valued.** `None` means "this event says nothing about
+holds". Collapsing it to a boolean would make every `accessed` event silently release a legal hold.
+
+**`ConfidenceScore` refuses a `float` outright** rather than coercing. The column is `Numeric` and
+scores are compared against thresholds; accepting binary floating point makes `0.7` a different
+number in the domain than in the database.
+
+**Category and artifact type validate shape, not membership.** The vocabulary is extended by
+registering an attribute schema, so a closed enum would make adding a category a code change and
+would reject data a correctly-registered connector may send. `CustodyEventType` **is** closed,
+because every value has specific meaning to the custody rules — an unrecognised one is not
+extensibility, it is an event nothing can reason about sitting in a legal record.
+
+`shared/cem.py` rather than `ingestion/`: two modules need the vocabulary (`ingestion` for evidence,
+`investigation` for confidence), and `shared` is the lowest layer in the import DAG, so neither module
+depends on the other. `platform` has no reason to import it and does not — the DAG contract still
+passes.
+
+### Tests
+
+**88 new pure unit tests** in `tests/unit/test_aggregates.py`: no database, no fixtures, no engine,
+0.73 s for the file. The case machine is asserted over the **full status cross-product** rather than
+the happy path, so an added status cannot quietly become legal. `test_investigation_status.py` now
+imports `REVIEW_DISPOSITIONS` from the models, so the vocabulary has one definition in tests too.
+
+A helper (`assert_rejects`) asserts on `ValidationFailedError.details` rather than `str(exc)`.
+`ValidationFailedError` sets a fixed message and puts the reason in `.details`, so
+`pytest.raises(match=...)` would have matched the fixed string and asserted nothing about the actual
+rejection — a vacuous test. Checking the details pins the field name too, which is what an API client
+reads.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (218 files), import-linter (2/2 kept), full suite **1147 passed
+/ 2 skipped**. Platform coverage **90.66%** against the 90% floor; `shared/cem.py` **99%**.
+
+### Carried forward
+
+**ADR-0011 §3 is not built.** Aggregates do not raise domain events for the application layer to map
+onto the outbox; publication is still a direct `outbox.publish(...)` from each service. That touches
+every publisher in the codebase and is independently valuable, so it belongs in its own increment
+rather than as a rushed half of this one. Nothing in §1 or §2 depends on it, and the guarantees that
+matter for eventing — authenticity and per-aggregate ordering — are ADR-0006's and ADR-0007's, both
+built. ADR-0011's status table records the split.
+
+**No CEM change was needed.** The roadmap's Docs column for 2.4 reads "ADR-0011; CEM value objects",
+which anticipated the model moving. It did not: the value objects quote CEM §4/§5/§13 rather than
+extend them, and the one divergence found ran the other way — code that had invented a sentinel the
+CEM never defined. Aligning the code was the fix.
+
+**Wave 2 is complete.** 2.1 through 2.4 are all built and Accepted. Next roadmap item is Wave 3.1 —
+authentication and sessions plus `case_members` (ADR-0010, XL), which is also the fix for defect D1.
