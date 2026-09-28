@@ -48,15 +48,20 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Final, cast
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.engine.row import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sentinelai.platform.crypto.metrics import (
+    EVENT_SIGNATURE_FAILURES,
+    EVENT_SIGNATURES_VERIFIED,
+)
 from sentinelai.platform.db.uow import UnitOfWork
 from sentinelai.platform.events.envelope import EventEnvelope
 from sentinelai.platform.events.outbox import get_outbox_table
+from sentinelai.platform.events.signing import EventSigner
 from sentinelai.platform.logging import log
 
 # Schema→module map (database-design.md §2): every module owns an outbox_events
@@ -76,6 +81,10 @@ DEFAULT_OUTBOX_SCHEMAS: tuple[str, ...] = (
 # retry attempts (ADR-0006 §2/§4 are one mechanism here). Long enough that a normal handler finishes
 # well inside it; short enough that a dispatcher killed mid-batch does not strand its rows for long.
 CLAIM_LEASE_SECONDS: int = 60
+
+# ADR-0007 §2 verification outcomes.
+VERIFY_STRICT: Final = "strict"
+VERIFY_PERMISSIVE: Final = "permissive"
 
 EventHandler = Callable[[EventEnvelope, UnitOfWork], Awaitable[None]]
 # A module supplies its own concrete UoW type as the factory so its handler gets
@@ -110,12 +119,20 @@ class EventDispatcher:
         poll_interval_seconds: float = 1.0,
         batch_size: int = 100,
         lease_seconds: int = CLAIM_LEASE_SECONDS,
+        signer: EventSigner | None = None,
+        signature_mode: str = VERIFY_STRICT,
     ) -> None:
         self._session_factory = session_factory
         self._poll_schemas = tuple(poll_schemas)
         self._poll_interval = poll_interval_seconds
         self._batch_size = batch_size
         self._lease_seconds = lease_seconds
+        # ADR-0007 §2. With no signer the dispatcher cannot verify at all, so it does not pretend
+        # to:
+        # verification is skipped and that is logged once at startup rather than per event. A
+        # deployment reaches that state only by not wiring a KMS into the relay.
+        self._signer = signer
+        self._signature_mode = signature_mode
         self._handlers: dict[str, list[_Registration]] = defaultdict(list)
         self._shutdown = asyncio.Event()
 
@@ -154,7 +171,11 @@ class EventDispatcher:
 
     async def run_forever(self) -> None:
         """Poll loop. Runs until ``request_shutdown()`` and the current drain ends."""
-        log.info("event_dispatcher_started", schemas=list(self._poll_schemas))
+        log.info(
+            "event_dispatcher_started",
+            schemas=list(self._poll_schemas),
+            signature_mode=self._signature_mode if self._signer else "disabled (no signer wired)",
+        )
         while not self._shutdown.is_set():
             try:
                 dispatched = await self._poll_once()
@@ -244,6 +265,13 @@ class EventDispatcher:
         return rows
 
     async def _process_row(self, schema: str, event: EventEnvelope) -> None:
+        # ADR-0007 §2: verify BEFORE any handler, and before the inbox claim. A forged event that
+        # reached a handler would already have had its effect by the time anything noticed, and the
+        # inbox cannot help — it deduplicates on `(event_id, handler_name)`, and a forger mints a
+        # fresh id.
+        if not await self._verify(schema, event):
+            return
+
         registrations = self._handlers.get(event.event_type, [])
         all_succeeded = True
         for registration in registrations:
@@ -264,11 +292,96 @@ class EventDispatcher:
         else:
             await self._mark(schema, event, status="pending", attempt_count=next_attempt)
 
+    async def _verify(self, schema: str, event: EventEnvelope) -> bool:
+        """Whether this event is authentic enough to deliver — ADR-0007 §2.
+
+        Three outcomes, and the middle one is why a single boolean on the signature is not enough:
+
+        * **verified** — deliver.
+        * **absent** — deliver only under ``permissive``. A row written before Wave 2.3, or by a
+          publisher with no signing identity wired, genuinely has no signature. It cannot be
+          signed retroactively with any honesty, so a deployment migrating real data needs a window
+          in which such rows still flow. Strict refuses them.
+        * **invalid** — never delivered, in either mode. A signature that is present and does not
+          verify is an active forgery attempt, not unproven history. Tolerating it under permissive
+          would hand an attacker a downgrade: corrupt the envelope and the event is treated as
+          merely unsigned.
+
+        A rejected event is quarantined as ``dead_letter`` immediately rather than retried. Retrying
+        is for transient failures, and a bad signature will not become good — retrying would only
+        delay the alarm while burning attempts.
+        """
+        if self._signer is None:
+            return True  # nothing to verify with; logged once at startup
+
+        if event.signature is None:
+            if self._signature_mode == VERIFY_PERMISSIVE:
+                EVENT_SIGNATURE_FAILURES.labels(schema=schema, reason="missing_tolerated").inc()
+                log.warning(
+                    "event_unsigned_tolerated",
+                    event_id=str(event.event_id),
+                    event_type=event.event_type,
+                    schema=schema,
+                    detail="permissive mode: delivered without authentication (ADR-0007 §2)",
+                )
+                return True
+            await self._quarantine(schema, event, reason="signature missing")
+            EVENT_SIGNATURE_FAILURES.labels(schema=schema, reason="missing").inc()
+            return False
+
+        valid = await self._signer.verify(
+            schema=schema,
+            envelope=event.signature,
+            event_id=event.event_id,
+            event_type=event.event_type,
+            event_version=event.event_version,
+            aggregate_type=event.aggregate_type,
+            aggregate_id=event.aggregate_id,
+            payload=event.payload,
+            correlation_id=event.correlation_id,
+            causation_id=event.causation_id,
+            trace_id=event.trace_id,
+            actor_type=event.actor_type,
+            actor_ref=event.actor_ref,
+            occurred_at=event.occurred_at,
+        )
+        if not valid:
+            await self._quarantine(schema, event, reason="signature invalid")
+            EVENT_SIGNATURE_FAILURES.labels(schema=schema, reason="invalid").inc()
+            return False
+
+        EVENT_SIGNATURES_VERIFIED.labels(schema=schema).inc()
+        return True
+
+    async def _quarantine(self, schema: str, event: EventEnvelope, *, reason: str) -> None:
+        """Terminally reject an event that failed authentication, and say so loudly.
+
+        ``CRITICAL`` rather than a warning: under the platform's threat model a forged event is an
+        insider with write access to a module's schema attempting to fabricate a domain fact
+        (ADR-0007 Context). That is a security incident, not a delivery hiccup.
+        """
+        await self._mark(schema, event, status="dead_letter", last_error=f"ADR-0007: {reason}")
+        log.critical(
+            "event_signature_rejected",
+            event_id=str(event.event_id),
+            event_type=event.event_type,
+            aggregate_id=str(event.aggregate_id),
+            schema=schema,
+            reason=reason,
+        )
+
     async def _deliver(self, event: EventEnvelope, registration: _Registration) -> bool:
         """Invoke one handler in its own transaction. True on success, False on failure."""
         try:
             async with self._session_factory() as session:
                 uow = registration.uow_factory(session)
+                # The factory takes only a session (a contract every module implements), so the
+                # signer is attached here instead — otherwise an event published BY a handler, such
+                # as `notification.dispatched`, would be written unsigned and then refused by this
+                # same dispatcher on the next poll.
+                outbox = getattr(uow, "outbox", None)
+                if outbox is not None and getattr(outbox, "signer", None) is None:
+                    outbox.signer = self._signer
                 await registration.handler(event, uow)
                 await uow.commit()
             return True
@@ -288,9 +401,14 @@ class EventDispatcher:
         *,
         status: str,
         attempt_count: int | None = None,
+        last_error: str | None = None,
     ) -> None:
         table = get_outbox_table(schema)
         values: dict[str, object] = {"dispatch_status": status}
+        if last_error is not None:
+            # Persisted on the row, so an operator investigating a dead-lettered event does not have
+            # to correlate it against a log line to learn why it was rejected.
+            values["last_error"] = last_error
         if attempt_count is not None:
             values["attempt_count"] = attempt_count
             # Re-stamped so the backoff window runs from THIS failure, not from the claim. A retry

@@ -25,9 +25,12 @@ from sentinelai.modules.investigation.models import (
     RelationshipEvidence,
     RelationshipRevision,
 )
+from sentinelai.platform.crypto import get_kms
+from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.db.uow import UnitOfWork
 from sentinelai.platform.events.outbox import OutboxWriter
+from sentinelai.platform.events.signing import EventSigner
 
 _SCHEMA = "investigation"
 
@@ -192,7 +195,7 @@ class CorrelationRunRepository:
 
 
 class InvestigationUnitOfWork(UnitOfWork):
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, *, kms: KeyManagementService | None = None) -> None:
         super().__init__(session)
         self.entities = EntityRepository(session)
         self.entity_revisions = EntityRevisionRepository(session)
@@ -201,10 +204,18 @@ class InvestigationUnitOfWork(UnitOfWork):
         self.relationship_evidence = RelationshipEvidenceRepository(session)
         self.entity_mentions = EntityMentionRepository(session)
         self.correlation_runs = CorrelationRunRepository(session)
-        self.outbox = OutboxWriter(session, schema=_SCHEMA)
+        self.outbox = OutboxWriter(
+            session,
+            schema=_SCHEMA,
+            # ADR-0007 §1: events this module publishes are signed under EVENT_ROOT. `None`
+            # writes them unsigned, which the dispatcher's strict mode then refuses -- so an
+            # unwired publisher fails loudly at consume time rather than silently here.
+            signer=EventSigner(kms) if kms is not None else None,
+        )
 
 
 async def get_investigation_uow(
     session: AsyncSession = Depends(get_session),
+    kms: KeyManagementService = Depends(get_kms),
 ) -> InvestigationUnitOfWork:
-    return InvestigationUnitOfWork(session)
+    return InvestigationUnitOfWork(session, kms=kms)

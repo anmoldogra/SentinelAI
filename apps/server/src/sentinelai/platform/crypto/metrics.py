@@ -74,6 +74,16 @@ LEDGER_VERIFICATION_DURATION = Histogram(
     "Wall-clock duration of one ledger verification run.",
     ["ledger"],
 )
+EVENT_SIGNATURE_FAILURES = Counter(
+    "sentinelai_event_signature_failures_total",
+    "Events rejected by signature verification, by schema and reason (missing/invalid).",
+    ["schema", "reason"],
+)
+EVENT_SIGNATURES_VERIFIED = Counter(
+    "sentinelai_event_signatures_verified_total",
+    "Events whose signature verified before dispatch, by schema.",
+    ["schema"],
+)
 LEDGER_ANCHORS_CUT = Counter(
     "sentinelai_ledger_anchors_cut_total",
     "Anchors published to WORM storage, by ledger.",

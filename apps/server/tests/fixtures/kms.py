@@ -33,27 +33,52 @@ from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.crypto.ledger import EVIDENCE_LEDGER_KEY
 from sentinelai.platform.crypto.policy import AlgorithmPolicy
 from sentinelai.platform.crypto.registry import KeyRegistry
+from sentinelai.platform.events.signing import EVENT_SIGNING_KEY
 
 _keystore = tempfile.mkdtemp(prefix="sentinelai-test-kms-")
 atexit.register(shutil.rmtree, _keystore, True)
 
 
-def _build() -> KeyManagementService:
+def _build(keystore: str) -> KeyManagementService:
     kms = KeyManagementService(
-        KeyRegistry(DevKmsProvider(_keystore, is_production=False)),
+        KeyRegistry(DevKmsProvider(keystore, is_production=False)),
         AlgorithmPolicy.from_config(signing_algorithm="ED25519", hybrid=False),
         StructlogAuditSink(),
     )
     # `create_key` is not idempotent — on an existing key it mints a new version — but this
     # keystore is fresh, so exactly one version exists for the whole run. That matters: a test
     # asserting a stored `key_id` would otherwise see a version that drifts.
+    #
+    # Both functional roots are created: EVIDENCE_ROOT for the ledgers and anchors (ADR-0003) and
+    # EVENT_ROOT for outbox signing (ADR-0007). They are separate keys by design — an event
+    # signature must never be presentable as a custody attestation — so a test KMS holding only one
+    # of them would make half the suite fail on a missing key rather than on anything it asserts.
     asyncio.run(kms.create_key(EVIDENCE_LEDGER_KEY))
+    asyncio.run(kms.create_key(EVENT_SIGNING_KEY))
     return kms
 
 
-_KMS = _build()
+_KMS = _build(_keystore)
 
 
 def kms_for_tests() -> KeyManagementService:
-    """The shared test KMS. One instance per run, with one key version."""
+    """The shared test KMS. One instance per run, with one version of each functional root."""
     return _KMS
+
+
+# A SECOND provider on its own keystore: real Ed25519, different key material. Built at import time
+# for the same reason `_KMS` is — `create_key` runs through `asyncio.run`, which cannot be called
+# from inside a running event loop, and every test that wants this is async.
+_alt_keystore = tempfile.mkdtemp(prefix="sentinelai-test-kms-alt-")
+atexit.register(shutil.rmtree, _alt_keystore, True)
+_ALT_KMS = _build(_alt_keystore)
+
+
+def foreign_kms_for_tests() -> KeyManagementService:
+    """A KMS holding *different* keys from :func:`kms_for_tests`.
+
+    For the tests that must distinguish "signed by us" from "signed by someone else". Verifying a
+    genuine, correctly-formed signature against a foreign key is the only way to show the trust
+    decision is real rather than a shape check on the envelope.
+    """
+    return _ALT_KMS

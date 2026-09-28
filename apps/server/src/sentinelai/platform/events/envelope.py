@@ -33,6 +33,12 @@ class EventEnvelope:
     occurred_at: datetime
     dispatch_status: str
     attempt_count: int
+    # ADR-0007 (Wave 2.3). ``None`` for a row written before signing existed, or by a publisher with
+    # no signing identity wired. The dispatcher distinguishes that from a signature that fails to
+    # verify, because permissive mode tolerates the first and never the second.
+    signature: bytes | None = None
+    key_id: str | None = None
+    sig_alg: str | None = None
 
     @classmethod
     def from_row(cls, row: RowMapping) -> EventEnvelope:
@@ -52,4 +58,9 @@ class EventEnvelope:
             occurred_at=row["occurred_at"],
             dispatch_status=row["dispatch_status"],
             attempt_count=row["attempt_count"],
+            # `.get` rather than `[...]`: a projection that selected only the dispatch columns would
+            # otherwise raise here, and an envelope built without signature fields is legitimate.
+            signature=row.get("signature"),
+            key_id=row.get("key_id"),
+            sig_alg=row.get("sig_alg"),
         )

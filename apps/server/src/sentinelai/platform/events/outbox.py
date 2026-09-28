@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -26,6 +27,8 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.schema import Column
+
+from sentinelai.platform.events.signing import EventSigner
 
 # Dedicated metadata: these generic per-schema tables are created by each module's
 # hand-written migration, not by autogenerate against the ORM Base.
@@ -54,6 +57,11 @@ def _build_outbox_table(schema: str) -> Table:
         Column("attempt_count", Integer, nullable=False),
         Column("last_error", Text, nullable=True),
         Column("last_attempted_at", TIMESTAMP(timezone=True), nullable=True),
+        # ADR-0007 (Wave 2.3). Nullable: a row written before signing existed genuinely has none,
+        # and a verifier must be able to tell that from a signature that fails.
+        Column("signature", LargeBinary, nullable=True),
+        Column("key_id", Text, nullable=True),
+        Column("sig_alg", Text, nullable=True),
         schema=schema,
     )
 
@@ -68,11 +76,27 @@ def get_outbox_table(schema: str) -> Table:
 
 
 class OutboxWriter:
-    """Writes integration events to one module's outbox, on the module's session."""
+    """Writes integration events to one module's outbox, on the module's session.
 
-    def __init__(self, session: AsyncSession, schema: str) -> None:
+    **Signing (ADR-0007 §1, Wave 2.3).** When a ``signer`` is present every row is signed under
+    ``KeyPurpose.EVENT_ROOT`` before the insert, so the signature lands in the same transaction as
+    the business write (event-driven §16). Without one the row is written unsigned, which is the
+    honest representation of a publisher that has no signing identity wired — and what the
+    dispatcher's strict mode then refuses to deliver, so the gap surfaces loudly at consume time
+    rather than silently at publish time.
+
+    ``signer`` is a mutable attribute rather than constructor-only because the dispatcher is the
+    composition root for handler UoWs: it builds them through a module-supplied factory that takes
+    only a session, and attaching the signer afterwards avoids changing that factory contract in
+    every module (see ``EventDispatcher._deliver``).
+    """
+
+    def __init__(
+        self, session: AsyncSession, schema: str, *, signer: EventSigner | None = None
+    ) -> None:
         self._session = session
         self._schema = schema
+        self.signer = signer
 
     async def publish(
         self,
@@ -88,11 +112,43 @@ class OutboxWriter:
         trace_id: str | None = None,
         event_version: str = "1.0.0",
     ) -> None:
-        """Insert one ``pending`` outbox row in the caller's open transaction."""
+        """Insert one ``pending`` outbox row in the caller's open transaction.
+
+        Signed first, then inserted: a signing failure must mean no row rather than an unsigned one,
+        and because this runs inside the caller's transaction the whole business write fails with it
+        (ADR-0007's fail-closed posture, matching ADR-0003 §1 for the ledgers).
+
+        ``event_id`` and ``occurred_at`` are generated here rather than left to a column default,
+        because both are inside the signed message — an event's identity and time are part of what
+        the publisher attests to, so they cannot be assigned after the signature is made.
+        """
         table = get_outbox_table(self._schema)
+        event_id = uuid4()
+        occurred_at = datetime.now(UTC)
+        signed_fields: dict[str, Any] = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "event_version": event_version,
+            "aggregate_type": aggregate_type,
+            "aggregate_id": aggregate_id,
+            "payload": payload,
+            "correlation_id": UUID(correlation_id)
+            if isinstance(correlation_id, str)
+            else correlation_id,
+            "causation_id": UUID(causation_id) if isinstance(causation_id, str) else causation_id,
+            "trace_id": trace_id,
+            "actor_type": actor_type,
+            "actor_ref": actor_ref,
+            "occurred_at": occurred_at,
+        }
+        signature = (
+            await self.signer.sign(schema=self._schema, **signed_fields)
+            if self.signer is not None
+            else None
+        )
         await self._session.execute(
             insert(table).values(
-                event_id=uuid4(),
+                event_id=event_id,
                 event_type=event_type,
                 event_version=event_version,
                 aggregate_type=aggregate_type,
@@ -103,8 +159,11 @@ class OutboxWriter:
                 trace_id=trace_id,
                 actor_type=actor_type,
                 actor_ref=actor_ref,
-                occurred_at=datetime.now(UTC),
+                occurred_at=occurred_at,
                 dispatch_status="pending",
                 attempt_count=0,
+                signature=signature.envelope if signature else None,
+                key_id=signature.key_id if signature else None,
+                sig_alg=signature.sig_alg if signature else None,
             )
         )

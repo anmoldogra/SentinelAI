@@ -34,7 +34,7 @@ async def scan_uploaded_evidence(ctx: dict[str, Any], evidence_id: UUID) -> None
     kms = ctx["kms"]
 
     async with session_factory() as session:
-        uow = IngestionUnitOfWork(session)
+        uow = IngestionUnitOfWork(session, kms=kms)
         service = EvidenceService(uow, storage=storage, kms=kms)
         try:
             await service.scan_and_promote(evidence_id, scanner, correlation_id=ctx.get("job_id"))

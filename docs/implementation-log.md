@@ -2109,3 +2109,113 @@ same shape as the anchor-cutter dependency from IC-031, and §28's `_outbox_pend
 `_oldest_pending_age_seconds` are the signal. Recorded in ADR-0006 and event-driven §2.
 
 Next roadmap item is Wave 2.3 — event authentication via signed outbox rows (ADR-0007).
+
+---
+
+## 2026-09-28 — IC-035: Wave 2.2 committed; Wave 2.3 event authentication (ADR-0007)
+
+**Type:** Release of Wave 2.2, then cryptographic non-repudiation for inter-module eventing. Eight
+additive migrations, one new platform module, no breaking change to any event contract.
+
+### Wave 2.2 shipped
+
+Background dispatcher with SKIP LOCKED (IC-034) committed as `2229361` and pushed. ADR-0006 Accepted.
+
+### Wave 2.3: what was wrong
+
+The event bus authenticated nothing. An insider who could `INSERT` into a schema's `outbox_events`
+could forge a domain fact — `evidence.superseded`, `case.status_changed` — and every consumer would
+process it as authentic. The Inbox is no defence: it deduplicates on `(event_id, handler_name)` and a
+forger mints a fresh `uuid4`.
+
+### What was checked before building
+
+`KeyPurpose.EVENT_ROOT` already existed and is reserved in ADR-0009 §7 for exactly this, so no key
+hierarchy invention was needed. ADR-0007 does **not** mandate a verify-optional flag — the roadmap
+lists one as this wave's *rollback* mechanism, which is the framing the implementation uses.
+
+### Three outcomes, not two
+
+§2 says reject a signature that is "absent or invalid". Implemented as three, because collapsing the
+first two would be wrong in both directions:
+
+* **verified** — delivered.
+* **absent** — delivered only under `permissive`. A row written before this wave genuinely has no
+  signature and cannot gain one; signing it now would attest to bytes nobody witnessed.
+* **invalid** — never delivered, in either mode.
+
+Tolerating a present-but-invalid signature under permissive would hand an attacker a downgrade:
+corrupt the envelope and a forgery is treated as merely unsigned. Same distinction ADR-0003 §6 draws
+between *not provable* and *forged*.
+
+### Design decisions worth recording
+
+**Verification runs before the inbox claim**, not after. The inbox deduplicates; it does not
+authenticate, and claiming it first would also record a forged event as seen.
+
+**Rejected events are quarantined, never retried.** A bad signature will not become good, so the row
+goes straight to `dead_letter` with the reason in `last_error` (on the row, so an operator need not
+correlate against logs) and a `CRITICAL` log line — under this ADR's threat model a forged event is an
+insider fabricating a fact, not a delivery hiccup.
+
+**The schema is inside the signed message**, which ADR-0007 §1 does not say. Without it a row lifted
+verbatim from one module's outbox into another's carries a genuine signature over genuine content and
+verifies. `test_an_event_copied_into_another_modules_outbox_is_rejected` is that case.
+
+**Signing fails closed** inside the publisher's transaction, so a KMS outage aborts the business
+write rather than committing an unauthenticatable fact — the trade ADR-0003 §1 makes for the ledgers.
+
+**How the signer reaches a publisher.** `get_<module>_uow` injects the process KMS; job wrappers pass
+`ctx["kms"]`. For events published *by a handler* (`notification.dispatched`) the dispatcher attaches
+the signer to the handler's UoW, because the module-supplied `uow_factory` contract takes only a
+session and threading a KMS through eight modules for a composition concern would be a wide change
+for no gain. A publisher with no signer writes `NULL` — honest, and not silent, because strict mode
+refuses the event at consume time.
+
+### Three defects found while building
+
+**The initial migration must not grow columns.** I first added `signature`/`key_id`/`sig_alg` to
+`create_outbox_events` *and* wrote the additive migration. A fresh upgrade-to-head then created them
+twice: `DuplicateColumn`. A migration is a historical record of the schema at its own revision, not a
+description of the current shape — the current shape lives in `outbox.py`'s Core table. Reverted, with
+the reasoning recorded in the helper so it is not re-added.
+
+**`get_*_uow` depending on `get_kms` broke every API test**, because `get_kms` reads `app.state.kms`
+which the HTTP lifespan sets and `ASGITransport` does not run. Twelve failures and a 16-minute suite
+(rich traceback rendering). Fixed by overriding `get_kms` in the three API test app builders — the
+documented testing seam, not a workaround: a request reaching a real publisher genuinely needs a
+signing identity.
+
+**The test KMS held only `EVIDENCE_ROOT`.** `EVENT_ROOT` is a separate key by design, so the fixture
+now creates both; a KMS holding one would fail half the suite on a missing key rather than on anything
+it asserts. Added `foreign_kms_for_tests()` (a second provider on its own keystore) for the
+"signed by someone else" tests — built at import time, because `asyncio.run` cannot be called from
+inside the running loop of an async test.
+
+### Tests
+
+**40 new** — 27 unit, 13 integration. The unit file varies **each signed field one at a time** and
+asserts the signature stops verifying: a signature covering only the payload would pass an
+end-to-end forgery test while leaving `event_type` and `actor_ref` freely rewritable, which are the
+fields an attacker most wants. That table is what makes "the signature covers the event" checked
+rather than claimed.
+
+The integration file performs the real attack — a hand-written `INSERT` — plus tampering with the
+payload, rewriting `event_type`, corrupting the envelope, transplanting a row into another module's
+schema, and signing with a foreign key. Each is rejected, quarantined, and not retried. Permissive
+mode is proven to carry an unsigned legacy row *and* to still refuse an invalid signature.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (217 files), import-linter (2/2 kept), full suite **1032 passed
+/ 2 skipped**. Platform coverage **90.66%** against the 90% floor (`signing.py` 92%, `outbox.py`
+100%). Migration round-trip green across every schema.
+
+### Carried forward
+
+**ADR-0007 §3 (writer restriction) is not built** and is recorded as such in the ADR's new status
+table. With §1/§2 built and strict mode on, forging an event requires the signing key — the
+substantive guarantee. §3 would additionally require the owning module's database role, making
+cross-module forgery need two independent compromises; it belongs with an ADR-0004 grant narrowing.
+
+Next roadmap item is Wave 2.4 — rich aggregates and value objects (ADR-0011).

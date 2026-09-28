@@ -40,7 +40,7 @@ async def generate_case_report(ctx: dict[str, Any], case_id: UUID, report_id: UU
     kms = ctx["kms"]
 
     async with session_factory() as session:
-        uow = CaseManagementUnitOfWork(session)
+        uow = CaseManagementUnitOfWork(session, kms=kms)
         service = CaseService(uow, storage=storage, kms=kms)
         try:
             await service.complete_report(
@@ -55,7 +55,7 @@ async def generate_case_report(ctx: dict[str, Any], case_id: UUID, report_id: UU
 
     # Fresh transaction: the one above is dead, and the failure must be visible to a poller.
     async with session_factory() as session:
-        failure_uow = CaseManagementUnitOfWork(session)
+        failure_uow = CaseManagementUnitOfWork(session, kms=kms)
         await CaseService(failure_uow, storage=storage, kms=kms).fail_report(report_id, reason)
         await failure_uow.commit()
     raise RuntimeError(f"case report {report_id} failed to generate: {reason}")

@@ -23,10 +23,13 @@ from sentinelai.modules.ingestion.models import (
     EvidenceCustodyEvent,
     IntakeRecord,
 )
+from sentinelai.platform.crypto import get_kms
+from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.db.chain_lock import CUSTODY_CHAIN, lock_chain
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.db.uow import UnitOfWork
 from sentinelai.platform.events.outbox import OutboxWriter
+from sentinelai.platform.events.signing import EventSigner
 
 _SCHEMA = "ingestion"
 
@@ -253,15 +256,25 @@ class AttributeSchemaRepository:
 
 
 class IngestionUnitOfWork(UnitOfWork):
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, *, kms: KeyManagementService | None = None) -> None:
         super().__init__(session)
         self.evidence = EvidenceRepository(session)
         self.custody = CustodyEventRepository(session)
         self.intake = IntakeRepository(session)
         self.connectors = ConnectorRepository(session)
         self.attribute_schemas = AttributeSchemaRepository(session)
-        self.outbox = OutboxWriter(session, schema=_SCHEMA)
+        self.outbox = OutboxWriter(
+            session,
+            schema=_SCHEMA,
+            # ADR-0007 §1: events this module publishes are signed under EVENT_ROOT. `None`
+            # writes them unsigned, which the dispatcher's strict mode then refuses -- so an
+            # unwired publisher fails loudly at consume time rather than silently here.
+            signer=EventSigner(kms) if kms is not None else None,
+        )
 
 
-async def get_ingestion_uow(session: AsyncSession = Depends(get_session)) -> IngestionUnitOfWork:
-    return IngestionUnitOfWork(session)
+async def get_ingestion_uow(
+    session: AsyncSession = Depends(get_session),
+    kms: KeyManagementService = Depends(get_kms),
+) -> IngestionUnitOfWork:
+    return IngestionUnitOfWork(session, kms=kms)

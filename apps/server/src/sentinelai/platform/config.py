@@ -22,6 +22,8 @@ _ZERO_EGRESS = frozenset({"air-gapped", "classified"})
 # KMS providers acceptable for a classified deployment (HSM / managed KMS — never software `dev`).
 _CLASSIFIED_KMS = frozenset({"vault_transit", "pkcs11", "aws_kms", "azure_key_vault", "gcp_kms"})
 # Well-known placeholder secret values that must never reach a production-grade profile.
+# ADR-0007 §2 verification modes. See `events_signature_mode`.
+_EVENT_SIGNATURE_MODES = frozenset({"strict", "permissive"})
 _PLACEHOLDER_SECRETS = frozenset(
     {"", "dev-only-change-me", "changeme", "change-me", "minioadmin", "root", "dev-only-token"}
 )
@@ -114,6 +116,20 @@ class Settings(BaseSettings):
     # cannot be verified at all — `verify_timestamp_token` refuses an empty trust store rather than
     # passing everything, because a token checked against nothing attests to nothing.
     tsa_trust_anchors_pem: str = ""
+
+    # --- event authentication (ADR-0007, Wave 2.3) ---
+    # "strict" rejects an event whose signature is absent OR invalid. "permissive" tolerates an
+    # ABSENT signature (a row written before signing existed) while still rejecting an invalid one
+    # --
+    # the distinction is the whole point: a missing signature is unproven history, a bad one is an
+    # active forgery attempt, and collapsing them would let an attacker downgrade a forgery to a
+    # shrug by corrupting the envelope.
+    #
+    # This is the roadmap's rollback lever for Wave 2.3. Strict by default because this platform has
+    # no pre-signing production data to carry; a deployment that does sets permissive for one
+    # release
+    # and watches `sentinelai_event_signature_failures_total{reason="missing"}` fall to zero.
+    events_signature_mode: str = "strict"
 
     # --- notification delivery (security-architecture §25) ---
     # log (Phase 1: the in-app notification row is the durable delivery) | smtp | slack, later.
@@ -211,6 +227,11 @@ class Settings(BaseSettings):
             return
 
         problems: list[str] = []
+
+        if self.events_signature_mode not in _EVENT_SIGNATURE_MODES:
+            problems.append(
+                f"EVENTS_SIGNATURE_MODE must be one of {sorted(_EVENT_SIGNATURE_MODES)}"
+            )
 
         # Enabled-but-unconfigured is a silent no-op: the anchor cutter would try to timestamp,
         # fail,

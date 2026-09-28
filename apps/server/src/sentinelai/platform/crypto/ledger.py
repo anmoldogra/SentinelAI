@@ -197,7 +197,7 @@ def _serialize_key_id(key_id: KeyId) -> str:
     return f"{key_id.provider.value}:{key_id.version}:{key_id.backend_ref}"
 
 
-def _bundle_to_envelope(bundle: SignatureBundle) -> bytes:
+def encode_signature_envelope(bundle: SignatureBundle) -> bytes:
     """Serialize a signature bundle to canonical JSON.
 
     The per-signature keys mirror ``SignedHeader.canonical_bytes()`` exactly, so the header can be
@@ -232,7 +232,7 @@ def _bundle_to_envelope(bundle: SignatureBundle) -> bytes:
     )
 
 
-def _envelope_to_bundle(envelope: bytes) -> SignatureBundle:
+def decode_signature_envelope(envelope: bytes) -> SignatureBundle:
     """Rebuild a signature bundle from stored bytes. Raises rather than returning a partial one."""
     try:
         parsed = json.loads(envelope.decode("utf-8"))
@@ -327,7 +327,7 @@ class LedgerSigner:
         except Exception as exc:  # a provider fault that escaped the KMS error taxonomy
             raise LedgerSignatureError(f"ledger signing failed: {exc}") from exc
         return LedgerSignature(
-            envelope=_bundle_to_envelope(bundle),
+            envelope=encode_signature_envelope(bundle),
             # Every algorithm in the bundle, so a hybrid (PQC) bundle is queryable by either.
             sig_alg=",".join(sorted(s.header.algorithm.value for s in bundle.signatures)),
             key_id=_serialize_key_id(bundle.primary.header.key_id),
@@ -359,7 +359,7 @@ class LedgerSigner:
             ledger=ledger, sequence=sequence, prev_hash=prev_hash, entry_hash=entry_hash
         )
         try:
-            bundle = _envelope_to_bundle(envelope)
+            bundle = decode_signature_envelope(envelope)
         except LedgerSignatureError:
             return False
         return await self._kms.verify(message, bundle)
@@ -377,6 +377,8 @@ __all__ = [
     "LedgerSignatureError",
     "LedgerSigner",
     "compute_entry_hash",
+    "decode_signature_envelope",
+    "encode_signature_envelope",
     "ledger_timestamp",
     "ledger_uuid",
     "signed_message",

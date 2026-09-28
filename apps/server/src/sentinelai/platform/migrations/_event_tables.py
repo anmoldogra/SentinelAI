@@ -33,6 +33,12 @@ def create_outbox_events(schema: str) -> None:
         sa.Column("attempt_count", sa.Integer(), nullable=False),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("last_attempted_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        # ADR-0007's signature/key_id/sig_alg are deliberately NOT here. This function is called by
+        # each module's *initial* migration, which has to keep producing the schema as it stood at
+        # that revision — adding columns to it would make a fresh upgrade-to-head create them here
+        # and then fail in `add_outbox_signature_columns` with DuplicateColumn. A migration is a
+        # historical record, not a description of the current shape; the current shape lives in
+        # `platform/events/outbox.py`'s Core table.
         schema=schema,
     )
     # The dispatcher polls WHERE dispatch_status = 'pending' ORDER BY occurred_at.
@@ -73,6 +79,30 @@ def create_outbox_dispatch_index(schema: str) -> None:
 
 def drop_outbox_dispatch_index(schema: str) -> None:
     op.drop_index(outbox_dispatch_index(schema), table_name="outbox_events", schema=schema)
+
+
+_SIGNATURE_COLUMNS = ("signature", "key_id", "sig_alg")
+
+
+def add_outbox_signature_columns(schema: str) -> None:
+    """Add ADR-0007's ``signature``/``key_id``/``sig_alg`` to an existing ``outbox_events``.
+
+    Additive and nullable, so the migration is safe against a table with rows in it and needs no
+    backfill. Rows written before this migration keep ``NULL``, which is the truthful value: they
+    were never signed, and cannot be signed retroactively with any honesty — a signature applied now
+    would attest to bytes nobody witnessed at publication. The dispatcher's permissive mode carries
+    such rows through a migration; strict mode refuses them.
+    """
+    op.add_column(
+        "outbox_events", sa.Column("signature", sa.LargeBinary(), nullable=True), schema=schema
+    )
+    op.add_column("outbox_events", sa.Column("key_id", sa.Text(), nullable=True), schema=schema)
+    op.add_column("outbox_events", sa.Column("sig_alg", sa.Text(), nullable=True), schema=schema)
+
+
+def drop_outbox_signature_columns(schema: str) -> None:
+    for column in reversed(_SIGNATURE_COLUMNS):
+        op.drop_column("outbox_events", column, schema=schema)
 
 
 def create_inbox_events(schema: str) -> None:

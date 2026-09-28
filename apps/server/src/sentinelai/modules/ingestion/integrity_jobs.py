@@ -146,7 +146,7 @@ async def reverify_evidentiary_ledgers(
         failed_ledgers += int(audit_report.is_failed)
 
         # --- custody chains: most recently active first, bounded ---
-        uow = IngestionUnitOfWork(session)
+        uow = IngestionUnitOfWork(session, kms=kms)
         service = EvidenceService(uow, storage=storage, kms=kms)
         evidence_ids = await uow.custody.recently_active_evidence_ids(limit=custody_chain_budget)
 

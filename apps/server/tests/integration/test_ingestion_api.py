@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 from sentinelai.entrypoints.http.main import create_app
 from sentinelai.modules.ingestion.service import EvidenceService, get_evidence_service
 from sentinelai.platform.auth.dependencies import CurrentUser, get_current_user
+from sentinelai.platform.crypto import get_kms
 from tests.fixtures.fake_object_storage import FakeObjectStorage
 from tests.fixtures.kms import kms_for_tests
 
@@ -18,6 +19,11 @@ def _app(ing_uow) -> object:
     app = create_app()
     user = CurrentUser(user_id=uuid4(), roles=("investigator",))
     app.dependency_overrides[get_current_user] = lambda: user
+    # Wave 2.3: `get_<module>_uow` now depends on `get_kms` so published events are signed
+    # (ADR-0007 §1). `get_kms` reads `app.state.kms`, which the HTTP lifespan sets -- and
+    # ASGITransport does not run the lifespan. Overriding it is the testing seam, not a
+    # workaround: a request that reaches a real publisher genuinely needs a signing identity.
+    app.dependency_overrides[get_kms] = lambda: kms_for_tests()
     app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(
         ing_uow, storage=FakeObjectStorage(), kms=kms_for_tests()
     )
@@ -52,6 +58,11 @@ async def test_ingest_unregistered_schema_returns_422(ing_uow) -> None:
     app = create_app()  # registry NOT seeded
     user = CurrentUser(user_id=uuid4(), roles=("investigator",))
     app.dependency_overrides[get_current_user] = lambda: user
+    # Wave 2.3: `get_<module>_uow` now depends on `get_kms` so published events are signed
+    # (ADR-0007 §1). `get_kms` reads `app.state.kms`, which the HTTP lifespan sets -- and
+    # ASGITransport does not run the lifespan. Overriding it is the testing seam, not a
+    # workaround: a request that reaches a real publisher genuinely needs a signing identity.
+    app.dependency_overrides[get_kms] = lambda: kms_for_tests()
     app.dependency_overrides[get_evidence_service] = lambda: EvidenceService(
         ing_uow, storage=FakeObjectStorage(), kms=kms_for_tests()
     )

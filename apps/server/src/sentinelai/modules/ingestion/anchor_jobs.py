@@ -184,7 +184,7 @@ async def cut_anchor_batches(
     cut = 0
 
     async with session_factory() as session:
-        uow = IngestionUnitOfWork(session)
+        uow = IngestionUnitOfWork(session, kms=kms)
         # Custody first: it is the chain a court asks about, so it gets the KMS round-trip if this
         # run is interrupted.
         for ledger in (LEDGER_CUSTODY, LEDGER_AUDIT):

@@ -31,6 +31,7 @@ from sentinelai.platform.config import settings
 from sentinelai.platform.crypto import create_kms
 from sentinelai.platform.db.session import async_session_factory, dispose_engine, engine
 from sentinelai.platform.events.dispatcher import EventDispatcher
+from sentinelai.platform.events.signing import EventSigner
 from sentinelai.platform.logging import configure_logging, log
 from sentinelai.platform.security.scanner import build_malware_scanner
 from sentinelai.platform.storage import build_object_storage
@@ -76,7 +77,16 @@ async def on_startup(ctx: dict[str, Any]) -> None:
 
     # ADR-0006 §1: the outbox relay lives here now. Started as a task rather than awaited, so arq
     # goes on to serve jobs; `on_shutdown` drains it.
-    dispatcher = register_all(EventDispatcher(async_session_factory))
+    # ADR-0007 §2: the relay verifies every event before a handler sees it, and signs events that
+    # handlers publish in turn. Both need the process KMS, which is why this is built here rather
+    # than inside the dispatcher.
+    dispatcher = register_all(
+        EventDispatcher(
+            async_session_factory,
+            signer=EventSigner(ctx["kms"]),
+            signature_mode=settings.events_signature_mode,
+        )
+    )
     ctx["dispatcher"] = dispatcher
     ctx["dispatcher_task"] = asyncio.create_task(dispatcher.run_forever())
 

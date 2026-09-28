@@ -205,6 +205,17 @@ Every event, regardless of type, is wrapped in the same envelope — this is the
 | `last_attempted_at` | timestamptz, nullable | |
 | `last_error` | text, nullable | |
 | `dispatched_at` | timestamptz, nullable | |
+| `signature` | bytea, nullable | Ed25519 signature envelope over the event's canonical form (ADR-0007, Wave 2.3) |
+| `key_id` | text, nullable | `provider:version:backend_ref` of the signing key — queryable for rotation, **not** trusted during verification |
+| `sig_alg` | text, nullable | Signature algorithm(s) in the envelope, likewise for querying only |
+
+**Events are authenticated (ADR-0007, Wave 2.3).** An insider who can `INSERT` into a schema's `outbox_events` could otherwise forge domain facts — `evidence.superseded`, `case.status_changed` — that every consumer processes as authentic, and the Inbox does not help: it deduplicates on `(event_id, handler_name)`, and a forger mints a fresh `event_id`. Every row therefore carries a detached Ed25519 signature made under `KeyPurpose.EVENT_ROOT`, produced inside the publisher's transaction and **verified by the relay before any handler runs**.
+
+**What the signature covers:** the publisher's assertion — the owning schema (a domain separator, so a row copied into another module's table does not verify), `event_id`, `event_type`, `event_version`, `aggregate_type`, `aggregate_id`, `payload`, the causal triad, `actor_type`/`actor_ref`, and `occurred_at`. It deliberately does **not** cover `dispatch_status`, `attempt_count`, `last_error`, `last_attempted_at` or `dispatched_at`: those are the relay's bookkeeping, they change legitimately many times after publication, and signing them would make every retry invalidate the signature.
+
+The message is RFC 8785 (JCS) canonical JSON, because `payload` is JSONB and Postgres preserves neither key order nor whitespace — a signature over a non-canonical encoding would break on a round trip that changed nothing. That is also what keeps it reproducible by an independent verifier on the far side of a Redpanda topic (Section 2's Phase 3+), where the signature travels in a message header and the verification logic is unchanged.
+
+**Three outcomes, and the middle one matters.** Verified events are delivered. An **absent** signature is delivered only under `EVENTS_SIGNATURE_MODE=permissive`, the migration window for rows written before this wave (they cannot be signed retroactively with any honesty). An **invalid** signature is never delivered in either mode — tolerating one under permissive would let an attacker downgrade a forgery to a shrug by corrupting the envelope. A rejected event is quarantined as `dead_letter` with the reason in `last_error` and a `CRITICAL` log line; it is never retried, because a bad signature will not become good.
 
 **Illustrative envelope instances** (data, not implementation — the same style of example used throughout `canonical-evidence-model.md` §14 and `api-design.md`):
 
