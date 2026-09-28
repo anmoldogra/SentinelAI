@@ -52,6 +52,12 @@ from sentinelai.platform.logging import log
 
 # Where the request-scoped session is published for the route wrapper to find.
 _STATE_ATTR = "db_session"
+# Where pre-commit hooks accumulate. See `register_pre_commit`.
+_HOOKS_ATTR = "pre_commit_hooks"
+
+# A hook runs after the handler returned and *before* the transaction commits, so anything it
+# writes lands in the same transaction as the handler's own writes.
+PreCommitHook = Callable[[Request, Response], Coroutine[Any, Any, None]]
 
 
 async def bind_session(
@@ -71,6 +77,29 @@ def bound_session(request: Request) -> AsyncSession | None:
     """The session bound to this request, or ``None`` if the route never touched the database."""
     session: AsyncSession | None = getattr(request.state, _STATE_ATTR, None)
     return session
+
+
+def register_pre_commit(request: Request, hook: PreCommitHook) -> None:
+    """Run ``hook`` after the handler succeeds and **before** this request's commit.
+
+    The window between "the handler produced a response" and "the transaction commits" is not
+    reachable from a dependency: FastAPI runs dependency teardown *after* the response is produced,
+    which is the same reason this module is a route class and not a ``yield`` dependency. Anything
+    that must write a record *describing the response*, atomically with the writes the response
+    describes, needs this hook.
+
+    Its first user is the idempotency store (ADR-0012 §2(c)), which has to persist the response in
+    the same transaction as the business write — otherwise a committed effect could exist whose
+    response was never recorded, and the retry would re-execute it. The hook is deliberately
+    generic: this module knows nothing about idempotency, and ``platform.db`` must not start
+    importing its siblings.
+
+    Hooks run in registration order. A hook that raises aborts the commit and rolls the transaction
+    back, which is correct — a response that cannot be recorded must not be delivered as if it had.
+    """
+    hooks: list[PreCommitHook] = getattr(request.state, _HOOKS_ATTR, [])
+    hooks.append(hook)
+    setattr(request.state, _HOOKS_ATTR, hooks)
 
 
 class TransactionalRoute(APIRoute):
@@ -98,10 +127,23 @@ class TransactionalRoute(APIRoute):
                 await _rollback(request)
                 raise
 
+            try:
+                await _run_pre_commit(request, response)
+            except BaseException:
+                # A hook that fails must not leave the handler's writes committed without the
+                # record the hook was there to write. Same rollback the handler's own failure gets.
+                await _rollback(request)
+                raise
+
             await _commit(request)
             return response
 
         return transactional
+
+
+async def _run_pre_commit(request: Request, response: Response) -> None:
+    for hook in getattr(request.state, _HOOKS_ATTR, []):
+        await hook(request, response)
 
 
 async def _commit(request: Request) -> None:
@@ -131,4 +173,10 @@ async def _rollback(request: Request) -> None:
         log.warning("request_transaction_rollback_failed", path=request.url.path)
 
 
-__all__ = ["TransactionalRoute", "bind_session", "bound_session"]
+__all__ = [
+    "PreCommitHook",
+    "TransactionalRoute",
+    "bind_session",
+    "bound_session",
+    "register_pre_commit",
+]

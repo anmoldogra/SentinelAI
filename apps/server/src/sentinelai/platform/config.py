@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     # purpose: it is a credential for a half-authenticated principal (the password has been
     # accepted, the factor has not), so it must not outlive the login attempt that made it.
     mfa_challenge_ttl_seconds: int = 300  # 5m — time to open an authenticator app.
+    # api-design.md §2.9: "stores (key, request body hash, response) for 24 hours". The window has
+    # to outlive a client's whole retry budget — an agency connector on an unreliable link may back
+    # off for hours — and every hour past that is a row kept for a retry that will never come.
+    idempotency_ttl_seconds: int = 86_400  # 24h, per §2.9.
 
     # --- object storage (evidence blobs) ---
     storage_endpoint_url: str = "http://localhost:9000"

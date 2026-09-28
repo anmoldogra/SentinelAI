@@ -75,6 +75,17 @@ class ConflictError(DomainError):
     code, http_status = "CONFLICT", 409
 
 
+class IdempotencyKeyConflictError(DomainError):
+    """An ``Idempotency-Key`` was reused with a different request body (api-design.md §2.9).
+
+    409, and the code is the one §2.4's table already documents. ADR-0012 §2(b) says ``422``; that
+    is wrong and is recorded as such in the ADR — 422 means the entity is semantically invalid,
+    whereas the entity here is fine and the *key reuse* is the conflict, which is what 409 is for.
+    """
+
+    code, http_status = "IDEMPOTENCY_KEY_CONFLICT", 409
+
+
 class PreconditionFailedError(DomainError):
     """An ``If-Match`` ETag did not match current state — optimistic-concurrency
     guard (api-design.md §2.6). Distinct from a 409 body conflict."""
