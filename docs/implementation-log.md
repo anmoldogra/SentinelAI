@@ -2584,3 +2584,148 @@ export/read surface over a ledger that already exists and verifies, so it is add
 here so it is not mistaken for something this increment covered.
 
 Next roadmap item is Wave 3.2 — the API idempotency store (ADR-0012, `platform.idempotency_keys`).
+
+---
+
+## 2026-09-29 — IC-038: Wave 3.1 committed; Wave 3.2 API idempotency (ADR-0012)
+
+**Type:** Release of Wave 3.1, then the idempotency store `api-design.md` §2.9 has specified since
+the API was designed. One migration, one new `platform` package, one generic seam on ADR-0005's
+transaction boundary. No endpoint's contract changes.
+
+### Wave 3.1 shipped
+
+Access and API trust (IC-037) committed as `fb0dd50` (membership ABAC, ADR-0017) and `99eba54`
+(MFA enforcement + session lifecycle, ADR-0010), then pushed.
+
+### Wave 3.2: what was wrong
+
+Twenty endpoints in `api-design.md` §4 are marked "Yes (key)", `Idempotency-Key` has been in §2.9
+from the start, and **nothing implemented it**. A connector that timed out and retried
+`POST /evidence` created a second evidence object — two chain-of-custody roots for one seizure, both
+signed, both anchored, and no way for a verifier to say which was the real one. The header was
+accepted and ignored, which is worse than rejecting it: a client doing exactly what the contract
+asked got no protection and no error.
+
+### ADR-0012 §2(b) says 422. The status is 409
+
+The task for this wave specified `422` on a fingerprint mismatch, and so does the ADR. `api-design.md`
+disagrees in three places: §2.4's error table lists `IDEMPOTENCY_KEY_CONFLICT → 409`, §2.9 spells out
+"returns `409 IDEMPOTENCY_KEY_CONFLICT`", and `POST /evidence` lists "409 (idempotency)" among its
+error codes. `CLAUDE.md` makes `api-design.md` authoritative for the REST contract, and
+`shared/exceptions.py`'s own docstring requires every exception map 1:1 to a documented §2.4 code.
+
+`409` is also right on the merits: `422` means the entity is semantically invalid, and here the entity
+is a perfectly valid case or evidence object — what conflicts is the *reuse of the key*, which is a
+state conflict. Implementing the ADR's `422` would have meant either contradicting the published
+contract or editing three places in `api-design.md` to match an ADR that was wrong. The ADR is
+corrected instead, with the reasoning recorded in its status block.
+
+### Middleware could not satisfy §2(c), so it is a dependency plus a pre-commit hook
+
+§2 offers "dependency/middleware" and §2(c) requires the response be persisted **in the same
+transaction as the business write**. ASGI middleware runs outside the route's session entirely, so it
+would have to open its own transaction — and could then commit a response record for a business write
+that rolled back, or commit the write and lose the record. Both are the failure this ADR exists to
+prevent, in opposite directions.
+
+What is built is a **router-level dependency**. It shares the request-scoped session (FastAPI caches
+`get_session`), and it can stop the handler by raising — which is what makes "no double effects" mean
+*the business logic does not run twice*, rather than *its writes get deduplicated afterwards*. The
+distinction is the whole point, and it is what the API tests assert: the service is wrapped in a
+counting spy, and every replay test checks the counter, not just the body. A body-only test would pass
+against an implementation that re-ran the handler and threw the second result away.
+
+A replay reaches the client as an exception (`IdempotentReplay`) rendered by a registered handler,
+because a dependency can only refuse to let the handler run. The refusal *is* the mechanism.
+
+Recording the response needs a window no dependency can reach: after the handler returns, before the
+commit. FastAPI runs dependency teardown *after* the response is produced — the same finding that made
+ADR-0005 a route class instead of a `yield` dependency (IC-012). So `platform/db/transaction.py` gains
+a generic `register_pre_commit` hook. It names nothing about idempotency; `platform.db` must not start
+importing its siblings, and the hook is a seam rather than a dependency.
+
+### The unique constraint is the concurrency control
+
+§2(d) permits "serialize (row lock) **or** `409`". Serializing is strictly better — a client that
+retried after a timeout wants the original answer, not a new error — and it needed no explicit
+locking. Two simultaneous requests carrying one key both reach the claim `INSERT`; Postgres makes the
+second wait on `uq_idempotency_claim` until the first transaction ends. First committed → the second's
+insert fails and it replays the response now stored. First rolled back → the second's insert succeeds
+and it proceeds.
+
+That is why the claim lives in the **request's own transaction**, and the consequence is the design's
+best property: a failed request's claim rolls back with it, so the client can fix the problem and
+retry the same key immediately. A claim committed independently would outlive the failure it
+accompanied and block every retry of that key for the full 24 hours — one transient error becoming a
+day of them — and would need a reaper for abandoned claims. This design needs neither. `state =
+'claimed'` is therefore never observable by another transaction, which is proven against Postgres
+rather than argued.
+
+### What is deliberately not cached
+
+**Failures.** Most arrive as exceptions and roll back with their claim; a handler that *returns* a
+4xx/5xx has its claim dropped explicitly. Caching a failure would block every retry of that key while
+storing nothing worth replaying.
+
+**Streaming responses.** No materialized body, and consuming the iterator to capture one would break
+the response being sent. The claim is dropped — such an endpoint is not idempotency-cacheable, and
+saying so by not caching beats storing an empty body and replaying it as the answer.
+
+**Most headers.** An allowlist (`ETag`, `Location`, `Content-Type`), not a denylist: `Date`,
+`Content-Length` and any request/correlation id describe *this* exchange, and replaying a stored copy
+would hand a client another request's identifiers. A replay also carries `Idempotent-Replay: true`,
+which §2.9 does not specify — without it a replay is indistinguishable from a fresh execution and
+"did my retry take effect?" is unanswerable from the wire.
+
+### The fingerprint covers more than §2.9's "body hash"
+
+SHA-256 over `(method, path, principal, body)` with a `NUL` separator between fields, so
+`("POST", "/a/b")` and `("POST/a", "/b")` cannot hash alike — the same domain-separation argument
+ADR-0003 §2 makes for the ledger preimage. The method matters because `PUT` and `PATCH` on one path
+with one body are different operations. The principal is redundant against the unique constraint
+today and is included anyway, so that widening the lookup later (a service account acting for a user)
+cannot silently let one caller replay another's response.
+
+The body is hashed **verbatim**, not JCS-canonicalized. Canonicalizing would let a client resend
+semantically-identical JSON with different whitespace and still replay — friendlier, and it means
+parsing attacker-controlled input on the idempotency path before any handler has validated it, to buy
+leniency in a case where the strict answer (conflict, retry fresh) is already safe. A body that will
+not parse at all still gets a fingerprint.
+
+### Tests
+
+**41 new** — 13 pure fingerprint tests, 14 end-to-end over the real router stack, 14 against real
+Postgres.
+
+The Postgres file carries the two properties a fake cannot express: a genuine two-transaction race on
+one key (with a barrier, so it is a race and not two sequential calls) proving exactly one claim
+survives and the loser blocks rather than duplicating; and that a rolled-back claim frees its key
+immediately.
+
+One test failure was worth more than the test. `test_a_failed_request_leaves_no_claim` failed because
+the fake session could not roll back a dict — and the first draft's comment papered over that by
+asserting the guard's cleanup path instead. The fake now models pending-vs-committed rows and honours
+`rollback()`, so the test asserts the real property. A fake that cannot fail the way production fails
+is a fake that proves nothing.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (226 files), import-linter (2/2 kept — `platform` stays
+domain-agnostic; the idempotency package imports nothing from any module). Full suite **1236 passed /
+2 skipped**. Platform coverage **95.30%** against the 90% floor, with the new package at 91–100%
+(`guard.py` 91%, everything else 100%). Migration round-trip green including the new revision.
+
+### Carried forward
+
+**The header is enforced when present, not yet mandatory.** §2.9 says it is *required* on the twenty
+"Yes (key)" endpoints. Making it so would reject every request from the existing console and any
+connector that does not send one — a client-breaking change belonging with a coordinated `apps/web`
+and SDK update, not smuggled into the store that makes it possible. Recorded in ADR-0012's status.
+
+**`DELETE` is excluded by design**, not omission: every keyed `DELETE` in §4 is marked *naturally*
+idempotent, so storing a response for one would add a write to buy nothing.
+
+Next roadmap item is Wave 4 (Phase 2) — CQRS graph read models (ADR-0013), multi-tenancy (ADR-0014),
+observability, and DR/backup. Wave 3's remaining gaps are unchanged and still recorded in IC-037: SSO,
+ADR-0010 A3's cookie transport, self-service MFA enrolment, and the admin router.

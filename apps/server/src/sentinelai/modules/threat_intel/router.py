@@ -18,6 +18,7 @@ from sentinelai.modules.threat_intel.schemas import (
 from sentinelai.modules.threat_intel.service import ThreatIntelService, get_threat_intel_service
 from sentinelai.platform.auth.dependencies import CurrentUser, require_role
 from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
+from sentinelai.platform.idempotency import enforce_idempotency
 from sentinelai.shared.envelope import Envelope, ListEnvelope, Meta, Pagination
 from sentinelai.shared.pagination import PageParams, page_params
 
@@ -28,7 +29,10 @@ router = APIRouter(
     # success and rolls back on any exception; `bind_session` publishes the request-scoped
     # session for it. Declared here rather than per-handler so no handler can omit it.
     route_class=TransactionalRoute,
-    dependencies=[Depends(bind_session)],
+    # ADR-0012 / api-design.md §2.9: a mutating request carrying an `Idempotency-Key`
+    # replays its stored response instead of re-executing. A no-op without the header, so
+    # this changes nothing for the endpoints §2.9 does not cover.
+    dependencies=[Depends(bind_session), Depends(enforce_idempotency)],
 )
 
 

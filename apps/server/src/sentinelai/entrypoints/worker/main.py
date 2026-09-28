@@ -32,6 +32,7 @@ from sentinelai.platform.crypto import create_kms
 from sentinelai.platform.db.session import async_session_factory, dispose_engine, engine
 from sentinelai.platform.events.dispatcher import EventDispatcher
 from sentinelai.platform.events.signing import EventSigner
+from sentinelai.platform.idempotency import purge_expired_idempotency_keys
 from sentinelai.platform.logging import configure_logging, log
 from sentinelai.platform.security.scanner import build_malware_scanner
 from sentinelai.platform.storage import build_object_storage
@@ -147,6 +148,19 @@ class WorkerSettings:
             minute=0,
             run_at_startup=False,
             max_tries=3,
+        ),
+        # ADR-0012 §3: sweep expired idempotency records. Daily rather than hourly — the read path
+        # already ignores an expired row (and deletes it when a client reuses that key), so this is
+        # about table and index size, not correctness, and a missed run costs nothing but disk.
+        #
+        # 03:10, off every other schedule here: it is the one job that takes a table-wide DELETE,
+        # and there is no reason for that to overlap the anchor cutter's reads.
+        cron(
+            purge_expired_idempotency_keys,
+            hour={3},
+            minute=10,
+            run_at_startup=False,
+            max_tries=2,
         ),
     ]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
