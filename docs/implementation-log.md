@@ -2729,3 +2729,144 @@ idempotent, so storing a response for one would add a write to buy nothing.
 Next roadmap item is Wave 4 (Phase 2) — CQRS graph read models (ADR-0013), multi-tenancy (ADR-0014),
 observability, and DR/backup. Wave 3's remaining gaps are unchanged and still recorded in IC-037: SSO,
 ADR-0010 A3's cookie transport, self-service MFA enrolment, and the admin router.
+
+---
+
+## 2026-09-29 — IC-039: Wave 3 gap closure — A3 cookie transport and the audit-log export
+
+**Type:** Two gaps IC-037 and IC-038 recorded as outstanding, closed. One additive migration, one new
+`platform` package, one new endpoint. No new ADR — both items were already specified and already
+recorded as unbuilt.
+
+### Gap 1: A3 was half-built, and the half that was missing was the transport
+
+ADR-0010 A3 specifies two credentials: a short-lived access token in the `Authorization` header held
+in JavaScript memory, and a long-lived refresh token in an `HttpOnly; Secure; SameSite=Strict` cookie
+scoped to the refresh endpoint. Wave 3.1 built the **rotation** half against a single credential
+carried in the request body — which meant the client had to hold the long-lived credential in
+JavaScript to send it, the exact exposure the cookie exists to remove.
+
+`platform.sessions` now carries two independently-generated 256-bit tokens per row, each as an
+argon2id digest plus a lookup prefix. Independent generation is the point: a refresh token derivable
+from an access token would make the script-exposed credential sufficient to mint new sessions.
+
+**Two expiries, and this inverted an existing test.** `expires_at` is the access token's;
+`refresh_expires_at` is the refresh token's. The access token must be able to expire *while the
+session stays refreshable* — that is the entire purpose of the split — so `refresh` keys on the
+refresh credential and checks `refresh_expires_at`. A path that resolved the access token would
+refuse exactly the case it exists to serve, and would require a live access token in order to replace
+one, which is circular.
+
+`test_an_expired_session_cannot_be_refreshed` had asserted the opposite, correctly, when there was
+one credential. It is now a pair: an expired **access** token must still refresh, and an expired
+**refresh** token must not. A third test pins that the two credentials are not interchangeable —
+separate repository methods matching separate digests, rather than one method accepting either, which
+would make them a single credential with two names.
+
+**One row, not a `refresh_tokens` table.** The credentials share one lifecycle: issued together,
+revoked together, replaced together by rotation. A second table would model a one-to-one relationship
+as a join and give `revoked_at` two places to disagree about whether a session is over.
+
+**Pre-A3 sessions cannot be backfilled** and are not. The plaintext was never stored, so there is no
+digest to derive; those sessions stay usable until their access token expires and are then simply not
+refreshable. A placeholder digest would be a row claiming a credential exists when none does.
+
+`cookies.py` owns every attribute, because A3's argument is a property of the whole set — three
+handlers with three literal attribute lists would be three chances for the one that matters to drift.
+`Secure` is keyed on the profile *name* rather than `is_production`, so `testing` gets it too: a test
+profile is not a reason to hand out a cookie that could travel in clear.
+
+Logout clears the cookie as well as revoking server-side. Revocation alone suffices for security, but
+a cookie left in the jar means the browser keeps presenting a dead token and the resulting 401 is
+indistinguishable, to the client, from a session that expired on its own. `/auth/logout` never
+*receives* the cookie — its `Path` scopes it to the refresh endpoint — and clearing works anyway,
+because `Set-Cookie` is applied from the response.
+
+**A3's CSRF argument is now tested, not asserted.** It depends on no endpoint accepting the cookie as
+authentication. `test_the_cookie_is_not_accepted_as_authentication` presents the cookie with no
+`Authorization` header and requires a refusal.
+
+### The access token is still 8 hours, and it is the one part of A3 still outstanding
+
+A3 calls the access token "short". `session_ttl_seconds` stays at 8h because `apps/web` has no
+refresh loop — `shared/api/client.ts` marks retry/refresh as "deliberately NOT here yet" — so
+shortening it would log every analyst out mid-shift with no automatic recovery.
+
+Stated plainly rather than left implicit: A3's benefit — "an XSS that steals the in-memory access
+token still cannot mint new sessions past its short expiry" — is weakened while "short" means 8h.
+What the transport buys *today* is that the long-lived credential is unreadable by script, so an XSS
+cannot extend its reach past the stolen token's own window. Tightening the TTL is one line once the
+console can refresh.
+
+### A dead config field was squatting on a live name
+
+`refresh_token_ttl_seconds` already existed — inside the block marked "RESERVED, NOT ACTIVE", left
+from the JWT design ADR-0010 §2 explicitly rejected. Nothing read it. Now that the name has a real
+meaning, two fields with one name is the drift trap Wave 2.4 removed from the CEM vocabulary
+(IC-036), so the dead pair went: `refresh_token_ttl_seconds` is the live setting, and
+`access_token_ttl_seconds` went with it because the access token's lifetime is `session_ttl_seconds`
+and a second field claiming to be it would be read first and be wrong. A stale comment asserting the
+refresh flow "is not built yet" was corrected in the same pass.
+
+### Gap 2: the audit log had no export
+
+`api-design.md` §4.1 has listed `GET /api/v1/admin/audit-log` (admin, compliance) and §10 has
+detailed it since the API was designed; PRD FR-9.3 requires it. The app registered health, auth and
+the module routers, and nothing else — so the one artifact an oversight body reads was reachable only
+by someone with database credentials, which is precisely the person an audit is meant to check.
+
+`platform/admin/` rather than a module: `platform.audit_log` is platform-owned — every module writes
+through `record_audit_event`, none owns it — so an admin router inside `case_management` would be a
+module reaching across a schema boundary for a table that is not its own.
+
+**Ascending `(occurred_at, audit_id)`, which is a correctness requirement and not a preference.** The
+export exists to be verified, and verifying `entry_hash` links needs the order the entries were
+written in; newest-first would be friendlier to a UI and hand a reviewer a sequence whose links run
+backwards. The composite key matters because `occurred_at` is not unique — two entries written in one
+transaction can share a timestamp, and ordering by it alone would let a page boundary drop or
+duplicate one. Keyset pagination, not OFFSET: the audit log only grows, and an OFFSET scan deep into
+it gets slower the more history there is to export.
+
+**The export carries the signature, not only the hashes.** Recomputing the chain proves the entries
+are *self-consistent* — an insider who rewrote the whole chain would pass that check. Only the
+signature proves they could not (ADR-0003 §1), so `signature` (base64), `sig_alg`, `key_id`,
+`hash_algo` and `preimage_version` ship alongside `prev_entry_hash`/`entry_hash`. The agility fields
+are nullable, and a verifier must report a null as *unprovable* rather than as a pass.
+
+**Reading the audit log is deliberately not itself audited.** An entry per audit read would grow the
+table on every page of an export and, because each entry chains to the last, interleave the reader's
+own footprints into the chain being exported. The access is authorized and logged at request level;
+§10 asks for neither more nor less.
+
+The repository exposes **no write method**. §10: "There is no `DELETE` anywhere in this endpoint group
+— the audit log has no API-level erasure path at all." A parametrized test asserts `DELETE`, `POST`,
+`PATCH` and `PUT` all return 405, because the day someone adds a convenience mutation here is the day
+the audit log stops being evidence.
+
+### Tests
+
+**48 new** — 18 session lifecycle (three of them new, replacing one whose premise A3 inverted), 11
+cookie transport, 19 audit-log export.
+
+The audit-log tests build a **real** chain through `record_audit_event` against Postgres rather than
+fabricating hashes, and the pagination test walks the whole log two entries at a time and asserts the
+reassembled sequence is every entry, once, in order, **with the links still joining across page
+boundaries** — the way keyset pagination over a composite key actually breaks. The cookie tests read
+the raw `Set-Cookie` header rather than httpx's parsed jar, because A3 is a statement about the
+attributes and the jar flattens them.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (232 files), import-linter (2/2 kept). Full suite **1268 passed
+/ 2 skipped**. Platform coverage **95.65%** against the 90% floor. Migration round-trip green
+including the new revision.
+
+### Carried forward
+
+**SSO/OIDC/SAML** remains unbuilt — deferred by sequencing per ADR-0010 A1, explicitly not scoped out
+of any profile. **Self-service MFA enrolment** remains CLI-only. **The access-token TTL** is the
+remaining piece of A3, gated on the console's refresh loop. The rest of §4.1's admin group
+(`/admin/users`, `/admin/roles`) is still unbuilt; provisioning is `sentinelai.cli.admin`.
+
+Next roadmap item is Wave 4 (Phase 2) — CQRS graph read models (ADR-0013), multi-tenancy (ADR-0014),
+observability, and DR/backup with independent integrity attestation.

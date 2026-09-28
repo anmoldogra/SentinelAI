@@ -17,7 +17,7 @@ ADR-0009. Resolves documentation contradiction **D1**.
 | §4 RBAC (`require_role`) | **Built** (pre-Wave-3.1) |
 | §4 ABAC / `case_members` | **Moved out** by A2 → **ADR-0017**, which is now Accepted and Built. `require_case_access` is owner-or-member and audits its denials |
 | §5 / A3 Access token in memory, never web storage | **Built** — `apps/web/src/shared/auth/token-store.ts` has no storage path and ESLint bans the globals |
-| §5 / A3 Refresh credential as an `HttpOnly` cookie | **Not built** — `POST /auth/refresh` takes the token in the request body. See the note |
+| §5 / A3 Refresh credential as an `HttpOnly` cookie | **Built** — `HttpOnly; Secure; SameSite=Strict`, `Path=/api/v1/auth/refresh`; the refresh token never appears in a response body, and `POST /auth/refresh` takes no body at all |
 
 **`security-architecture.md` §8 compliance is now enforced rather than merely intended.** The
 non-compliance this status block previously recorded — MFA storage that nothing consulted — is
@@ -67,22 +67,68 @@ both `0` and `O` guarantees support tickets. Ten characters is ~51 bits — less
 deliberately: a longer code gets transcribed wrong, and each attempt already costs an argon2id verify
 and is single-use.
 
-### Refresh is rotation, and the cookie is not built
+### A3's two credentials (2026-09-29, Wave 3.3)
 
-A3 specifies a two-token scheme: a short-lived access token in memory and a long-lived refresh
-credential in an `HttpOnly; Secure; SameSite=Strict` cookie scoped to the refresh endpoint. What
-Wave 3.1 built is the **rotation** half — `POST /auth/refresh` issues a successor session and sets
-`revoked_at` on its predecessor, so a stolen token is single-use and its reuse is detectable, which
-is A3's stated security property.
+Wave 3.1 built A3's **rotation** half against a single credential carried in the request body. This
+completes the **transport** half, and the two together are what A3 actually asks for.
 
-The **transport** half is not built: there is one credential, not two, and it travels in the
-request body. Completing A3 means a second token class (a schema change on `platform.sessions`),
-cookie issuance, and a matching change in `apps/web` — a coordinated front-and-back increment
-rather than a detail of this one.
+`platform.sessions` now holds two independently-generated 256-bit tokens per row — each as an
+argon2id digest plus a lookup prefix, neither ever stored in the clear. Independently generated
+matters: a refresh token derivable from an access token would make the script-exposed credential
+sufficient to mint new sessions, which is precisely the exposure the split removes.
 
-A3's CSRF argument is unaffected and still holds, for the same reason it did before: **no endpoint
-accepts a cookie as authentication.** That property remains load-bearing, and the day one does, a
-CSRF token becomes mandatory in the same change.
+**One row, two expiries.** `expires_at` is the access token's; `refresh_expires_at` is the refresh
+token's. The access token has to be able to expire *while the session stays refreshable* — that is
+the entire point — so a refresh path that resolved the access token, or checked `expires_at`, would
+refuse exactly the case it exists to serve, and would require a live access token in order to replace
+one, which is circular. `refresh` therefore keys on the refresh credential alone. The test that
+previously asserted "an expired session cannot be refreshed" had its premise inverted by this change
+and is now a pair: an expired *access* token must still refresh, an expired *refresh* token must not.
+
+**The credentials are not interchangeable.** `get_active_by_token` and `get_active_by_refresh_token`
+are separate methods matching separate digests, rather than one method accepting either — one method
+would make them a single credential with two names. An access token presented at `/auth/refresh` is
+refused, and a refresh token presented as a bearer does not resolve.
+
+**Why a session row and not a `refresh_tokens` table.** The two credentials share one lifecycle: they
+are issued together, revoked together, and rotation replaces both at once. A second table would model
+a one-to-one relationship as a join and give `revoked_at` two places to disagree about whether a
+session is over.
+
+**Pre-A3 sessions have no refresh credential and cannot be given one** — the plaintext was never
+stored, so there is no digest to backfill. Those sessions stay usable until their access token expires
+and are then simply not refreshable. Writing a placeholder digest would be a row claiming a
+credential exists when none does.
+
+`cookies.py` owns every attribute of the cookie, because A3's argument is a property of the whole set
+and not of any one of them; three handlers with three literal attribute lists would be three chances
+for the one that matters to drift. `Secure` is keyed on the profile *name* rather than
+`is_production`, so `testing` gets it too — a test profile is not a reason to hand out a cookie that
+could travel in clear.
+
+Logout clears the cookie as well as revoking server-side. Revocation alone is sufficient for security
+— the credential is dead either way — but a cookie left in the jar means the browser keeps presenting
+a dead token, and the 401 it earns is indistinguishable, to the client, from a session that simply
+expired. Note that `/auth/logout` never *receives* this cookie (its `Path` scopes it to the refresh
+endpoint); clearing works regardless, because `Set-Cookie` is applied from the response.
+
+**A3's CSRF argument still holds, and is now tested rather than asserted.** It depends on **no
+endpoint accepting the cookie as authentication**; `get_current_user` reads the `Authorization`
+header and nothing else, and `test_the_cookie_is_not_accepted_as_authentication` is what keeps that
+true. The day an endpoint does accept it, a CSRF token becomes mandatory in the same change.
+
+### The access token is still 8 hours, and that is the one thing A3 asks for that is not done
+
+A3 calls the access token "short". `session_ttl_seconds` remains at its pre-A3 value of 8h because
+`apps/web` has no refresh loop — `shared/api/client.ts` marks retry/refresh as "deliberately NOT here
+yet". Shortening it now would log every analyst out mid-shift with no automatic recovery, trading a
+real usability failure for a partial security gain.
+
+The consequence is worth stating plainly rather than leaving implicit: A3's stated benefit — "an XSS
+that steals the in-memory access token still cannot mint new sessions past its short expiry" — is
+weakened for as long as "short" means 8h. What the transport does buy today is that the *long-lived*
+credential is unreadable by script, so an XSS cannot extend its reach beyond the stolen token's
+window. Tightening the access TTL is a one-line configuration change once the console can refresh.
 
 ### Logout takes the header directly, not `get_current_user`
 

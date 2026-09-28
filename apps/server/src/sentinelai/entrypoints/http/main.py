@@ -34,6 +34,7 @@ from sentinelai.modules.notification.router import router as notification_router
 from sentinelai.modules.osint.router import router as osint_router
 from sentinelai.modules.social_media.router import router as social_media_router
 from sentinelai.modules.threat_intel.router import router as threat_intel_router
+from sentinelai.platform.admin import admin_router
 from sentinelai.platform.auth.dependencies import get_case_access_checker
 from sentinelai.platform.auth.router import router as auth_router
 from sentinelai.platform.config import settings
@@ -197,6 +198,12 @@ def create_app() -> FastAPI:
     # Authentication lives in platform, not a domain module — it issues the sessions the
     # module routers authorize against, so it is registered ahead of them.
     app.include_router(auth_router)
+
+    # api-design.md §4.1/§10: the audit-log export. Registered next to auth rather than among the
+    # module routers because it reads `platform.audit_log`, which platform owns — every module
+    # writes to it and none owns it. Authorization is per-route (`admin`, `compliance`), not
+    # router-wide, so the first mutating admin endpoint cannot inherit a read gate by accident.
+    app.include_router(admin_router)
 
     # Domain module routers (each carries its own /api/v1 prefix).
     for module_router in _MODULE_ROUTERS:
