@@ -2870,3 +2870,161 @@ remaining piece of A3, gated on the console's refresh loop. The rest of §4.1's 
 
 Next roadmap item is Wave 4 (Phase 2) — CQRS graph read models (ADR-0013), multi-tenancy (ADR-0014),
 observability, and DR/backup with independent integrity attestation.
+
+---
+
+## 2026-09-30 — IC-040: Wave 4.1 CQRS graph read models (ADR-0013); `get_case_graph` unblocked
+
+**Type:** The first read/write split in the codebase. One new schema, one migration, two projectors,
+one endpoint that had raised `NotImplementedError` since Phase 8. Resolves the roadmap's
+benchmark-gated graph-store decision, with measurements.
+
+### The deferral was structural, not a performance problem
+
+`service.get_case_graph` had raised `NotImplementedError` for eight phases, and its docstring said
+why: **no documented table maps a case to its entities.** Relationships reference evidence, cases
+reference evidence, and `database-design.md` §5 forbids the cross-schema foreign key that would join
+them. Every earlier attempt to schedule this read it as "graph queries are slow"; the query could not
+be *written*.
+
+`investigation.correlation_generated` already carries `case_id` beside `relationship_id`
+(event-driven §25.8). The **event stream supplies the mapping the schema cannot** — and that is not a
+loophole in §5, because nothing joins across a schema at query time: the join happened when the event
+was published. That asymmetry is the whole reason CQRS applies here, and it is why this wave closes a
+deferral that three earlier waves could not.
+
+### §3's benchmark gate, resolved as "no graph datastore"
+
+ADR-0013 §3 committed to adopting a graph store "only if measured CTE latency at target cardinality is
+insufficient — a new datastore is a decision that requires evidence". Measured on the built projection
+against PostgreSQL 16 (p50 of five samples):
+
+| Entities | Edges | depth=1 | depth=3 | Returned at depth=3 |
+|---|---|---|---|---|
+| 1,000 | 3,000 | 15 ms | 75 ms | 993 nodes / 2,991 edges |
+| 10,000 | 30,000 | 153 ms | 1,417 ms | 9,941 nodes / 29,942 edges |
+| 50,000 | 200,000 | 1,793 ms | 13,996 ms | 49,975 nodes / 199,990 edges |
+
+**The last column is the finding.** These are single dense components, so a 3-hop walk reaches
+essentially everything: the 14 seconds is spent materializing and serializing 250,000 elements, not
+traversing to find them. A graph database returns the same 250,000 elements just as slowly. So the
+measurement does not say "CTEs are too slow" — it says a dense-component `depth=3` is the wrong query
+to answer, and the limit is **response size**. `api-design.md` §6 already assumes a case subgraph is
+bounded and offers no pagination, so the mitigation is a node cap on the response, not a storage
+engine.
+
+Decision: **stay on PostgreSQL.** The air-gapped profiles settle it independently of the numbers — a
+second datastore is a second image to mirror into the enclave, a second backup path, a second set of
+Vault credentials, and a second thing to patch on an offline update cycle, for a query shape that is
+not the bottleneck. Apache AGE avoids the separate *service* but is still an extension that must be
+present in the enclave image and version-matched. Recorded in ADR-0013 with the gate left open: a
+*bounded* subgraph missing interactive latency would be new evidence.
+
+### `investigation_read`, not `graph_read_models`
+
+§1 asks for read/write separation, and a schema boundary is what makes that checkable rather than
+aspirational — a query against `investigation_read` provably touches no transactional row, and the
+projection can be truncated and rebuilt without a migration against live case data.
+
+Named for its **owner** rather than its content, which is a deviation from the two names the task
+suggested and the reason is `database-design.md`: §5 is schema-per-module and §11 orders migrations by
+module, so a schema belonging to no module would have no Alembic chain and no defined position in the
+ArgoCD PreSync sequence. §2's ownership table and a new §3.7 record it.
+
+### Idempotency is doubled on purpose
+
+Every projector performs the Inbox claim before any side effect (§17), **and** every write is an
+`ON CONFLICT DO UPDATE` that converges. Either alone handles ordinary redelivery. Together they mean
+the projection survives a replay that deliberately clears the inbox — which §Replay calls a normal
+operation — and a future handler that forgets the claim. `is_seed` is folded with `OR` rather than
+overwritten, so replay *order* cannot demote a seed and silently change what `depth` returns.
+
+Investigation consumes its own published events here, which is deliberate rather than a loop: routing
+the projection through the outbox is what makes it rebuildable by replay instead of a side effect
+welded to the write path. A drop-and-replay test proves §2's rebuildability rather than asserting it.
+
+### What bounds `depth`, stated rather than glossed
+
+§6 defines `depth` as "hops from directly-evidenced entities". A relationship from
+`correlation_generated` was generated for a case from evidence linked to it, so both endpoints are hop
+zero. That is the only event that adds nodes, so **every projected node is a seed** and depth 1, 2 and
+3 return the same subgraph — which is exactly what §6's default (`depth=1`) should return, but means
+the traversal is inert today.
+
+`depth` starts discriminating when the projection holds edges reaching outside the case's findings, and
+feeding those needs an entity-level projection event §25.8 does not define. The recursive CTE is built
+anyway, because it is §3's decision and because it makes `depth` correct on the day those edges arrive
+rather than a migration away from it. Inventing the event would violate `CLAUDE.md` rule 1.
+
+The task also named `entity.created` and `relationship.created` as projector inputs. **Neither exists**
+— §163's catalog is explicit about the full set, and `entity.created` appears in the codebase only as
+an audit *action* string. The projectors consume the two documented events that actually carry what a
+graph projection needs.
+
+### Three defects found
+
+**The reachable set must not leave the database.** The first implementation resolved the walk to a
+Python `set[UUID]` and fed it back as an `IN (...)` bind list. The benchmark killed it outright: asyncpg
+caps a statement at 32,767 arguments, so a case with more reachable entities failed with
+`InterfaceError` instead of returning a graph — and well under the cap it was shipping tens of thousands
+of UUIDs out and back per request. The walk is now a subquery the planner joins against. This is the
+bug the benchmark existed to find, and it would not have shown up in any functional test.
+
+**Postgres allows one recursive term, not two.** Expanding "forward" and "backward" as separate
+branches of the `UNION ALL` is invalid SQL (`InvalidRecursionError`). One term now matches an edge on
+*either* endpoint and returns the other via `CASE`. Referencing the CTE through `.alias()` fails the
+same way, by inlining its definition into the non-recursive term.
+
+**A `Decimal` query parameter returned 500 instead of 400.** `min_confidence` is the codebase's first
+non-JSON-native query parameter, and the `RequestValidationError` handler put `exc.errors()` — which
+echoes the offending input, coerced to `Decimal` — straight into a `JSONResponse`. `json.dumps` raised
+*inside the handler*, the unhandled-exception handler caught it, and an out-of-range value came back as
+a server error with the offending field hidden. Fixed with `jsonable_encoder` and pinned by a new
+`tests/unit/test_error_envelope.py`; it affects every route, not just this one.
+
+### Two premises corrected against the code
+
+`entities.confidence` and `relationships.confidence` are both **NOT NULL**. The projection columns were
+drafted nullable "defensively", with a filter branch keeping unscored nodes and a test asserting an
+analyst-registered entity survives a threshold — a state the write side cannot produce. Both the
+nullability and the branch are gone: a projection column that admits a value its source cannot emit is
+an invented state plus dead code to handle it.
+
+`review_entity_status` publishes **nothing** ("audit only", and §25.8 defines no entity-disposition
+event), so a projected node's `status` refreshes only when one of its relationships is re-projected.
+Pinned by a test so it is a known property rather than a surprise.
+
+### Tests
+
+**48 new** — 24 projection/traversal against real Postgres, 18 HTTP contract, 6 error-envelope
+regression.
+
+The Postgres file covers what only a real database settles: that the recursive walk **terminates on a
+cycle** (a test that would hang, not fail, if the hop bound were dropped), that filters are applied
+*before* traversal so an excluded edge cannot act as a bridge to a node the caller should not reach,
+and that a case's projection can be dropped and rebuilt to the same graph. The HTTP file proves the
+endpoint refuses a non-member — `require_case_access`, the owner-or-member ABAC from Wave 3.1 — and
+that the projection is not even queried for a refused caller.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (237 files), import-linter (2/2 kept — the read package imports
+nothing outside `investigation`). Full suite **1316 passed / 2 skipped**. Platform coverage **95.65%**
+against the 90% floor. Migration round-trip green including the new schema, which the downgrade drops.
+
+### Carried forward
+
+**A response node cap** — the benchmark says this, not a graph store, is the mitigation for a dense
+subgraph. It is an `api-design.md` §6 change (a documented cap plus a truncation signal) and belongs
+with that edit.
+
+**The review-queue and statistics projections** (§1) are not built: the existing write-side queries
+serve both and neither is a measured bottleneck.
+
+**A scheduled rebuild job** is not built. `delete_case` plus replay is the mechanism and is tested;
+scheduling it needs an operator trigger and a decision about what a rebuild does to a case being
+actively read.
+
+Next roadmap items in Wave 4: multi-tenancy (ADR-0014, gated on a product decision about deployment
+profiles), observability (OTel over the `trace_id` already in the envelope), and DR/backup with
+independent integrity attestation.

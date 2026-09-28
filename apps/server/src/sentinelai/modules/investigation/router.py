@@ -8,10 +8,13 @@ The AI-findings review queue is ``GET /relationships?status=proposed`` (database
 
 from __future__ import annotations
 
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 
+from sentinelai.modules.investigation.models import STATUS_CONFIRMED, STATUS_PROPOSED
+from sentinelai.modules.investigation.read import MAX_DEPTH
 from sentinelai.modules.investigation.repository import (
     InvestigationUnitOfWork,
     get_investigation_uow,
@@ -22,6 +25,8 @@ from sentinelai.modules.investigation.schemas import (
     EntityMentionRead,
     EntityRead,
     EntityStatusUpdate,
+    GraphEdgeRead,
+    GraphNodeRead,
     GraphRead,
     RelationshipEvidenceRead,
     RelationshipRead,
@@ -52,6 +57,19 @@ router = APIRouter(
     # this changes nothing for the endpoints §2.9 does not cover.
     dependencies=[Depends(bind_session), Depends(enforce_idempotency)],
 )
+
+
+def _split_csv(value: str | None) -> list[str] | None:
+    """Parse a comma-separated filter, dropping blanks.
+
+    ``None`` means "no filter"; an empty or all-blank string means the same, rather than a filter
+    that matches nothing — a client sending ``?entity_types=`` means it did not filter, and an
+    empty subgraph would be a confusing answer to that.
+    """
+    if value is None:
+        return None
+    parts = [item.strip() for item in value.split(",") if item.strip()]
+    return parts or None
 
 
 def _meta(request: Request) -> Meta:
@@ -258,13 +276,41 @@ async def get_correlation_run(
 async def get_case_graph(
     case_id: UUID,
     request: Request,
+    status: str = Query(
+        default=f"{STATUS_PROPOSED},{STATUS_CONFIRMED}",
+        description="Comma-separated dispositions to include.",
+    ),
+    entity_types: str | None = Query(default=None, description="Comma-separated entity types."),
+    min_confidence: Decimal | None = Query(default=None, ge=0, le=1),
+    depth: int = Query(default=1, ge=0, le=MAX_DEPTH),
     current_user: CurrentUser = Depends(require_case_access()),
     service: InvestigationService = Depends(get_investigation_service),
 ) -> Envelope[GraphRead]:
-    # DEFERRED (Phase 8): blocked on the case→evidence bridge — see service.get_case_graph.
-    entities, relationships = await service.get_case_graph(case_id, current_user)
+    """Return the case's entity/relationship subgraph (api-design.md §6, ADR-0013).
+
+    Served entirely from the CQRS projection — this route touches no transactional table.
+
+    ``require_case_access`` is the authorization, and it is the same owner-or-member ABAC check
+    every
+    other case-scoped route uses (ADR-0017). The projection deliberately holds no access rules of
+    its
+    own: a read model that made authorization decisions would be a second place for them to drift
+    from `platform`'s, and it would be the place nobody thinks to audit.
+
+    ``depth`` is capped at 3 by §6 ("to bound query cost") and the cap is enforced twice — here, and
+    again in the traversal, so a caller reaching the repository another way cannot ask for an
+    unbounded walk.
+    """
+    nodes, edges = await service.get_case_graph(
+        case_id,
+        current_user,
+        statuses=_split_csv(status),
+        entity_types=_split_csv(entity_types),
+        min_confidence=min_confidence,
+        depth=depth,
+    )
     graph = GraphRead(
-        entities=[EntityRead.model_validate(e) for e in entities],
-        relationships=[RelationshipRead.model_validate(r) for r in relationships],
+        entities=[GraphNodeRead.model_validate(n) for n in nodes],
+        relationships=[GraphEdgeRead.model_validate(e) for e in edges],
     )
     return Envelope(data=graph, meta=_meta(request))

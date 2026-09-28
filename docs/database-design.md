@@ -30,6 +30,15 @@ This document is the complete PostgreSQL data model for Phase 1: table-by-table 
 | `case_management` | `case-management` | Cases, evidence links, status history, reports |
 | `investigation` | `investigation` | Entities, relationships, correlation runs |
 | `notification` | `notification` | Notification rules, dispatch records |
+| `investigation_read` | `investigation` | **Read models only** — the case-graph CQRS projection (ADR-0013, Section 3.7) |
+
+`investigation_read` is the one schema whose name does not match its owning module's, and the
+mismatch is the point: it holds **derived** rows, not the module's source of truth. Read/write
+separation (ADR-0013 §1) is only checkable if the boundary is visible, and a projection sitting among
+transactional tables is a boundary nobody can verify. It stays named for its owner — rather than
+something content-descriptive like `graph_read_models` — because Section 11's migration ordering is
+per module: a schema belonging to no module would have no Alembic chain and no defined position in
+the ArgoCD PreSync sequence.
 
 Two schemas carry a sanctioned, narrow exception to "no cross-schema access," both purely infrastructural, never business data:
 - **`platform.audit_log`** is written to by every module via a shared platform logging interface call (not direct table access) — the one centralized, system-wide audit surface (Section 10).
@@ -284,9 +293,43 @@ Additional module-specific tables:
 
 Every schema in Sections 3.3–3.6 also owns its own `outbox_events` table (`event_id` PK, `event_type`, `payload` jsonb, `dispatch_status`, `occurred_at`, `dispatched_at`) — deliberately duplicated per schema rather than centralized (Section 2). This is a compact summary; `docs/event-driven-architecture.md` §9 is the authoritative full envelope (adds `event_version`, `aggregate_type`, `aggregate_id`, `correlation_id`, `causation_id`, `trace_id`, `actor_type`/`actor_ref`, `attempt_count`, `last_error`) and §17 defines the companion `inbox_events` table every consuming module also owns.
 
+### 3.7 `investigation_read` — the case-graph projection (ADR-0013)
+
+A **read model**, not a source of truth. Every row is derived from integration events and is
+disposable: dropping the schema and replaying the outbox rebuilds it exactly. It holds no fact that
+`investigation` does not already own.
+
+| Table | Column | Type | Null? | Notes |
+|---|---|---|---|---|
+| `case_graph_nodes` | `case_id` | uuid | no | composite PK with `entity_id`; no FK — a projection must not constrain against the write side |
+| | `entity_id` | uuid | no | app-ref → `investigation.entities` |
+| | `entity_type`, `canonical_name`, `status` | text | no | denormalized copies, so a graph read is one indexed scan and never a join back |
+| | `confidence` | numeric(4,3) | no | mirrors `investigation.entities.confidence` exactly, including NOT NULL |
+| | `is_seed` | boolean | no | whether this entity is hop zero for `depth` (api-design.md §6) |
+| | `projected_at` | timestamptz | no | staleness signal — the honest answer to "how old is this graph?" |
+| `case_graph_edges` | `case_id` | uuid | no | composite PK with `relationship_id` |
+| | `relationship_id` | uuid | no | app-ref → `investigation.relationships` |
+| | `rel_type` | text | no | `type` on the wire (api-design.md §6); `rel_type` in the column, which does not shadow a builtin |
+| | `from_entity_id`, `to_entity_id` | uuid | no | app-refs; no FK to `case_graph_nodes`, so replay order cannot fail a constraint |
+| | `status` | text | no | folded in from `investigation.finding_reviewed` |
+| | `confidence` | numeric(4,3) | no | mirrors the transactional column |
+| | `projected_at` | timestamptz | no | |
+
+> **This schema is why `GET /cases/{case_id}/graph` is buildable at all.** The endpoint was deferred
+> for eight phases on a case→entity bridge no table provides: relationships reference evidence, cases
+> reference evidence, and Section 5 forbids the cross-schema foreign key that would join them.
+> `investigation.correlation_generated` already carries `case_id` beside `relationship_id`
+> (`event-driven-architecture.md` §25.8), so the **event stream** supplies the mapping the **schema**
+> cannot — which is the read/write asymmetry CQRS exists to exploit, not a loophole in Section 5.
+
+> **No append-only trigger and no audit columns here**, unlike the evidentiary tables of Section 10.
+> Protecting a projection from mutation would protect nothing: the fact lives in
+> `investigation.relationships` and in the event log, both already guarded, and this schema is
+> rebuilt on demand by design.
+
 ## 4. Primary Keys
 
-Every table's primary key is a single `uuid` column named `<entity>_id`, generated at the application layer (not database-generated sequential IDs), with two exceptions that use composite primary keys because the row *is* the relationship: `platform.user_roles` (`user_id`, `role_id`) and `investigation.relationship_evidence` (`relationship_id`, `evidence_id`). No table in this model uses a natural key (email, connector name, etc.) as its primary key — naturals keys are enforced as unique constraints instead, so identity remains stable even if a natural attribute changes.
+Every table's primary key is a single `uuid` column named `<entity>_id`, generated at the application layer (not database-generated sequential IDs), with exceptions that use composite primary keys because the row *is* the relationship: `platform.user_roles` (`user_id`, `role_id`), `investigation.relationship_evidence` (`relationship_id`, `evidence_id`), `case_management.case_members` (`case_id`, `user_id`), and both tables of `investigation_read` (Section 3.7), where the key is `(case_id, <projected id>)` because a projection row is scoped to the case it was projected for. No table in this model uses a natural key (email, connector name, etc.) as its primary key — naturals keys are enforced as unique constraints instead, so identity remains stable even if a natural attribute changes.
 
 ## 5. Foreign Keys
 

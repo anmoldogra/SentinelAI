@@ -18,6 +18,7 @@ import hashlib
 import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import Depends
@@ -49,6 +50,8 @@ from sentinelai.modules.investigation.models import (
     RelationshipEvidence,
     RelationshipRevision,
 )
+from sentinelai.modules.investigation.read.models import CaseGraphEdge, CaseGraphNode
+from sentinelai.modules.investigation.read.repository import GraphProjectionRepository
 from sentinelai.modules.investigation.repository import (
     InvestigationUnitOfWork,
     get_investigation_uow,
@@ -109,6 +112,9 @@ def _actor_role(actor: CurrentUser) -> str:
 class InvestigationService:
     def __init__(self, uow: InvestigationUnitOfWork, *, kms: KeyManagementService) -> None:
         self._uow = uow
+        # The read half (ADR-0013). Built on the same session, so a graph read participates in the
+        # request's transaction like any other query — it simply touches a different schema.
+        self._graph = GraphProjectionRepository(uow.session)
         # Required, not optional: every audit write this service makes must be signed
         # (ADR-0003 §1), and an optional KMS would make an unsigned one reachable.
         self._kms = kms
@@ -359,16 +365,44 @@ class InvestigationService:
         return run
 
     async def get_case_graph(
-        self, case_id: UUID, actor: CurrentUser
-    ) -> tuple[Sequence[Entity], Sequence[Relationship]]:
-        """DEFERRED (Q2): requires a case→evidence mapping that no documented table
-        provides (§3.5 has no case↔evidence table; case_management.public exposes no
-        evidence-id lookup). Repository-level graph loading over an evidence-id set is
-        implemented (``list_by_evidence_ids``) and ready to back this once the bridge
-        is decided. See the phase report's inconsistency list."""
-        raise NotImplementedError(
-            "get_case_graph is blocked on the case→evidence bridge (database-design §3.5 "
-            "has no case↔evidence table) — Phase 8 report"
+        self,
+        case_id: UUID,
+        actor: CurrentUser,
+        *,
+        statuses: Sequence[str] | None = None,
+        entity_types: Sequence[str] | None = None,
+        min_confidence: Decimal | None = None,
+        depth: int = 1,
+    ) -> tuple[Sequence[CaseGraphNode], Sequence[CaseGraphEdge]]:
+        """Return a case's filtered subgraph, read **only** from the CQRS projection (ADR-0013).
+
+        This was deferred for eight phases as "blocked on the case→evidence bridge": relationships
+        reference evidence, cases reference evidence, and `database-design.md` §5 forbids the
+        cross-schema foreign key that would join them. The projection resolves it without bending
+        that rule — ``investigation.correlation_generated`` carries ``case_id`` beside
+        ``relationship_id`` (§25.8), so the event stream supplies the mapping the schema cannot.
+
+        **Reads touch no transactional table.** That is ADR-0013 §1's separation, and it is what the
+        schema boundary makes checkable rather than aspirational. The returned rows are projection
+        rows, not ORM entities: mapping them back to ``Entity``/``Relationship`` would reintroduce
+        the coupling the projection exists to remove, and the two have deliberately different
+        shapes.
+
+        The caller is already authorized — ``require_case_access`` gates the route, so ABAC (owner
+        or
+        member, ADR-0017) runs before this method is reached. The projection is queried by
+        ``case_id`` alone and holds no access rules of its own; a read model that made authorization
+        decisions would be a second place for them to drift from `platform`'s.
+
+        Staleness is bounded by dispatcher latency (§2, seconds) and is visible: every projected row
+        carries ``projected_at``.
+        """
+        return await self._graph.read_subgraph(
+            case_id,
+            statuses=statuses if statuses else (STATUS_PROPOSED, STATUS_CONFIRMED),
+            entity_types=entity_types,
+            min_confidence=min_confidence,
+            depth=depth,
         )
 
 
