@@ -27,6 +27,7 @@ import atexit
 import shutil
 import tempfile
 
+from sentinelai.platform.auth.repository import MFA_SECRET_KEY
 from sentinelai.platform.crypto.audit import StructlogAuditSink
 from sentinelai.platform.crypto.backends.dev import DevKmsProvider
 from sentinelai.platform.crypto.kms import KeyManagementService
@@ -49,12 +50,14 @@ def _build(keystore: str) -> KeyManagementService:
     # keystore is fresh, so exactly one version exists for the whole run. That matters: a test
     # asserting a stored `key_id` would otherwise see a version that drifts.
     #
-    # Both functional roots are created: EVIDENCE_ROOT for the ledgers and anchors (ADR-0003) and
-    # EVENT_ROOT for outbox signing (ADR-0007). They are separate keys by design — an event
-    # signature must never be presentable as a custody attestation — so a test KMS holding only one
-    # of them would make half the suite fail on a missing key rather than on anything it asserts.
+    # All three functional roots are created: EVIDENCE_ROOT for the ledgers and anchors
+    # (ADR-0003), EVENT_ROOT for outbox signing (ADR-0007), and SESSION_ROOT for the encrypted
+    # TOTP secret (ADR-0010, Wave 3.1). They are separate keys by design — an event signature must
+    # never be presentable as a custody attestation — so a test KMS holding only some of them
+    # would make part of the suite fail on a missing key rather than on anything it asserts.
     asyncio.run(kms.create_key(EVIDENCE_LEDGER_KEY))
     asyncio.run(kms.create_key(EVENT_SIGNING_KEY))
+    asyncio.run(kms.create_key(MFA_SECRET_KEY))
     return kms
 
 

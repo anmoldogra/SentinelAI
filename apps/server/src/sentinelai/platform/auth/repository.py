@@ -157,6 +157,19 @@ class UserRepository:
         stmt = select(User).where(func.lower(User.email) == email.lower())
         return (await self._session.execute(stmt)).scalars().first()
 
+    async def get_by_id(self, user_id: UUID) -> User | None:
+        """Resolve a user by primary key — for flows that already hold an authenticated id.
+
+        Separate from ``get_by_email`` because the two answer different questions: that one
+        resolves an attacker-supplied string during authentication, this one follows a reference
+        the server itself issued (a session's ``user_id``, a challenge's).
+        """
+        return (
+            (await self._session.execute(select(User).where(User.user_id == user_id)))
+            .scalars()
+            .first()
+        )
+
 
 class MfaRepository:
     """Persists the TOTP second factor: the encrypted secret, the replay guard, recovery codes,

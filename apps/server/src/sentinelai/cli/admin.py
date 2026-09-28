@@ -12,13 +12,22 @@ Run it as a module::
 
 or via the `create-admin` / `dev-token` Makefile targets.
 
+`enroll-mfa` exists for the same reason `create-user` does. Wave 3.1 made login *enforce* a second
+factor for any account that has one, and `api-design.md` §9 documents no enrolment endpoint — so
+without this there is no way to set `mfa_enrolled_at`, the enforcement branch never fires, and
+`security-architecture.md` §8's "mandatory for every role that can access evidence or case data"
+stays unmet in practice. Self-service enrolment is an HTTP surface that has to be specified before
+it is built; this is the provisioning path, and it is a legitimate action on any profile.
+
 **`dev-token` is a development affordance and refuses to run on a production-grade profile.** It
 mints a long-lived session out of band and prints the plaintext bearer token to stdout, bypassing
 password verification, MFA, and rate limiting — every reason those exist is a reason this must not
-run against production. `create-user` has no such restriction; provisioning a real operator is a
-legitimate action anywhere.
+run against production. `create-user` and `enroll-mfa` have no such restriction; provisioning a real
+operator, and giving them a second factor, are legitimate actions anywhere.
 
-Both commands are idempotent: re-running `create-user` will not duplicate a user or a role grant.
+`create-user` and `ensure-keys` are idempotent. **`enroll-mfa` is deliberately not**: it mints a new
+shared secret, so re-running it invalidates the authenticator the user already registered. It
+refuses an already-enrolled account unless `--replace` says that is the intent.
 """
 
 from __future__ import annotations
@@ -37,13 +46,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.models import Role, User, UserRole
-from sentinelai.platform.auth.repository import SessionRepository, UserRepository
+from sentinelai.platform.auth.repository import (
+    MfaRepository,
+    SessionRepository,
+    UserRepository,
+)
 from sentinelai.platform.config import settings
 from sentinelai.platform.crypto import KeyManagementService, KeyNotFound, create_kms
 from sentinelai.platform.crypto.ledger import EVIDENCE_LEDGER_KEY
 from sentinelai.platform.db.session import async_session_factory, dispose_engine
+from sentinelai.platform.security import totp
 from sentinelai.platform.security.hashing import Argon2PasswordHasher
-from sentinelai.platform.security.tokens import generate_opaque_token
+from sentinelai.platform.security.tokens import (
+    generate_opaque_token,
+    generate_recovery_code,
+)
 
 # The RBAC roles api-design.md §3 and security-architecture.md §6 define. Constrained on purpose:
 # a typo'd role name would create a role that grants nothing and authorizes nowhere.
@@ -58,6 +75,14 @@ _ROLE_DESCRIPTIONS = {
 # Long enough that a developer is not re-minting a token mid-task; short enough that a forgotten
 # one does not stay valid indefinitely.
 _DEV_TOKEN_DEFAULT_DAYS = 30
+# What an authenticator app shows above the account name. A fixed product label rather than a
+# deployment-specific one: an analyst working two SentinelAI instances distinguishes them by the
+# account (their email), and a configurable issuer would change the provisioning URI — and so
+# every already-registered authenticator entry — when an operator edited a setting.
+_TOTP_ISSUER = "SentinelAI"
+# security-architecture.md §8 does not fix a count. Ten is the common floor across the
+# authenticator ecosystem and enough that a user who burns a few still has a way back in.
+_RECOVERY_CODE_COUNT = 10
 _ENV_PASSWORD = "SENTINELAI_ADMIN_PASSWORD"
 
 
@@ -278,6 +303,64 @@ async def issue_dev_token(*, email: str, ttl_days: int, quiet: bool) -> int:
     return 0
 
 
+async def enroll_mfa(*, email: str, replace: bool) -> int:
+    """Enrol a user's TOTP second factor and print the provisioning URI plus recovery codes.
+
+    The secret is generated here, encrypted by ``MfaRepository`` under ``SESSION_ROOT``, and
+    printed **once**. It is encrypted rather than hashed because TOTP verification recomputes an
+    HMAC over it, so it has to be recoverable — and printed once because the plaintext is never
+    readable from the database afterwards.
+
+    Recovery codes are generated at the same time and are the reason this is safe to run on a
+    production profile: a user whose authenticator is lost has a way back in that does not involve
+    an administrator disabling their second factor.
+    """
+    kms, _ = await _ensure_evidence_key()
+    try:
+        async with async_session_factory() as session:
+            user = await UserRepository(session).get_by_email(email)
+            if user is None:
+                raise SystemExit(f"error: no user with email {email!r}. Run `create-user` first.")
+            if user.mfa_enrolled_at is not None and not replace:
+                raise SystemExit(
+                    f"error: {email} is already enrolled. Pass --replace to mint a new secret, "
+                    f"which invalidates the authenticator currently registered."
+                )
+
+            mfa = MfaRepository(session, kms)
+            secret = totp.generate_secret()
+            enrolled_at = datetime.now(UTC)
+            await mfa.store_secret(user_id=user.user_id, secret=secret, enrolled_at=enrolled_at)
+            codes = [generate_recovery_code() for _ in range(_RECOVERY_CODE_COUNT)]
+            await mfa.replace_recovery_codes(
+                user_id=user.user_id, codes=codes, created_at=enrolled_at
+            )
+
+            await record_audit_event(
+                session,
+                kms=kms,
+                actor_user_id=user.user_id,
+                actor_role="system",
+                action="mfa_enrolled",
+                module="platform",
+                target_type="user",
+                target_id=user.user_id,
+                details={"replaced": user.mfa_enrolled_at is not None, "via": "admin_cli"},
+            )
+            await session.commit()  # ADR-0005: the entrypoint owns the transaction
+
+        uri = totp.provisioning_uri(secret, account=email, issuer=_TOTP_ISSUER)
+        print(f"enrolled {email} — add this to an authenticator app:")
+        print(f"\n  {uri}\n")
+        print("Recovery codes (each usable once; store them somewhere safe):")
+        for code in codes:
+            print(f"  {code}")
+        print("\nNeither the secret nor these codes can be recovered from the database.")
+        return 0
+    finally:
+        await kms.aclose()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m sentinelai.cli.admin",
@@ -304,6 +387,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create the evidence signing key if absent (idempotent; never rotates)",
     )
 
+    enroll = sub.add_parser("enroll-mfa", help="Enrol a user's TOTP second factor")
+    enroll.add_argument("--email", required=True)
+    enroll.add_argument(
+        "--replace",
+        action="store_true",
+        help="Mint a new secret for an already-enrolled user, invalidating their current one.",
+    )
+
     token = sub.add_parser("dev-token", help="Mint a long-lived session token (non-production)")
     token.add_argument("--email", required=True)
     token.add_argument("--ttl-days", type=int, default=_DEV_TOKEN_DEFAULT_DAYS)
@@ -328,6 +419,8 @@ async def _run(args: argparse.Namespace) -> int:
             )
         if args.command == "ensure-keys":
             return await ensure_keys()
+        if args.command == "enroll-mfa":
+            return await enroll_mfa(email=args.email, replace=args.replace)
         return await issue_dev_token(email=args.email, ttl_days=args.ttl_days, quiet=args.quiet)
     finally:
         await dispose_engine()

@@ -32,3 +32,37 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     expires_at: datetime
+
+
+class MfaRequiredResponse(BaseModel):
+    """The other shape ``POST /auth/login`` can return (api-design.md §9).
+
+    A `200`, not a `401`: the password was correct. What the caller receives instead of a session
+    is an ``mfa_token`` to present at ``POST /auth/mfa/verify`` — a credential for a
+    half-authenticated principal, short-lived and single-use.
+    """
+
+    mfa_required: Literal[True] = True
+    mfa_token: str
+    expires_at: datetime
+
+
+class MfaVerifyRequest(BaseModel):
+    """The second-factor exchange: the ``mfa_token`` from login plus a code."""
+
+    mfa_token: str = Field(min_length=1, max_length=512)
+    # Accepts a TOTP code or a recovery code, so the bound is the longer of the two shapes. The
+    # server never tells the client which it matched.
+    code: str = Field(min_length=1, max_length=64)
+
+
+class RefreshRequest(BaseModel):
+    """The session to rotate.
+
+    The token travels in the body rather than the ``Authorization`` header because refresh is the
+    one endpoint whose credential may already be past the point where a header would be accepted
+    by the auth dependency — and because ADR-0010 A3 scopes the refresh credential to this
+    endpoint alone. The cookie transport A3 specifies is not yet built; see ADR-0010's status.
+    """
+
+    refresh_token: str = Field(min_length=1, max_length=512)

@@ -2,20 +2,107 @@
 
 ## Status
 
-Proposed — **amended 2026-08-30** (amendments A1–A3 below). Depends on ADR-0009. Resolves
-documentation contradiction **D1**.
+**Accepted — Built**, except SSO. Amended 2026-08-30 (A1–A3 below); the increment those
+amendments scoped — session lifecycle + MFA — landed in modernization **Wave 3.1**. Depends on
+ADR-0009. Resolves documentation contradiction **D1**.
 
-**Implementation status at the time of amendment** (verified against the code, not assumed):
-§1 and §2's schema are **built** — `platform.sessions` carries `token_lookup` (indexed,
-non-unique) + argon2id `token_hash`, and `database-design.md` §3.1 was updated in the same change,
-so D1 is closed. `POST /auth/login` works and `require_role` enforces RBAC for real. **Not built:**
-`/auth/refresh`, `/auth/logout`, all MFA (no MFA columns exist on `platform.users`), all SSO
-endpoints, and `case_members`. `DbCaseAccessChecker` is ownership-only and says so in its own
-docstring. The console today authenticates solely through the `VITE_DEV_ACCESS_TOKEN` dev seam.
+| Decision | State |
+|---|---|
+| §1 D1 resolution: `sessions.token_hash` + `token_lookup` | **Built** (pre-Wave-3.1) — argon2id digest, non-unique prefix index; `database-design.md` §3.1 updated in the same change |
+| §2 Opaque server-side sessions, immediate revocation, sliding expiry | **Built** — `POST /auth/refresh` rotates (successor issued, predecessor `revoked_at`), `POST /auth/logout` revokes on demand |
+| §3 Password login | **Built** (pre-Wave-3.1) — argon2id, uniform rejection, uniform timing |
+| §3 MFA (TOTP + recovery codes), per A1 | **Built** — storage landed earlier; Wave 3.1 made login **consult** it. An enrolled account now receives an `mfa_token`, never a session, until `POST /auth/mfa/verify` succeeds |
+| §3 MFA enrolment path | **Built** — `python -m sentinelai.cli.admin enroll-mfa`. No *self-service* endpoint: `api-design.md` §9 documents none, and one has to be specified before it is built |
+| §3 SSO / OIDC / SAML | **Not built** — deferred by sequencing (A1), not excluded by profile. `identity_provider_links` and `users.external_idp_subject` already exist, so it costs no migration |
+| §4 RBAC (`require_role`) | **Built** (pre-Wave-3.1) |
+| §4 ABAC / `case_members` | **Moved out** by A2 → **ADR-0017**, which is now Accepted and Built. `require_case_access` is owner-or-member and audits its denials |
+| §5 / A3 Access token in memory, never web storage | **Built** — `apps/web/src/shared/auth/token-store.ts` has no storage path and ESLint bans the globals |
+| §5 / A3 Refresh credential as an `HttpOnly` cookie | **Not built** — `POST /auth/refresh` takes the token in the request body. See the note |
 
-Note that the platform is **currently non-compliant with `security-architecture.md` §8**, which
-makes MFA "mandatory for every role that can access evidence or case data — no exceptions, per
-PRD SR-2". Closing that is the point of the increment this amendment scopes.
+**`security-architecture.md` §8 compliance is now enforced rather than merely intended.** The
+non-compliance this status block previously recorded — MFA storage that nothing consulted — is
+closed: a password alone cannot open a session for an enrolled account, and
+`tests/integration/test_session_lifecycle_db.py` is the proof.
+
+## Implementation note (2026-09-29, Wave 3.1)
+
+### MFA was storage without enforcement, which is worse than no MFA
+
+The columns, the `mfa_challenges` table, the recovery codes, the `MfaRepository` and a
+vector-tested RFC 6238 implementation all existed before this wave. Nothing read them:
+`AuthService.login` issued a session on a correct password regardless of `mfa_enrolled_at`. An
+account could complete enrolment, believe it had a second factor, and be protected by one factor —
+the failure mode a user cannot detect and would not expect. Wave 3.1 added the branch.
+
+Two ordering decisions inside the exchange are security-relevant:
+
+**The challenge is consumed before the code is checked.** Consuming only on success would let an
+attacker holding a stolen `mfa_token` try six digits repeatedly until it expired. Consuming first
+makes each attempt cost a fresh password login.
+
+**The account's status is re-checked at the second factor**, not only at the password. The window
+between the two steps is small, but an account disabled inside it must not be able to walk through.
+
+### Enforcement without an enrolment path would have been dead code
+
+Nothing in the codebase called `MfaRepository.store_secret`. Adding the login branch alone would
+have produced a feature that never fires: no account could reach `mfa_enrolled_at`, so §8's
+"mandatory" factor would have remained unmet in practice while the code claimed otherwise — the
+worst of both, because it reads as done.
+
+`enroll-mfa` is the provisioning path, for the same reason `create-user` is: `POST /auth/login` could
+not be used until something could create a user, and `api-design.md` documents no admin-user
+endpoint either. It generates the secret, prints the provisioning URI and ten recovery codes **once**
+(neither is recoverable from the database afterwards), and audits the enrolment.
+
+It is deliberately **not idempotent** — re-running mints a new secret and invalidates the
+authenticator the user already registered — so it refuses an enrolled account unless `--replace`
+states that intent. And unlike `dev-token` it carries **no** production restriction: refusing to
+enrol a real operator in production would make the mandatory factor unprovisionable exactly where it
+matters most.
+
+Recovery codes use a Crockford-style base32 alphabet with the confusable characters removed
+(`I`, `L`, `O`, `U`, `0`, `1`). A code is read off a screen and typed back, and an alphabet holding
+both `0` and `O` guarantees support tickets. Ten characters is ~51 bits — less than a session token,
+deliberately: a longer code gets transcribed wrong, and each attempt already costs an argon2id verify
+and is single-use.
+
+### Refresh is rotation, and the cookie is not built
+
+A3 specifies a two-token scheme: a short-lived access token in memory and a long-lived refresh
+credential in an `HttpOnly; Secure; SameSite=Strict` cookie scoped to the refresh endpoint. What
+Wave 3.1 built is the **rotation** half — `POST /auth/refresh` issues a successor session and sets
+`revoked_at` on its predecessor, so a stolen token is single-use and its reuse is detectable, which
+is A3's stated security property.
+
+The **transport** half is not built: there is one credential, not two, and it travels in the
+request body. Completing A3 means a second token class (a schema change on `platform.sessions`),
+cookie issuance, and a matching change in `apps/web` — a coordinated front-and-back increment
+rather than a detail of this one.
+
+A3's CSRF argument is unaffected and still holds, for the same reason it did before: **no endpoint
+accepts a cookie as authentication.** That property remains load-bearing, and the day one does, a
+CSRF token becomes mandatory in the same change.
+
+### Logout takes the header directly, not `get_current_user`
+
+`get_current_user` rejects an expired or already-revoked session with a `401`, and logout has to
+succeed for exactly those. A caller told their logout failed will reasonably conclude the session
+is still live. It returns `204` whether or not anything was revoked, so the response cannot tell
+the holder of a stale token whether it was ever real.
+
+### The developer seams were already restricted — and are now tested
+
+Both bypass paths turn on `Settings.is_production`, which deliberately spans three profiles
+(`production`, `air-gapped`, `classified`) because the latter two are hardening overlays on the
+first. `issue_dev_token` refuses outright on any of them, and `apps/web`'s `VITE_DEV_ACCESS_TOKEN`
+sits behind `import.meta.env.DEV` so it is dead-code eliminated from a production build — and it
+never manufactures a session, since the server still resolves the token against a real
+`platform.sessions` row.
+
+Neither guard had a test. `tests/unit/test_dev_seam_guards.py` adds them, including one that fails
+if a sixth profile is ever added without being classified as production-grade or not — the shape of
+mistake (`app_env == "production"`) that would leave the two most sensitive deployments open.
 
 ## Context
 

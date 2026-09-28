@@ -2374,3 +2374,213 @@ CEM never defined. Aligning the code was the fix.
 
 **Wave 2 is complete.** 2.1 through 2.4 are all built and Accepted. Next roadmap item is Wave 3.1 —
 authentication and sessions plus `case_members` (ADR-0010, XL), which is also the fix for defect D1.
+
+---
+
+## 2026-09-29 — IC-037: Wave 2.4 committed; Wave 3.1 access & API trust (ADR-0010, ADR-0017)
+
+**Type:** Release of Wave 2.4, then authentication and authorization. One migration
+(`case_management.case_members`), three new endpoints on `/auth`, three on `/cases`, and one new
+ADR. Two live security gaps closed.
+
+### Wave 2.4 shipped
+
+Rich aggregates and value objects (IC-036) committed as `eaf8a71` (value objects + aggregate roots)
+and `05ee47f` (service delegation + ADR-0011), then pushed. **Wave 2 is complete**: 2.1 `b6414d6`,
+2.2 `2229361`, 2.3 `0ca0543`, 2.4 the two above. ADR-0011 is Accepted with §3 recorded as not built.
+
+### What the roadmap asked for, and what the ADRs actually said
+
+The instruction for this increment was to build `sessions.token_hash`, `case_members`, and MFA under
+ADR-0010. Checking the documents first changed three of those four premises:
+
+**`sessions.token_hash` was already built**, with `token_lookup`, the non-unique prefix index and
+the argon2id digest. D1 has been closed since before Wave 1. No migration was needed.
+
+**The MFA *storage* was already built too** — `202608300001_platform_mfa`, `mfa_challenges`,
+`mfa_recovery_codes`, `MfaRepository`, and a vector-tested RFC 6238 implementation in
+`platform/security/totp.py`. ADR-0010's own status block, written the day that migration landed,
+still said "all MFA (no MFA columns exist)".
+
+**`case_members` is not ADR-0010's** — amendment **A2** (2026-08-30) removed it and assigned it to
+**ADR-0017 (Case Membership and Case-Level Access)**, which did not exist, and which A2 requires to
+"be written before that work starts". Building the table under ADR-0010 would also have meant
+inventing a table `database-design.md` §3.4 does not document, against `CLAUDE.md` rule 1.
+
+So this increment wrote ADR-0017 first, and `database-design.md` §3.4 and `api-design.md` §4.2 were
+extended in the same change as the code, not after it.
+
+### Gap 1: MFA was storage with nothing reading it
+
+`AuthService.login` issued a session on a correct password regardless of `mfa_enrolled_at`. An
+account could complete enrolment, believe it held a second factor, and be protected by one — a
+failure mode the user cannot detect and would not expect, and a standing violation of
+`security-architecture.md` §8 ("mandatory for every role that can access evidence or case data — no
+exceptions, per PRD SR-2").
+
+Login now branches: an enrolled account gets an `mfa_token` (a short-lived, single-use credential
+for a half-authenticated principal) and **no session row is written at all** until
+`POST /auth/mfa/verify` succeeds. Two orderings inside that exchange matter:
+
+* **The challenge is consumed before the code is checked.** Consuming only on success would let a
+  stolen `mfa_token` be used to brute-force six digits until it expired. Consuming first makes each
+  attempt cost a fresh password login.
+* **Account status is re-checked at the second factor.** The window between password and factor is
+  small, but an account disabled inside it must not walk through.
+
+Recovery codes are accepted alongside TOTP, because a user who has lost their authenticator must
+still be able to get in — refusing that produces lockouts, not security. The server never reveals
+which of the two matched.
+
+### Gap 2: ABAC was ownership-only, in two places
+
+`security-architecture.md` §6 evaluates "case-scope grant" as its first ABAC attribute, and its
+worked example is an investigator refused evidence "linked to a case they are not assigned to".
+There was nothing to evaluate: `DbCaseAccessChecker` compared `cases.owning_user_id` to the caller,
+so a case was reachable by exactly one person and every collaborative workflow in the PRD — a
+forensic examiner working "multiple case teams", a supervisor reviewing findings — was
+unimplementable.
+
+`case_members` (composite PK `(case_id, user_id)`) is the grant. Access is **owner OR member**,
+resolved in one `EXISTS` over the union rather than "fetch the owner, then maybe the membership" —
+the two-query form makes the owner's check cheap and everyone else's cost an extra round trip, which
+is backwards once a case has a team. The owner is deliberately **not** written into the table:
+`owning_user_id` is already authoritative, and a duplicate membership row creates two places that
+can disagree about who owns a case.
+
+**The second place was the one that would have silently defeated the first.** `CaseService` had its
+own `_load_owned` gate, ownership-only, called from thirteen sites. A granted member would have
+passed `require_case_access` at the router and then been refused inside the service. It is now
+`_load_accessible` and asks the same question the router's port does.
+
+Membership needs a grant path or the table stays empty and ABAC stays ownership-only in practice, so
+ADR-0017 adds `GET`/`PUT`/`DELETE /cases/{case_id}/members`. Every one of them is itself
+case-scoped, which is what stops the endpoint group from being a self-service escalation path: a
+caller who cannot open a case cannot add themselves to it. `PUT` is naturally idempotent — the
+membership is named by the URL, so a re-grant updates the role in place — and the composite primary
+key is what guarantees that rather than a convention.
+
+### Gap 3: enforcement with no way to enrol
+
+Found while checking that the new branch was reachable: **nothing called
+`MfaRepository.store_secret`**. There is no enrolment endpoint (`api-design.md` §9 documents none)
+and no CLI command, so no account could ever reach `mfa_enrolled_at` — the branch would never have
+fired, and §8's "mandatory" factor would have stayed unmet while the code read as done.
+
+`python -m sentinelai.cli.admin enroll-mfa` is the provisioning path, for the same reason
+`create-user` is one: login could not be used until something could create a user, and no
+admin-user endpoint is documented either. It prints the provisioning URI and ten recovery codes
+once, audits the enrolment, and is deliberately **not** idempotent — re-running mints a new secret
+and invalidates the registered authenticator, so it refuses an enrolled account without
+`--replace`. Unlike `dev-token` it carries no production restriction: refusing to enrol a real
+operator in production would make the mandatory factor unprovisionable exactly where it matters.
+
+Recovery codes needed a generator, which also did not exist. `generate_recovery_code` uses a
+Crockford-style base32 alphabet with `I`/`L`/`O`/`U`/`0`/`1` removed — a code is read off a screen
+and typed back, and an alphabet holding both `0` and `O` guarantees support tickets. ~51 bits, less
+than a session token and deliberately so: a longer code gets transcribed wrong, and each attempt
+already costs an argon2id verify and is single-use.
+
+### The denial is now recorded
+
+`platform/auth/dependencies.py`'s module docstring claimed both RBAC and ABAC were "audited
+regardless of outcome". Neither was. §6 requires the ABAC denial by name — "the denial itself is
+written to `platform.audit_log` with the caller's identity, the resource requested, and the reason"
+— because a compliance review has to distinguish "this analyst never had access" from "this analyst
+had access and used it".
+
+`require_case_access` now writes `case_access_denied` and **commits it before raising**. That commit
+is not optional: ADR-0005's boundary rolls back on any exception, so without it the 403 would erase
+the record that makes it interesting. Same composition the `login_failed` entry already used.
+
+RBAC denials are still not audited, and the docstring now says so instead of claiming otherwise. No
+document requires it, and it would put a KMS dependency in the path of every role-gated route to
+record what the request log already carries.
+
+### The developer seams needed testing, not removing
+
+Both were already restricted. `issue_dev_token` refuses when `Settings.is_production`, which spans
+`production`, `air-gapped` **and** `classified` because the latter two are hardening overlays on the
+first. `apps/web`'s `VITE_DEV_ACCESS_TOKEN` sits behind `import.meta.env.DEV`, so it is dead-code
+eliminated from a production build, and it never manufactures a session — the server still resolves
+the token against a real `platform.sessions` row.
+
+Neither guard had a test, which is the part worth fixing: a refactor dropping either would have
+produced a build that mints sessions without a password on a classified deployment and failed
+nothing. `tests/unit/test_dev_seam_guards.py` adds them, including a test that fails if a sixth
+profile is ever added without being classified — the `app_env == "production"` shape of mistake that
+would leave the two most sensitive profiles open.
+
+### Defects found while building
+
+**The API test harness would have hidden the whole feature.** `test_case_api.py` overrides the ABAC
+port with an allow-all, which is right for testing case CRUD and fatal for testing access control.
+The new `test_case_members_api.py` backs the port with the same store the service writes through, so
+a grant is observable through the gate and a checker with its own state cannot hide a disagreement
+between them.
+
+**The denial audit dragged DB-less tests into Postgres.** Adding a real `record_audit_event` to the
+403 path made `test_case_members_api.py` take 126 seconds and fail on a closed event loop, because
+`get_session` was not overridden and every refusal reached for a real connection. The root conftest
+now stubs that one symbol for DB-less tests (14s), and the denial audit is proven where it belongs,
+against a real database. That stub then silenced the audit test itself — which is why
+`test_case_access_audit_db.py` restores the real function in a module-level autouse fixture and says
+why.
+
+**The shared test KMS held two of three functional roots.** `SESSION_ROOT` (the encrypted TOTP
+secret) was missing, so every MFA flow failed on `KeyNotFound` rather than on anything it asserted.
+Added alongside `EVIDENCE_ROOT` and `EVENT_ROOT`, for the reason already written in that fixture.
+
+### Tests
+
+**48 new** — 16 session lifecycle, MFA enforcement and recovery codes (real Postgres), 7 membership
+resolution (real Postgres), 4 denial auditing (real Postgres), 10 membership API, 11 dev-seam and
+enrolment-wiring guards.
+
+The ABAC tests are deliberately written against **both** predicates: membership on one case grants
+nothing on another, and a membership belonging to one user does not stand in for another. A query
+missing either predicate passes every other test in the file. The credential-scan test reads the
+actual stored column values rather than trusting the write path, because "we hash it" is the kind of
+claim that survives a refactor that stops being true. The recovery-code alphabet has its own test,
+because "we excluded the confusable characters" is a property nothing else would notice losing.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (219 files), import-linter (2/2 kept — `platform` stays
+domain-agnostic; the ABAC port is still a Protocol the composition root binds). Full suite
+**1195 passed / 2 skipped**. Platform coverage **95.33%** (up from 90.66% — the new auth and access-control paths are densely tested) against the 90% floor. Migration round-trip green
+including the new `case_members` revision.
+
+### Carried forward
+
+**SSO/OIDC/SAML is not built** — deferred by sequencing per ADR-0010 A1, explicitly *not* scoped out
+of any profile (PRD SR-2 requires IdP integration, and §7 makes federation air-gap compatible
+against an enclave-local IdP). `identity_provider_links` and `users.external_idp_subject` already
+exist, so it costs no migration when it lands.
+
+**A3's cookie transport is not built.** Refresh rotates — successor issued, predecessor revoked,
+which is A3's security property — but there is one credential class, not two, and it travels in the
+request body. Completing A3 needs a schema change, cookie issuance, and a matching `apps/web`
+change in one coordinated increment. A3's CSRF argument still holds because no endpoint accepts a
+cookie as authentication; the day one does, a CSRF token becomes mandatory in the same change.
+
+**There is no self-service MFA enrolment endpoint.** Enrolment is an administrator action via the
+CLI. A user-facing `POST /auth/mfa/enroll` has to be specified in `api-design.md` before it is
+built (`CLAUDE.md` rule 1), and it brings its own questions — whether a session with one factor may
+enrol a second, and what happens to sessions issued before enrolment.
+
+**Membership has no history.** A revocation deletes the row and the audit log records it, so
+`case_members` cannot answer "who was on this case in March" from the table itself. Recorded in
+ADR-0017's Consequences as a deliberate limit — the append-only ledger already holds that — rather
+than discovered later.
+
+**The other ABAC attributes §6 lists remain open**: evidence classification vs. caller clearance,
+`legal_authority_ref` presence, time-of-day context. This increment closes the case-scope attribute
+only; `require_case_access` is the seam where the rest would go.
+
+**There is no admin router at all.** `GET /api/v1/admin/audit-log` (api-design.md §10, PRD FR-9.3)
+is unbuilt — the app includes health, auth and the module routers, and nothing else. It is an
+export/read surface over a ledger that already exists and verifies, so it is additive; naming it
+here so it is not mistaken for something this increment covered.
+
+Next roadmap item is Wave 3.2 — the API idempotency store (ADR-0012, `platform.idempotency_keys`).

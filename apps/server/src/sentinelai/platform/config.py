@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     # arrives with the sliding-expiry refresh flow (POST /api/v1/auth/refresh), which is not
     # built yet — so a session currently lives exactly this long regardless of activity.
     session_ttl_seconds: int = 28_800  # 8h — one working shift.
+    # The `mfa_token` window between password acceptance and second factor. Short on
+    # purpose: it is a credential for a half-authenticated principal (the password has been
+    # accepted, the factor has not), so it must not outlive the login attempt that made it.
+    mfa_challenge_ttl_seconds: int = 300  # 5m — time to open an authenticator app.
 
     # --- object storage (evidence blobs) ---
     storage_endpoint_url: str = "http://localhost:9000"

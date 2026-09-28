@@ -10,17 +10,27 @@ so the failure path commits the audit entry the service wrote before re-raising.
 ``AsyncSession`` injected here is the same instance the service's repositories hold — FastAPI
 caches the ``get_session`` sub-dependency per request.
 
-The remaining §4.1 auth endpoints (``/auth/mfa/verify``, ``/auth/refresh``, ``/auth/logout``, the
-SSO pair) are not implemented here; MFA and SSO are explicitly out of this increment's scope.
+``/auth/mfa/verify``, ``/auth/refresh`` and ``/auth/logout`` complete §9's session lifecycle
+(Wave 3.1). The SSO pair (``/auth/sso/{provider}/redirect|callback``) is still unbuilt — ADR-0010
+A1 defers it by sequencing, not by profile, and the schema it needs already exists.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request, status
+from datetime import UTC, datetime, timedelta
+
+from fastapi import APIRouter, Depends, Header, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sentinelai.platform.auth.schemas import LoginRequest, LoginResponse
+from sentinelai.platform.auth.schemas import (
+    LoginRequest,
+    LoginResponse,
+    MfaRequiredResponse,
+    MfaVerifyRequest,
+    RefreshRequest,
+)
 from sentinelai.platform.auth.service import AuthService, get_auth_service
+from sentinelai.platform.config import settings
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.shared.envelope import Envelope, Meta
@@ -56,7 +66,7 @@ async def login(
     """Exchange credentials for an opaque bearer token (api-design.md §9)."""
     client_host = request.client.host if request.client is not None else None
     try:
-        token, session_row = await service.login(
+        outcome = await service.login(
             payload.email,
             payload.password.get_secret_value(),
             ip_address=client_host,
@@ -69,7 +79,112 @@ async def login(
         await session.commit()
         raise
 
+    if outcome.session is None:
+        # No session means the account is MFA-enrolled and `token` is the challenge credential.
+        # Still a 200 (api-design.md §9): the password was correct. `security-architecture.md` §8
+        # makes the second factor mandatory, so a password alone never reaches case data.
+        return Envelope(
+            data=MfaRequiredResponse(
+                mfa_token=outcome.token,
+                expires_at=datetime.now(UTC)
+                + timedelta(seconds=settings.mfa_challenge_ttl_seconds),
+            ),
+            meta=_meta(request),
+        )
+
+    return Envelope(
+        data=LoginResponse(access_token=outcome.token, expires_at=outcome.session.expires_at),
+        meta=_meta(request),
+    )
+
+
+@router.post(
+    "/auth/mfa/verify",
+    response_model=Envelope[LoginResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Complete a login with the second factor",
+)
+async def verify_mfa(
+    payload: MfaVerifyRequest,
+    request: Request,
+    service: AuthService = Depends(get_auth_service),
+    session: AsyncSession = Depends(get_session),
+) -> Envelope[LoginResponse]:
+    """Exchange an ``mfa_token`` + code for a bearer token (api-design.md §9)."""
+    client_host = request.client.host if request.client is not None else None
+    try:
+        token, session_row = await service.verify_mfa(
+            payload.mfa_token,
+            payload.code,
+            ip_address=client_host,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except UnauthenticatedError:
+        # Same composition as login: the rejection's audit entry must survive the boundary
+        # rollback that the 401 is about to trigger. A failed second factor is the more
+        # interesting of the two signals — it means a correct password was already presented.
+        await session.commit()
+        raise
+
     return Envelope(
         data=LoginResponse(access_token=token, expires_at=session_row.expires_at),
         meta=_meta(request),
     )
+
+
+@router.post(
+    "/auth/refresh",
+    response_model=Envelope[LoginResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Rotate a session before it expires",
+)
+async def refresh(
+    payload: RefreshRequest,
+    request: Request,
+    service: AuthService = Depends(get_auth_service),
+) -> Envelope[LoginResponse]:
+    """Issue a successor session and revoke the presented one (api-design.md §9, ADR-0010 §2).
+
+    No explicit commit here, unlike login: a refused refresh writes no audit entry to preserve —
+    an unresolvable token names no actor, so there is nothing to attribute the attempt to.
+    """
+    client_host = request.client.host if request.client is not None else None
+    token, session_row = await service.refresh(
+        payload.refresh_token,
+        ip_address=client_host,
+        user_agent=request.headers.get("user-agent"),
+    )
+    return Envelope(
+        data=LoginResponse(access_token=token, expires_at=session_row.expires_at),
+        meta=_meta(request),
+    )
+
+
+@router.post(
+    "/auth/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke the current session",
+)
+async def logout(
+    request: Request,
+    authorization: str = Header(...),
+    service: AuthService = Depends(get_auth_service),
+) -> Response:
+    """Revoke the bearer token immediately (api-design.md §9, ADR-0010 §2).
+
+    Takes the token from the ``Authorization`` header rather than depending on
+    ``get_current_user``: that dependency rejects an expired or already-revoked session with a
+    ``401``, and logout must succeed for exactly those — a caller who is told their logout failed
+    will reasonably believe the session is still live.
+
+    ``204`` whether or not anything was revoked, for the same reason: the response must not tell
+    a holder of a stale token whether it was ever real.
+    """
+    if not authorization.startswith("Bearer "):
+        raise UnauthenticatedError()
+    await service.logout(
+        authorization.removeprefix("Bearer "),
+        ip_address=request.client.host if request.client is not None else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

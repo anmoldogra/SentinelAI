@@ -22,7 +22,11 @@ from sentinelai.entrypoints.http.middleware import register_middleware
 from sentinelai.platform.auth.models import Session, User
 from sentinelai.platform.auth.router import router as auth_router
 from sentinelai.platform.auth.schemas import LoginRequest
-from sentinelai.platform.auth.service import AuthService, get_auth_service
+from sentinelai.platform.auth.service import (
+    AuthService,
+    LoginOutcome,
+    get_auth_service,
+)
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.security.tokens import LOOKUP_PREFIX_LENGTH, token_lookup_prefix
 from sentinelai.shared.exceptions import UnauthenticatedError
@@ -144,7 +148,9 @@ async def test_login_issues_token_and_never_stores_it(audit: list[dict[str, Any]
     user = make_user()
     service, sessions, _ = make_service(user)
 
-    token, session_row = await service.login(user.email, _PASSWORD)
+    outcome = await service.login(user.email, _PASSWORD)
+    token, session_row = outcome.token, outcome.session
+    assert session_row is not None, "an un-enrolled user must get a session, not a challenge"
 
     assert token  # returned to the caller exactly once
     stored = sessions.created[0]
@@ -160,7 +166,8 @@ async def test_login_honours_configured_session_ttl(audit: list[dict[str, Any]])
     user = make_user()
     service, _, _ = make_service(user, ttl_seconds=3600)
 
-    _, session_row = await service.login(user.email, _PASSWORD)
+    session_row = (await service.login(user.email, _PASSWORD)).session
+    assert session_row is not None
 
     assert (session_row.expires_at - session_row.issued_at).total_seconds() == 3600
 
@@ -169,7 +176,7 @@ async def test_email_match_is_case_insensitive(audit: list[dict[str, Any]]) -> N
     user = make_user()
     service, _, _ = make_service(user)
 
-    token, _ = await service.login(user.email.upper(), _PASSWORD)
+    token = (await service.login(user.email.upper(), _PASSWORD)).token
 
     assert token
 
@@ -227,7 +234,8 @@ async def test_success_is_audited_with_roles(audit: list[dict[str, Any]]) -> Non
     user = make_user()
     service, _, _ = make_service(user, roles=["supervisor", "investigator"])
 
-    _, session_row = await service.login(user.email, _PASSWORD, ip_address="10.0.0.9")
+    session_row = (await service.login(user.email, _PASSWORD, ip_address="10.0.0.9")).session
+    assert session_row is not None
 
     (entry,) = audit
     assert entry["action"] == "login_success"
@@ -316,7 +324,7 @@ class StubService:
         *,
         ip_address: str | None = None,
         user_agent: str | None = None,
-    ) -> tuple[str, Session]:
+    ) -> LoginOutcome:
         self.calls.append({"email": email, "password": password, "ip_address": ip_address})
         if isinstance(self._result, Exception):
             raise self._result
@@ -349,7 +357,7 @@ def make_session_row() -> Session:
 
 def test_route_returns_the_token_in_the_standard_envelope() -> None:
     session_row = make_session_row()
-    service = StubService(("plaintext-token", session_row))
+    service = StubService(LoginOutcome(token="plaintext-token", session=session_row))
     client, db = build_client(service)
 
     response = client.post(
