@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -68,10 +69,21 @@ def register_exception_handlers(app: FastAPI) -> None:
     ) -> JSONResponse:
         # Override FastAPI's default 422-for-everything to match api-design.md §2.4's
         # 400 (malformed shape) vs 422 (domain rule) split.
+        #
+        # `exc.errors()` is passed through `jsonable_encoder` rather than used directly, because
+        # each entry carries the **offending input** — and that input is whatever the caller sent,
+        # coerced toward the parameter's declared type. For a `Decimal` query parameter that fails a
+        # bound, the `input` is a `Decimal`, which `json.dumps` cannot serialize: the handler
+        # raised, the unhandled-exception handler caught it, and an out-of-range query parameter
+        # came back as a **500 instead of a 400**. Found when the graph endpoint (ADR-0013) became
+        # the first route with a non-JSON-native query parameter.
         return JSONResponse(
             status_code=400,
             content=_error_body(
-                request, code="VALIDATION_FAILED", message="Malformed request", details=exc.errors()
+                request,
+                code="VALIDATION_FAILED",
+                message="Malformed request",
+                details=jsonable_encoder(exc.errors()),
             ),
         )
 
