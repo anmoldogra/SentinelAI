@@ -70,21 +70,39 @@ def _dummy_hash(hasher: PasswordHasher) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class LoginOutcome:
-    """What a password login produced: a session, or a pending second factor.
+class IssuedSession:
+    """A newly-issued session and **both** of its plaintext credentials — ADR-0010 A3.
 
-    Both shapes carry exactly one freshly-minted opaque credential, so there is one ``token``
-    field and ``session`` is what distinguishes them: present, and ``token`` is a bearer token;
-    absent, and ``token`` is the ``mfa_token`` for the second-factor exchange. A second nullable
-    field for the MFA case would hold the same string and give the router two things to keep
-    consistent instead of one to branch on.
+    The two travel differently and must not be confused: ``access_token`` goes in the response body
+    for the client to hold in memory and send as a bearer, ``refresh_token`` goes in an HttpOnly
+    cookie scoped to the refresh endpoint and is never in a body. Returning them as one object
+    rather than a tuple is what makes a caller name which is which at the point of use.
 
-    The plaintext is present here and nowhere else — only its argon2id digest is persisted, so
-    this object is the single opportunity to return it.
+    Both plaintexts exist here and nowhere else — only their argon2id digests are persisted, so this
+    object is the single opportunity to hand them out.
     """
 
-    token: str
-    session: Session | None = None
+    access_token: str
+    refresh_token: str
+    session: Session
+
+
+@dataclass(frozen=True, slots=True)
+class LoginOutcome:
+    """What a password login produced: an issued session, or a pending second factor.
+
+    Exactly one of ``issued`` / ``mfa_token`` is set, and which one is the discriminator the router
+    branches on. Modelled as two explicit fields rather than one overloaded ``token`` because A3
+    made a login's success case carry *two* credentials — a single field could no longer describe
+    both outcomes without lying about one of them.
+    """
+
+    issued: IssuedSession | None = None
+    mfa_token: str | None = None
+
+    @property
+    def mfa_required(self) -> bool:
+        return self.issued is None
 
 
 class AuthService:
@@ -179,15 +197,9 @@ class AuthService:
                 user_agent=user_agent,
                 details={},
             )
-            return LoginOutcome(token=challenge_token)
+            return LoginOutcome(mfa_token=challenge_token)
 
-        token = generate_opaque_token()
-        session_row = await self._sessions.create_session(
-            user_id=user.user_id,
-            token=token,
-            issued_at=issued_at,
-            expires_at=issued_at + timedelta(seconds=self._ttl_seconds),
-        )
+        issued = await self._issue(user.user_id, issued_at)
 
         roles = await self._sessions.get_role_names(user.user_id)
         await record_audit_event(
@@ -198,12 +210,37 @@ class AuthService:
             action="login_success",
             module=_MODULE,
             target_type="session",
-            target_id=session_row.session_id,
+            target_id=issued.session.session_id,
             ip_address=ip_address,
             user_agent=user_agent,
             details={"roles": roles},
         )
-        return LoginOutcome(token=token, session=session_row)
+        return LoginOutcome(issued=issued)
+
+    async def _issue(self, user_id: UUID, now: datetime) -> IssuedSession:
+        """Mint an access/refresh pair and persist their digests — ADR-0010 §1, A3.
+
+        One place, called by login, MFA completion and rotation alike, so the three paths cannot
+        drift on how long a credential lives or on whether a refresh token is issued at all.
+
+        The two tokens are independently generated 256-bit values, not derived from one another: a
+        refresh token computable from an access token would make the access token — the one exposed
+        to JavaScript — sufficient to mint new sessions, which is the exact property A3's split
+        exists to remove.
+        """
+        access_token = generate_opaque_token()
+        refresh_token = generate_opaque_token()
+        session_row = await self._sessions.create_session(
+            user_id=user_id,
+            token=access_token,
+            issued_at=now,
+            expires_at=now + timedelta(seconds=self._ttl_seconds),
+            refresh_token=refresh_token,
+            refresh_expires_at=now + timedelta(seconds=settings.refresh_token_ttl_seconds),
+        )
+        return IssuedSession(
+            access_token=access_token, refresh_token=refresh_token, session=session_row
+        )
 
     async def verify_mfa(
         self,
@@ -212,7 +249,7 @@ class AuthService:
         *,
         ip_address: str | None = None,
         user_agent: str | None = None,
-    ) -> tuple[str, Session]:
+    ) -> IssuedSession:
         """Complete a login by presenting the second factor (api-design.md §9).
 
         Accepts either a TOTP code or an unused recovery code — a user who has lost their
@@ -274,23 +311,17 @@ class AuthService:
             )
             raise UnauthenticatedError(_MFA_REJECTION)
 
-        token = generate_opaque_token()
-        session_row = await self._sessions.create_session(
-            user_id=user.user_id,
-            token=token,
-            issued_at=now,
-            expires_at=now + timedelta(seconds=self._ttl_seconds),
-        )
+        issued = await self._issue(user.user_id, now)
         roles = await self._sessions.get_role_names(user.user_id)
         await self._audit_event(
             user,
             "login_success",
-            target_id=session_row.session_id,
+            target_id=issued.session.session_id,
             ip_address=ip_address,
             user_agent=user_agent,
             details={"roles": roles, "mfa": True},
         )
-        return token, session_row
+        return issued
 
     async def _factor_accepted(self, user: User, code: str, now: datetime) -> bool:
         """Verify ``code`` as a TOTP code, then as a recovery code. Neither leaks which was used.
@@ -312,47 +343,53 @@ class AuthService:
 
     async def refresh(
         self,
-        token: str,
+        refresh_token: str,
         *,
         ip_address: str | None = None,
         user_agent: str | None = None,
-    ) -> tuple[str, Session]:
-        """Rotate a live session: issue a successor and revoke the presented one (ADR-0010 §2).
+    ) -> IssuedSession:
+        """Rotate a session on its **refresh** token — ADR-0010 §2 and A3.
 
-        api-design.md §9 describes this as extending a session before ``expires_at``. It is
-        implemented as **rotation** rather than as an ``UPDATE`` to ``expires_at``, because
-        ADR-0010's A3 requires that "each successful refresh issues a new token and revokes its
-        predecessor", which is what makes a stolen token single-use and its reuse detectable.
+        Implemented as rotation rather than an ``UPDATE`` to ``expires_at`` because A3 requires that
+        "each successful refresh issues a new token and revokes its predecessor", which is what
+        makes a stolen refresh token single-use and its reuse detectable.
 
-        Refreshing an expired or revoked session is refused rather than forgiven: a session that
-        has ended is exactly what revocation means, and extending one would make logout advisory.
+        **Keyed on the refresh credential, and checked against ``refresh_expires_at``.** The whole
+        point of A3's split is that the access token expires while the session stays refreshable, so
+        a refresh path that resolved the access token (or checked ``expires_at``) would refuse
+        exactly the case it exists to serve — and would require the client to hold a live access
+        token in order to replace one, which is circular.
+
+        A revoked or refresh-expired session is refused rather than forgiven: that is what
+        revocation means, and extending one would make logout advisory. A pre-A3 session with no
+        refresh credential simply does not resolve, which is the honest answer — there is no token
+        to present, because none was ever issued.
         """
         now = datetime.now(UTC)
-        current = await self._sessions.get_active_by_token(token)
-        if current is None or current.expires_at < now or current.revoked_at is not None:
+        current = await self._sessions.get_active_by_refresh_token(refresh_token)
+        if (
+            current is None
+            or current.revoked_at is not None
+            or current.refresh_expires_at is None
+            or current.refresh_expires_at < now
+        ):
             raise UnauthenticatedError(_SESSION_REJECTION)
 
-        successor_token = generate_opaque_token()
-        successor = await self._sessions.create_session(
-            user_id=current.user_id,
-            token=successor_token,
-            issued_at=now,
-            expires_at=now + timedelta(seconds=self._ttl_seconds),
-        )
-        # Revoked, not deleted: the row is the evidence that this token existed and when it
-        # stopped being valid, which is what makes a later replay attempt legible.
+        successor = await self._issue(current.user_id, now)
+        # Revoked, not deleted: the row is the evidence that these credentials existed and when
+        # they stopped being valid, which is what makes a later replay attempt legible.
         current.revoked_at = now
 
         user = await self._users.get_by_id(current.user_id)
         await self._audit_event(
             user,
             "session_refreshed",
-            target_id=successor.session_id,
+            target_id=successor.session.session_id,
             ip_address=ip_address,
             user_agent=user_agent,
             details={"revoked_session_id": str(current.session_id)},
         )
-        return successor_token, successor
+        return successor
 
     async def logout(
         self,

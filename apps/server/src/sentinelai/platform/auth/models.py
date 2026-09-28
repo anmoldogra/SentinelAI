@@ -124,17 +124,29 @@ class UserRole(Base):
 
 
 class Session(Base):
-    """A server-side session record backing a bearer token (security §35).
+    """A server-side session record backing **two** credentials — ADR-0010 §1 and A3.
 
-    ADR-0010 §1: the bearer token is a high-entropy opaque secret that is **never** stored. The
-    row keeps its argon2id digest (``token_hash``) plus a short, non-secret ``token_lookup``
-    prefix. Because argon2id is salted, the digest is not itself indexable — the prefix is what
-    turns token resolution into an index seek followed by a verify of the few candidates.
+    Neither token is stored. The row keeps each one's argon2id digest plus a short, non-secret
+    lookup prefix; because argon2id is salted the digest is not itself indexable, so the prefix is
+    what turns token resolution into an index seek followed by a verify of the few candidates.
+
+    **Why one row and not two tables.** A3 splits the credential in two — a short-lived access
+    token in the ``Authorization`` header and a long-lived refresh token in an HttpOnly cookie —
+    but they share one lifecycle: they are issued together, revoked together, and rotation replaces
+    both at once. A separate ``refresh_tokens`` table would model a one-to-one relationship as a
+    join and give ``revoked_at`` two places to disagree about whether a session is over.
+
+    **Why two expiries.** The access token has to be able to expire *while the session is still
+    refreshable* — that is the entire point of the split. One column could not express it, and a
+    refresh path that checked ``expires_at`` would refuse exactly the case it exists to serve.
     """
 
     __tablename__ = "sessions"
     __table_args__ = (
         Index("ix_sessions_token_lookup", "token_lookup"),
+        # The refresh lookup gets its own index for the same reason the access one has it: the
+        # refresh endpoint resolves a token on every call, and without it that becomes a scan.
+        Index("ix_sessions_refresh_token_lookup", "refresh_token_lookup"),
         {"schema": _SCHEMA},
     )
 
@@ -147,8 +159,26 @@ class Session(Base):
     token_lookup: Mapped[str] = mapped_column(String(LOOKUP_PREFIX_LENGTH), nullable=False)
     token_hash: Mapped[str] = mapped_column(Text, nullable=False)
     issued_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    # The **access** token's expiry. Named without a prefix because it predates the split and is
+    # what `get_current_user` checks; renaming it would touch every session query to say the same
+    # thing.
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    # --- the refresh credential (ADR-0010 A3) ------------------------------
+    #
+    # Nullable because sessions written before A3 have no refresh token and cannot gain one: the
+    # plaintext was never stored, so there is nothing to derive a digest from. Such a session
+    # remains usable until its access token expires and is then simply not refreshable — which is
+    # honest, and is why `refresh` treats a missing refresh credential as "no such token" rather
+    # than as an error to explain.
+    refresh_token_lookup: Mapped[str | None] = mapped_column(
+        String(LOOKUP_PREFIX_LENGTH), nullable=True
+    )
+    refresh_token_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refresh_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
 
 
 class MfaRecoveryCode(Base):

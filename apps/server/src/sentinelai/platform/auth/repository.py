@@ -116,6 +116,25 @@ class SessionRepository:
         )
         return list((await self._session.execute(stmt)).scalars().all())
 
+    async def get_active_by_refresh_token(self, token: str) -> Session | None:
+        """Resolve a session from its **refresh** token — ADR-0010 A3.
+
+        Separate from :meth:`get_active_by_token` rather than a flag on it, because the two
+        credentials must never be interchangeable: an access token presented to the refresh
+        endpoint, or a refresh token presented as a bearer, has to fail. One method matching either
+        digest would make them one credential with two names.
+
+        Does not filter on expiry or revocation; the caller decides, as it does for access tokens.
+        """
+        stmt = select(Session).where(Session.refresh_token_lookup == token_lookup_prefix(token))
+        candidates = (await self._session.execute(stmt)).scalars().all()
+        for candidate in candidates:
+            if candidate.refresh_token_hash is not None and self._hasher.verify(
+                candidate.refresh_token_hash, token
+            ):
+                return candidate
+        return None
+
     async def create_session(
         self,
         *,
@@ -123,10 +142,16 @@ class SessionRepository:
         token: str,
         issued_at: datetime,
         expires_at: datetime,
+        refresh_token: str | None = None,
+        refresh_expires_at: datetime | None = None,
     ) -> Session:
-        """Persist a new session for ``token``, storing only its digest and lookup prefix.
+        """Persist a new session, storing only each token's digest and lookup prefix.
 
         Flushed, not committed: the transaction belongs to the entrypoint (ADR-0005).
+
+        ``refresh_token`` is optional so the admin CLI's ``dev-token`` — which mints a bare,
+        long-lived access token out of band and has no cookie to put a refresh credential in — does
+        not have to invent one it would never use.
         """
         session_row = Session(
             user_id=user_id,
@@ -135,6 +160,13 @@ class SessionRepository:
             issued_at=issued_at,
             expires_at=expires_at,
             revoked_at=None,
+            refresh_token_lookup=(
+                token_lookup_prefix(refresh_token) if refresh_token is not None else None
+            ),
+            refresh_token_hash=(
+                self._hasher.hash(refresh_token) if refresh_token is not None else None
+            ),
+            refresh_expires_at=refresh_expires_at,
         )
         self._session.add(session_row)
         await self._session.flush()

@@ -166,10 +166,10 @@ async def test_an_enrolled_user_gets_a_challenge_not_a_session(
 
         outcome = await _service(session).login(user.email, _PASSWORD)
 
-        assert outcome.session is None, (
+        assert outcome.issued is None, (
             "a password alone must not open a session for an enrolled account"
         )
-        assert outcome.token
+        assert outcome.mfa_token
         rows = (await session.execute(select(Session))).scalars().all()
         assert rows == [], "no session row may exist until the second factor is verified"
 
@@ -189,10 +189,15 @@ async def test_the_second_factor_completes_the_login(
 
         now = datetime.now(UTC)
         code = totp.compute_code(secret, totp.current_step(now))
-        token, session_row = await service.verify_mfa(outcome.token, code)
+        issued = await service.verify_mfa(outcome.mfa_token or "", code)
 
-        assert token and session_row.user_id == user.user_id
-        assert session_row.revoked_at is None
+        assert issued.access_token and issued.session.user_id == user.user_id
+        assert issued.refresh_token, "A3: a completed login carries both credentials"
+        assert issued.access_token != issued.refresh_token, (
+            "the two must be independently generated — a refresh token derivable from the access "
+            "token would make the script-exposed credential sufficient to mint sessions"
+        )
+        assert issued.session.revoked_at is None
 
 
 async def test_a_wrong_code_is_refused_and_burns_the_challenge(
@@ -211,12 +216,12 @@ async def test_a_wrong_code_is_refused_and_burns_the_challenge(
         outcome = await service.login(user.email, _PASSWORD)
 
         with pytest.raises(UnauthenticatedError):
-            await service.verify_mfa(outcome.token, "000000")
+            await service.verify_mfa(outcome.mfa_token or "", "000000")
 
         # Even the *correct* code cannot rescue that challenge now.
         correct = totp.compute_code(secret, totp.current_step(datetime.now(UTC)))
         with pytest.raises(UnauthenticatedError):
-            await service.verify_mfa(outcome.token, correct)
+            await service.verify_mfa(outcome.mfa_token or "", correct)
 
 
 async def test_an_mfa_token_cannot_be_replayed(
@@ -233,10 +238,10 @@ async def test_an_mfa_token_cannot_be_replayed(
         service = _service(session)
         outcome = await service.login(user.email, _PASSWORD)
         code = totp.compute_code(secret, totp.current_step(datetime.now(UTC)))
-        await service.verify_mfa(outcome.token, code)
+        await service.verify_mfa(outcome.mfa_token or "", code)
 
         with pytest.raises(UnauthenticatedError):
-            await service.verify_mfa(outcome.token, code)
+            await service.verify_mfa(outcome.mfa_token or "", code)
 
 
 async def test_an_expired_challenge_is_refused(
@@ -271,7 +276,7 @@ async def test_an_unenrolled_user_still_logs_in_with_a_password_alone(
     async with db() as session:
         user = await _seed_user(session, "plain@example.gov")
         outcome = await _service(session).login(user.email, _PASSWORD)
-        assert outcome.session is not None
+        assert outcome.issued is not None
 
 
 # --- session lifecycle ------------------------------------------------------
@@ -283,16 +288,19 @@ async def test_refresh_rotates_and_revokes_its_predecessor(
         user = await _seed_user(session, "rotate@example.gov")
         service = _service(session)
         first = await service.login(user.email, _PASSWORD)
-        assert first.session is not None
+        assert first.issued is not None
 
-        second_token, second = await service.refresh(first.token)
+        second = await service.refresh(first.issued.refresh_token)
 
-        assert second_token != first.token
-        assert second.session_id != first.session.session_id
-        assert first.session.revoked_at is not None, (
+        assert second.access_token != first.issued.access_token
+        assert second.refresh_token != first.issued.refresh_token, (
+            "A3: the refresh credential rotates too, or a stolen cookie stays valid forever"
+        )
+        assert second.session.session_id != first.issued.session.session_id
+        assert first.issued.session.revoked_at is not None, (
             "the predecessor must be revoked, not left live"
         )
-        assert second.revoked_at is None
+        assert second.session.revoked_at is None
 
 
 async def test_a_rotated_token_cannot_be_used_again(
@@ -304,10 +312,11 @@ async def test_a_rotated_token_cannot_be_used_again(
         user = await _seed_user(session, "reuse@example.gov")
         service = _service(session)
         first = await service.login(user.email, _PASSWORD)
-        await service.refresh(first.token)
+        assert first.issued is not None
+        await service.refresh(first.issued.refresh_token)
 
         with pytest.raises(UnauthenticatedError):
-            await service.refresh(first.token)
+            await service.refresh(first.issued.refresh_token)
 
 
 async def test_logout_revokes_immediately(
@@ -318,18 +327,21 @@ async def test_logout_revokes_immediately(
     async with db() as session:
         user = await _seed_user(session, "logout@example.gov")
         service = _service(session)
-        issued = await service.login(user.email, _PASSWORD)
-        assert issued.session is not None
+        outcome = await service.login(user.email, _PASSWORD)
+        assert outcome.issued is not None
+        issued = outcome.issued
 
-        await service.logout(issued.token)
+        await service.logout(issued.access_token)
 
         assert issued.session.revoked_at is not None
-        assert await SessionRepository(session).get_active_by_token(issued.token) is not None, (
+        assert (
+            await SessionRepository(session).get_active_by_token(issued.access_token) is not None
+        ), (
             "the row still resolves — revocation is a state on it, not a deletion, so a later "
             "replay attempt stays legible"
         )
         with pytest.raises(UnauthenticatedError):
-            await service.refresh(issued.token)
+            await service.refresh(issued.refresh_token)
 
 
 async def test_logout_is_idempotent_and_silent(
@@ -340,10 +352,11 @@ async def test_logout_is_idempotent_and_silent(
     async with db() as session:
         user = await _seed_user(session, "twice@example.gov")
         service = _service(session)
-        issued = await service.login(user.email, _PASSWORD)
+        outcome = await service.login(user.email, _PASSWORD)
+        assert outcome.issued is not None
 
-        await service.logout(issued.token)
-        await service.logout(issued.token)
+        await service.logout(outcome.issued.access_token)
+        await service.logout(outcome.issued.access_token)
         await service.logout("not-a-token-that-was-ever-issued")
 
 
@@ -353,30 +366,84 @@ async def test_a_revoked_session_cannot_be_refreshed_back_to_life(
     async with db() as session:
         user = await _seed_user(session, "revoked@example.gov")
         service = _service(session)
-        issued = await service.login(user.email, _PASSWORD)
-        assert issued.session is not None
-        issued.session.revoked_at = datetime.now(UTC)
+        outcome = await service.login(user.email, _PASSWORD)
+        assert outcome.issued is not None
+        outcome.issued.session.revoked_at = datetime.now(UTC)
         await session.flush()
 
         with pytest.raises(UnauthenticatedError):
-            await service.refresh(issued.token)
+            await service.refresh(outcome.issued.refresh_token)
 
 
-async def test_an_expired_session_cannot_be_refreshed(
+async def test_an_expired_access_token_can_still_be_refreshed(
     db: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Sliding expiry slides only while the session is alive — otherwise `expires_at` would
-    never actually expire anything."""
+    """The property A3's split exists for, and the one this test used to assert the opposite of.
+
+    Before A3 there was one credential, so "expired" meant the session was over and refreshing it
+    was refused. Now the access token is meant to expire *while the session stays refreshable* — a
+    client whose 8h access token lapsed must be able to exchange its refresh cookie for a new one
+    without logging in again. A refresh path that checked `expires_at` would refuse exactly the
+    case it exists to serve.
+    """
     async with db() as session:
         user = await _seed_user(session, "stale@example.gov")
         service = _service(session)
-        issued = await service.login(user.email, _PASSWORD)
-        assert issued.session is not None
-        issued.session.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        outcome = await service.login(user.email, _PASSWORD)
+        assert outcome.issued is not None
+        outcome.issued.session.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.flush()
+
+        rotated = await service.refresh(outcome.issued.refresh_token)
+
+    assert rotated.access_token, "an expired access token must not block its own replacement"
+    assert rotated.session.expires_at > datetime.now(UTC)
+
+
+async def test_an_expired_refresh_token_cannot_be_refreshed(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    """The other half: sliding expiry slides only while the *refresh* credential is alive, or
+    `refresh_expires_at` would never expire anything and a session would be immortal."""
+    async with db() as session:
+        user = await _seed_user(session, "staleref@example.gov")
+        service = _service(session)
+        outcome = await service.login(user.email, _PASSWORD)
+        assert outcome.issued is not None
+        outcome.issued.session.refresh_expires_at = datetime.now(UTC) - timedelta(seconds=1)
         await session.flush()
 
         with pytest.raises(UnauthenticatedError):
-            await service.refresh(issued.token)
+            await service.refresh(outcome.issued.refresh_token)
+
+
+async def test_the_two_credentials_are_not_interchangeable(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    """A3's split is only real if each token works in exactly one place.
+
+    An access token accepted at the refresh endpoint would mean the script-readable credential
+    could mint new sessions — the exposure the HttpOnly cookie exists to remove. A refresh token
+    accepted as a bearer would mean the cookie authorized API calls, which is the precondition
+    A3's CSRF argument explicitly depends on never being true.
+    """
+    async with db() as session:
+        user = await _seed_user(session, "distinct@example.gov")
+        service = _service(session)
+        outcome = await service.login(user.email, _PASSWORD)
+        assert outcome.issued is not None
+        issued = outcome.issued
+
+        with pytest.raises(UnauthenticatedError):
+            await service.refresh(issued.access_token)
+
+        repo = SessionRepository(session)
+        assert await repo.get_active_by_token(issued.refresh_token) is None, (
+            "the refresh token must not resolve as a bearer"
+        )
+        assert await repo.get_active_by_refresh_token(issued.access_token) is None, (
+            "the access token must not resolve as a refresh credential"
+        )
 
 
 # --- token-hash security ----------------------------------------------------
@@ -398,23 +465,32 @@ async def test_no_credential_plaintext_reaches_the_database(
         service = _service(session)
 
         challenge = await service.login(enrolled.email, _PASSWORD)
-        issued = await service.login(plain.email, _PASSWORD)
+        outcome = await service.login(plain.email, _PASSWORD)
+        assert challenge.mfa_token is not None and outcome.issued is not None
+        issued = outcome.issued
         await session.flush()
 
         session_rows = (await session.execute(select(Session))).scalars().all()
         challenge_rows = (await session.execute(select(MfaChallenge))).scalars().all()
 
         for row in session_rows:
-            assert row.token_hash != issued.token
-            assert issued.token not in row.token_hash
+            assert row.token_hash != issued.access_token
+            assert issued.access_token not in row.token_hash
+            # A3's refresh credential gets the same treatment, and it is the one that matters most:
+            # it is long-lived, so a plaintext leak here would outlast every access token.
+            assert row.refresh_token_hash is not None
+            assert row.refresh_token_hash != issued.refresh_token
+            assert issued.refresh_token not in row.refresh_token_hash
         for row in challenge_rows:
-            assert row.token_hash != challenge.token
-            assert challenge.token not in row.token_hash
+            assert row.token_hash != challenge.mfa_token
+            assert (challenge.mfa_token or "") not in row.token_hash
 
         # The lookup prefix IS derived from the token and is meant to be — it is a non-secret
         # index key, not a credential. What matters is that it is too short to be the token.
         for row in session_rows:
-            assert len(row.token_lookup) < len(issued.token)
+            assert len(row.token_lookup) < len(issued.access_token)
+            assert row.refresh_token_lookup is not None
+            assert len(row.refresh_token_lookup) < len(issued.refresh_token)
 
 
 async def test_a_recovery_code_completes_a_login_and_is_single_use(
@@ -436,18 +512,18 @@ async def test_a_recovery_code_completes_a_login_and_is_single_use(
         service = _service(session)
 
         first = await service.login(user.email, _PASSWORD)
-        token, session_row = await service.verify_mfa(first.token, codes[0])
-        assert token and session_row.user_id == user.user_id
+        issued = await service.verify_mfa(first.mfa_token or "", codes[0])
+        assert issued.access_token and issued.session.user_id == user.user_id
 
         # The same code cannot be redeemed twice, even on a fresh challenge.
         second = await service.login(user.email, _PASSWORD)
         with pytest.raises(UnauthenticatedError):
-            await service.verify_mfa(second.token, codes[0])
+            await service.verify_mfa(second.mfa_token or "", codes[0])
 
         # A different, unused code still works.
         third = await service.login(user.email, _PASSWORD)
-        again, _ = await service.verify_mfa(third.token, codes[1])
-        assert again
+        again = await service.verify_mfa(third.mfa_token or "", codes[1])
+        assert again.access_token and again.refresh_token
 
 
 async def test_recovery_codes_are_stored_hashed_not_in_the_clear(

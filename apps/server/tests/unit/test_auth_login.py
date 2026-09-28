@@ -24,6 +24,7 @@ from sentinelai.platform.auth.router import router as auth_router
 from sentinelai.platform.auth.schemas import LoginRequest
 from sentinelai.platform.auth.service import (
     AuthService,
+    IssuedSession,
     LoginOutcome,
     get_auth_service,
 )
@@ -72,17 +73,31 @@ class FakeSessions:
         self.roles = roles if roles is not None else ["investigator"]
 
     async def create_session(
-        self, *, user_id: UUID, token: str, issued_at: datetime, expires_at: datetime
+        self,
+        *,
+        user_id: UUID,
+        token: str,
+        issued_at: datetime,
+        expires_at: datetime,
+        refresh_token: str | None = None,
+        refresh_expires_at: datetime | None = None,
     ) -> Session:
         row = Session(
             session_id=uuid4(),
             user_id=user_id,
             token_lookup=token_lookup_prefix(token),
-            # Mirrors the real repository: the digest is stored, never the token.
+            # Mirrors the real repository: the digest is stored, never the token. Both
+            # credentials, since ADR-0010 A3 — a fake that stored only the access token would let
+            # `test_login_issues_token_and_never_stores_it` pass while the refresh token leaked.
             token_hash=f"new::{token}",
             issued_at=issued_at,
             expires_at=expires_at,
             revoked_at=None,
+            refresh_token_lookup=(
+                token_lookup_prefix(refresh_token) if refresh_token is not None else None
+            ),
+            refresh_token_hash=f"new::{refresh_token}" if refresh_token is not None else None,
+            refresh_expires_at=refresh_expires_at,
         )
         self.created.append(row)
         return row
@@ -149,8 +164,8 @@ async def test_login_issues_token_and_never_stores_it(audit: list[dict[str, Any]
     service, sessions, _ = make_service(user)
 
     outcome = await service.login(user.email, _PASSWORD)
-    token, session_row = outcome.token, outcome.session
-    assert session_row is not None, "an un-enrolled user must get a session, not a challenge"
+    assert outcome.issued is not None, "an un-enrolled user must get a session, not a challenge"
+    token, session_row = outcome.issued.access_token, outcome.issued.session
 
     assert token  # returned to the caller exactly once
     stored = sessions.created[0]
@@ -166,8 +181,9 @@ async def test_login_honours_configured_session_ttl(audit: list[dict[str, Any]])
     user = make_user()
     service, _, _ = make_service(user, ttl_seconds=3600)
 
-    session_row = (await service.login(user.email, _PASSWORD)).session
-    assert session_row is not None
+    issued = (await service.login(user.email, _PASSWORD)).issued
+    assert issued is not None
+    session_row = issued.session
 
     assert (session_row.expires_at - session_row.issued_at).total_seconds() == 3600
 
@@ -176,7 +192,9 @@ async def test_email_match_is_case_insensitive(audit: list[dict[str, Any]]) -> N
     user = make_user()
     service, _, _ = make_service(user)
 
-    token = (await service.login(user.email.upper(), _PASSWORD)).token
+    issued = (await service.login(user.email.upper(), _PASSWORD)).issued
+    assert issued is not None
+    token = issued.access_token
 
     assert token
 
@@ -234,8 +252,9 @@ async def test_success_is_audited_with_roles(audit: list[dict[str, Any]]) -> Non
     user = make_user()
     service, _, _ = make_service(user, roles=["supervisor", "investigator"])
 
-    session_row = (await service.login(user.email, _PASSWORD, ip_address="10.0.0.9")).session
-    assert session_row is not None
+    issued = (await service.login(user.email, _PASSWORD, ip_address="10.0.0.9")).issued
+    assert issued is not None
+    session_row = issued.session
 
     (entry,) = audit
     assert entry["action"] == "login_success"
@@ -357,7 +376,15 @@ def make_session_row() -> Session:
 
 def test_route_returns_the_token_in_the_standard_envelope() -> None:
     session_row = make_session_row()
-    service = StubService(LoginOutcome(token="plaintext-token", session=session_row))
+    service = StubService(
+        LoginOutcome(
+            issued=IssuedSession(
+                access_token="plaintext-token",
+                refresh_token="plaintext-refresh",
+                session=session_row,
+            )
+        )
+    )
     client, db = build_client(service)
 
     response = client.post(

@@ -66,19 +66,34 @@ class Settings(BaseSettings):
     # --- auth / tokens ---
     # RESERVED, NOT ACTIVE. ADR-0010 mandates OPAQUE server-side sessions (not stateless JWT) for
     # authorization, with the store holding only a token hash (argon2id / keyed HMAC via ADR-0009).
-    # These fields are retained for backward compatibility only; nothing authorizes on them, so
-    # validate_for_profile() intentionally does NOT enforce them. Do not build auth on these.
+    # Nothing authorizes on these, so validate_for_profile() intentionally does NOT enforce them.
+    # Do not build auth on them.
+    #
+    # The dead `access_token_ttl_seconds` / `refresh_token_ttl_seconds` that used to sit here were
+    # removed when A3's two-credential split landed: `refresh_token_ttl_seconds` below is now a real
+    # setting, and a same-named dead field is the drift trap where one of them silently becomes the
+    # one nothing reads. `access_token_ttl_seconds` went with it — the access token's lifetime is
+    # `session_ttl_seconds`, and a second field claiming to be it would be read first and be wrong.
     jwt_secret_key: SecretStr = SecretStr("dev-only-change-me")
     jwt_algorithm: str = "HS256"
-    access_token_ttl_seconds: int = 900
-    refresh_token_ttl_seconds: int = 1_209_600
 
-    # ACTIVE. Absolute lifetime of an opaque session (security-architecture.md §9), deliberately
-    # deployment-configurable — §9 expects government/high-sensitivity profiles to default
-    # shorter than enterprise. This is the absolute cap only; the idle timeout §9 also calls for
-    # arrives with the sliding-expiry refresh flow (POST /api/v1/auth/refresh), which is not
-    # built yet — so a session currently lives exactly this long regardless of activity.
+    # ACTIVE. The **access** token's absolute lifetime (security-architecture.md §9), deliberately
+    # deployment-configurable — §9 expects government/high-sensitivity profiles to default shorter
+    # than enterprise.
+    #
+    # ADR-0010 A3 calls the access token "short", and 8h is not. It is left at the pre-A3 value on
+    # purpose: `apps/web` has no refresh loop yet (`shared/api/client.ts` marks retry/refresh as
+    # "deliberately NOT here yet"), so shortening this would log every analyst out mid-shift with no
+    # automatic recovery. Tightening it is a one-line change once the console can refresh, and it is
+    # recorded as outstanding in ADR-0010's status rather than left as a surprise.
+    #
+    # §9's idle timeout is now expressible — a session that is never refreshed ends at this cap —
+    # but is not separately enforced; refresh extends the credential, it does not track activity.
     session_ttl_seconds: int = 28_800  # 8h — one working shift.
+    # The **refresh** token's lifetime (A3: "long, sliding"). Sliding because each refresh mints a
+    # successor with a fresh window, so an active analyst is never logged out while an abandoned
+    # session still ends. 30 days bounds how long a stolen cookie is worth anything.
+    refresh_token_ttl_seconds: int = 2_592_000  # 30d.
     # The `mfa_token` window between password acceptance and second factor. Short on
     # purpose: it is a credential for a half-authenticated principal (the password has been
     # accepted, the factor has not), so it must not outlive the login attempt that made it.

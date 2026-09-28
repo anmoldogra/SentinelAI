@@ -27,7 +27,18 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    """An issued session's bearer token. The plaintext token is returned exactly once."""
+    """An issued session's **access** token. The plaintext is returned exactly once.
+
+    The refresh token is deliberately **not** a field here. ADR-0010 A3 puts it in an
+    ``HttpOnly`` cookie precisely so that script cannot read it; returning it in the body as well
+    would hand it to the JavaScript the cookie exists to keep it away from, and an XSS that stole
+    the in-memory access token could then mint sessions indefinitely. The whole value of the split
+    is that these two credentials travel by different channels.
+
+    ``expires_at`` is the *access* token's expiry. The refresh credential's lifetime is not
+    reported: the client cannot read the cookie, and a body field describing it would only be a
+    number to get out of sync with the cookie's own ``Max-Age``.
+    """
 
     access_token: str
     token_type: Literal["bearer"] = "bearer"
@@ -54,15 +65,3 @@ class MfaVerifyRequest(BaseModel):
     # Accepts a TOTP code or a recovery code, so the bound is the longer of the two shapes. The
     # server never tells the client which it matched.
     code: str = Field(min_length=1, max_length=64)
-
-
-class RefreshRequest(BaseModel):
-    """The session to rotate.
-
-    The token travels in the body rather than the ``Authorization`` header because refresh is the
-    one endpoint whose credential may already be past the point where a header would be accepted
-    by the auth dependency — and because ADR-0010 A3 scopes the refresh credential to this
-    endpoint alone. The cookie transport A3 specifies is not yet built; see ADR-0010's status.
-    """
-
-    refresh_token: str = Field(min_length=1, max_length=512)

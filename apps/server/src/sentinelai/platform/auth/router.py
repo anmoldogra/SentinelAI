@@ -10,9 +10,15 @@ so the failure path commits the audit entry the service wrote before re-raising.
 ``AsyncSession`` injected here is the same instance the service's repositories hold — FastAPI
 caches the ``get_session`` sub-dependency per request.
 
-``/auth/mfa/verify``, ``/auth/refresh`` and ``/auth/logout`` complete §9's session lifecycle
-(Wave 3.1). The SSO pair (``/auth/sso/{provider}/redirect|callback``) is still unbuilt — ADR-0010
-A1 defers it by sequencing, not by profile, and the schema it needs already exists.
+``/auth/mfa/verify``, ``/auth/refresh`` and ``/auth/logout`` complete §9's session lifecycle.
+
+**ADR-0010 A3's two-credential split lives here.** Every successful issue returns the access token
+in the body and the refresh token in an ``HttpOnly; Secure; SameSite=Strict`` cookie scoped to
+``/api/v1/auth/refresh`` — never both in the body, or the cookie would be pointless. ``cookies.py``
+owns the attributes; ``_issued_response`` is the single place that applies the split.
+
+The SSO pair (``/auth/sso/{provider}/redirect|callback``) is still unbuilt — ADR-0010 A1 defers it
+by sequencing, not by profile, and the schema it needs already exists.
 """
 
 from __future__ import annotations
@@ -22,14 +28,22 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, Header, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sentinelai.platform.auth.cookies import (
+    COOKIE_NAME,
+    clear_refresh_cookie,
+    set_refresh_cookie,
+)
 from sentinelai.platform.auth.schemas import (
     LoginRequest,
     LoginResponse,
     MfaRequiredResponse,
     MfaVerifyRequest,
-    RefreshRequest,
 )
-from sentinelai.platform.auth.service import AuthService, get_auth_service
+from sentinelai.platform.auth.service import (
+    AuthService,
+    IssuedSession,
+    get_auth_service,
+)
 from sentinelai.platform.config import settings
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
@@ -51,6 +65,22 @@ def _meta(request: Request) -> Meta:
     return Meta(request_id=request.state.request_id, correlation_id=request.state.correlation_id)
 
 
+def _issued_response(
+    request: Request, response: Response, issued: IssuedSession
+) -> Envelope[LoginResponse]:
+    """Shape an issued session: access token in the body, refresh token in the cookie (A3).
+
+    Shared by login, MFA completion and refresh so the split cannot be applied inconsistently — a
+    handler that forgot the cookie would leave a client unable to refresh, and one that leaked the
+    refresh token into the body would silently undo the reason the cookie is ``HttpOnly``.
+    """
+    set_refresh_cookie(response, issued.refresh_token)
+    return Envelope(
+        data=LoginResponse(access_token=issued.access_token, expires_at=issued.session.expires_at),
+        meta=_meta(request),
+    )
+
+
 @router.post(
     "/auth/login",
     response_model=Envelope[LoginResponse],
@@ -60,10 +90,11 @@ def _meta(request: Request) -> Meta:
 async def login(
     payload: LoginRequest,
     request: Request,
+    response: Response,
     service: AuthService = Depends(get_auth_service),
     session: AsyncSession = Depends(get_session),
 ) -> Envelope[LoginResponse]:
-    """Exchange credentials for an opaque bearer token (api-design.md §9)."""
+    """Exchange credentials for an access token plus a refresh cookie (api-design.md §9, A3)."""
     client_host = request.client.host if request.client is not None else None
     try:
         outcome = await service.login(
@@ -79,23 +110,23 @@ async def login(
         await session.commit()
         raise
 
-    if outcome.session is None:
-        # No session means the account is MFA-enrolled and `token` is the challenge credential.
-        # Still a 200 (api-design.md §9): the password was correct. `security-architecture.md` §8
-        # makes the second factor mandatory, so a password alone never reaches case data.
+    if outcome.issued is None:
+        # An MFA-enrolled account gets a challenge, not a session — still a 200 (api-design.md §9),
+        # because the password was correct. `security-architecture.md` §8 makes the second factor
+        # mandatory, so a password alone never reaches case data.
+        #
+        # No refresh cookie is set here on purpose: there is no session yet, and handing a
+        # half-authenticated principal a long-lived credential would undo the second factor.
         return Envelope(
             data=MfaRequiredResponse(
-                mfa_token=outcome.token,
+                mfa_token=outcome.mfa_token or "",
                 expires_at=datetime.now(UTC)
                 + timedelta(seconds=settings.mfa_challenge_ttl_seconds),
             ),
             meta=_meta(request),
         )
 
-    return Envelope(
-        data=LoginResponse(access_token=outcome.token, expires_at=outcome.session.expires_at),
-        meta=_meta(request),
-    )
+    return _issued_response(request, response, outcome.issued)
 
 
 @router.post(
@@ -107,13 +138,14 @@ async def login(
 async def verify_mfa(
     payload: MfaVerifyRequest,
     request: Request,
+    response: Response,
     service: AuthService = Depends(get_auth_service),
     session: AsyncSession = Depends(get_session),
 ) -> Envelope[LoginResponse]:
-    """Exchange an ``mfa_token`` + code for a bearer token (api-design.md §9)."""
+    """Exchange an ``mfa_token`` + code for an access token and refresh cookie (§9, A3)."""
     client_host = request.client.host if request.client is not None else None
     try:
-        token, session_row = await service.verify_mfa(
+        issued = await service.verify_mfa(
             payload.mfa_token,
             payload.code,
             ip_address=client_host,
@@ -126,10 +158,7 @@ async def verify_mfa(
         await session.commit()
         raise
 
-    return Envelope(
-        data=LoginResponse(access_token=token, expires_at=session_row.expires_at),
-        meta=_meta(request),
-    )
+    return _issued_response(request, response, issued)
 
 
 @router.post(
@@ -139,25 +168,33 @@ async def verify_mfa(
     summary="Rotate a session before it expires",
 )
 async def refresh(
-    payload: RefreshRequest,
     request: Request,
+    response: Response,
     service: AuthService = Depends(get_auth_service),
 ) -> Envelope[LoginResponse]:
-    """Issue a successor session and revoke the presented one (api-design.md §9, ADR-0010 §2).
+    """Rotate the session named by the refresh cookie (api-design.md §9, ADR-0010 §2 and A3).
 
-    No explicit commit here, unlike login: a refused refresh writes no audit entry to preserve —
-    an unresolvable token names no actor, so there is nothing to attribute the attempt to.
+    **No request body.** The credential is the ``HttpOnly`` cookie, which the browser attaches on
+    its own and script cannot read. A body field would mean the client had to hold the refresh token
+    in JavaScript to send it, which is exactly the exposure A3's split removes.
+
+    A missing cookie is a ``401`` like any other unusable credential: this endpoint is reached by a
+    client that believes it has a session, and "you have none" is the whole answer.
+
+    No explicit commit here, unlike login: a refused refresh writes no audit entry to preserve — an
+    unresolvable token names no actor, so there is nothing to attribute the attempt to.
     """
+    presented = request.cookies.get(COOKIE_NAME)
+    if not presented:
+        raise UnauthenticatedError("No refresh credential was presented.")
+
     client_host = request.client.host if request.client is not None else None
-    token, session_row = await service.refresh(
-        payload.refresh_token,
+    issued = await service.refresh(
+        presented,
         ip_address=client_host,
         user_agent=request.headers.get("user-agent"),
     )
-    return Envelope(
-        data=LoginResponse(access_token=token, expires_at=session_row.expires_at),
-        meta=_meta(request),
-    )
+    return _issued_response(request, response, issued)
 
 
 @router.post(
@@ -187,4 +224,13 @@ async def logout(
         ip_address=request.client.host if request.client is not None else None,
         user_agent=request.headers.get("user-agent"),
     )
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # Clear the cookie as well as revoking server-side. Revocation alone is sufficient for
+    # security — the credential is dead either way — but leaving it in the jar means the browser
+    # keeps presenting a dead token on every refresh attempt, and any 401 it earns is
+    # indistinguishable to the client from a session that expired on its own.
+    #
+    # This endpoint never *receives* the cookie (its Path scopes it to /auth/refresh); clearing
+    # works regardless, because Set-Cookie is applied from the response, not the request.
+    out = Response(status_code=status.HTTP_204_NO_CONTENT)
+    clear_refresh_cookie(out)
+    return out
