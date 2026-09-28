@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from sentinelai.modules.investigation.models import REVIEW_DISPOSITIONS
 from sentinelai.modules.investigation.service import (
-    _REVIEW_DISPOSITIONS,
     STATUS_CONFIRMED,
     STATUS_REJECTED,
     _normalize_etag,
@@ -15,7 +15,12 @@ from sentinelai.modules.investigation.service import (
 
 
 def test_review_dispositions() -> None:
-    assert {STATUS_CONFIRMED, STATUS_REJECTED} == _REVIEW_DISPOSITIONS
+    """The vocabulary moved to the aggregate in Wave 2.4 (ADR-0011 §1).
+
+    Asserted against the service's re-exported names too, so the two cannot drift: the router and
+    schemas still import them from the service.
+    """
+    assert {STATUS_CONFIRMED, STATUS_REJECTED} == REVIEW_DISPOSITIONS
 
 
 def test_entity_etag_depends_on_content() -> None:

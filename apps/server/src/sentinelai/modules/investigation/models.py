@@ -17,12 +17,91 @@ from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
+from sentinelai.modules.investigation.exceptions import FindingAlreadyReviewedError
 from sentinelai.platform.db.base import Base
+from sentinelai.shared.exceptions import ValidationFailedError
 
 _SCHEMA = "investigation"
 
 
-class Entity(Base):
+# The AI-finding review machine (database-design.md §3.5, PRD FR-7.3, ADR-0011 §1).
+# `proposed` is where AI output lands; only an explicit analyst action moves it, and both
+# dispositions are terminal — a confirmed finding is not re-openable by a second review, because the
+# audit trail of "who decided what" is the point of the human-in-the-loop guarantee.
+STATUS_PROPOSED = "proposed"
+STATUS_CONFIRMED = "confirmed"
+STATUS_REJECTED = "rejected"
+REVIEW_DISPOSITIONS: frozenset[str] = frozenset({STATUS_CONFIRMED, STATUS_REJECTED})
+
+
+class _Reviewable:
+    """The review invariant, shared by the two finding kinds — ADR-0011 §1.
+
+    ``Entity`` and ``Relationship`` are separate aggregates with separate tables and separate
+    revision ledgers, but the *rule* is one rule: a finding is reviewed exactly once, from
+    ``proposed``, to a disposition that is either ``confirmed`` or ``rejected``. Writing it twice
+    would be two chances for the two paths to drift on a guarantee PRD FR-7.3 makes explicitly.
+
+    A mixin rather than a base class because both already inherit ``Base``, and because this carries
+    behaviour only — no table, no columns, no mapped state of its own.
+    """
+
+    status: Mapped[str]
+
+    def review(self, disposition: str) -> str:
+        """Record an analyst's disposition; returns the previous status.
+
+        Raises ``ValidationFailedError`` for a disposition outside the vocabulary (422) and
+        ``FindingAlreadyReviewedError`` for a second review of an already-decided finding (409).
+
+        The order matters: the vocabulary check comes first, so a caller sending nonsense gets "that
+        is not a disposition" rather than "already reviewed", which would be a confusing answer to a
+        request that was malformed regardless of state.
+
+        ETag/concurrency is deliberately NOT checked here. It is an HTTP-level concern with no
+        domain meaning — the aggregate's job is that the *transition* is legal, not
+        that the caller held a fresh representation.
+        """
+        if disposition not in REVIEW_DISPOSITIONS:
+            raise ValidationFailedError(
+                [
+                    {
+                        "field": "status",
+                        "message": f"disposition must be one of {sorted(REVIEW_DISPOSITIONS)}",
+                    }
+                ]
+            )
+        if self.status != STATUS_PROPOSED:
+            raise FindingAlreadyReviewedError(f"finding is already {self.status}")
+        previous = self.status
+        self.status = disposition
+        return previous
+
+    @classmethod
+    def assert_supporting_evidence(cls, count: int, *, field: str = "evidence_ids") -> None:
+        """CEM §13: a finding must not **exist** without ≥1 supporting evidence reference.
+
+        A creation-time rule, and the placement is the point. CEM §1.6 says "No Entity or
+        Relationship may exist without at least one supporting evidence reference", and §13's
+        validation table says *Reject* — an existence invariant, not a review gate. Checking it at
+        confirmation instead would be both too late (the unsupported row already exists) and
+        wrong: refusing to let an analyst *reject* an unsupported finding is perverse, and rejection
+        is exactly what should happen to one.
+
+        A classmethod because it is asked before the instance exists, and the count is passed in
+        because the supporting rows are written in the same transaction as the finding — there is
+        nothing to query yet.
+
+        CEM §13 grants entities an explicit exception (an analyst-pre-registered entity needs no
+        MENTIONS edge), so ``Entity`` creation does not call this; only ``Relationship`` does.
+        """
+        if count < 1:
+            raise ValidationFailedError(
+                [{"field": field, "message": "a relationship requires ≥1 supporting evidence"}]
+            )
+
+
+class Entity(Base, _Reviewable):
     __tablename__ = "entities"
     __table_args__ = ({"schema": _SCHEMA},)
 
@@ -51,7 +130,7 @@ class EntityRevision(Base):
     occurred_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
 
 
-class Relationship(Base):
+class Relationship(Base, _Reviewable):
     __tablename__ = "relationships"
     __table_args__ = ({"schema": _SCHEMA},)
 
