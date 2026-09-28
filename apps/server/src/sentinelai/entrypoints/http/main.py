@@ -1,14 +1,15 @@
 """HTTP entrypoint — FastAPI application factory & lifespan (guide Part 2).
 
 One deployable process: builds the app, wires cross-cutting middleware/handlers,
-registers module routers, exposes ``/metrics``, and runs the Phase 1 in-process
-``EventDispatcher`` for the lifetime of the process (started/stopped in the
-lifespan, honoring the graceful-shutdown requirement of event-driven §2.2).
+registers module routers, and exposes ``/metrics``.
+
+It does **not** run the outbox relay: ADR-0006 §1 moved that to the worker, because a poller in
+every API replica meant N uncoordinated pollers over one set of tables. This process writes outbox
+rows inside business transactions and nothing more.
 """
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -24,29 +25,20 @@ from sentinelai.entrypoints.http.middleware import register_middleware
 
 # Domain module wiring — the composition root is allowed to import modules
 # (entrypoints is the top layer of the import DAG).
-from sentinelai.modules.case_management import events as cm_events
 from sentinelai.modules.case_management.router import router as cm_router
 from sentinelai.modules.case_management.service import provide_case_access_checker
-from sentinelai.modules.forensics import events as forensics_events
 from sentinelai.modules.forensics.router import router as forensics_router
-from sentinelai.modules.ingestion import events as ingestion_events
 from sentinelai.modules.ingestion.router import router as ingestion_router
-from sentinelai.modules.investigation import events as investigation_events
 from sentinelai.modules.investigation.router import router as investigation_router
-from sentinelai.modules.notification import events as notification_events
 from sentinelai.modules.notification.router import router as notification_router
-from sentinelai.modules.osint import events as osint_events
 from sentinelai.modules.osint.router import router as osint_router
-from sentinelai.modules.social_media import events as social_media_events
 from sentinelai.modules.social_media.router import router as social_media_router
-from sentinelai.modules.threat_intel import events as threat_intel_events
 from sentinelai.modules.threat_intel.router import router as threat_intel_router
 from sentinelai.platform.auth.dependencies import get_case_access_checker
 from sentinelai.platform.auth.router import router as auth_router
 from sentinelai.platform.config import settings
 from sentinelai.platform.crypto import HealthState, KmsUnavailable, create_kms
-from sentinelai.platform.db.session import async_session_factory, dispose_engine, engine
-from sentinelai.platform.events.dispatcher import EventDispatcher
+from sentinelai.platform.db.session import dispose_engine, engine
 from sentinelai.platform.logging import configure_logging, log
 from sentinelai.platform.migrations.currency import check_migrations_current
 from sentinelai.platform.security.scanner import build_malware_scanner
@@ -64,30 +56,22 @@ _MODULE_ROUTERS = (
     investigation_router,
     notification_router,
 )
-_CONSUMER_REGISTRARS = (
-    ingestion_events.register_consumers,
-    osint_events.register_consumers,
-    threat_intel_events.register_consumers,
-    forensics_events.register_consumers,
-    social_media_events.register_consumers,
-    cm_events.register_consumers,
-    investigation_events.register_consumers,
-    notification_events.register_consumers,
-)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Start the event dispatcher on startup; drain it and dispose the pool on shutdown."""
+    """Validate config, build process-wide resources, and dispose the pool on shutdown."""
     settings.validate_for_profile()  # fail closed on misconfig BEFORE opening any connection
     configure_logging(settings.log_level, json_logs=settings.app_env != "development")
     log.info("http_startup", version=__version__, env=settings.app_env)
 
-    dispatcher = EventDispatcher(async_session_factory)
-    for register in _CONSUMER_REGISTRARS:
-        register(dispatcher)
-    dispatcher_task = asyncio.create_task(dispatcher.run_forever())
-    app.state.dispatcher = dispatcher
+    # ADR-0006 §1: the outbox relay runs in the WORKER, not here. It used to start in this lifespan,
+    # which meant every API replica ran its own uncoordinated poller over the same outbox tables —
+    # duplicate delivery, wasted database load, and no ordering guarantee. The API now only *writes*
+    # outbox rows inside business transactions; something else relays them.
+    #
+    # Operational consequence worth knowing: with no worker running, events are written and never
+    # dispatched. They are not lost (the rows stay `pending`), but nothing downstream reacts.
 
     # arq pool for enqueuing background jobs (report generation, etc.). Best-effort:
     # if Redis is unavailable at startup the app still serves; endpoints that enqueue
@@ -186,8 +170,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        dispatcher.request_shutdown()
-        await dispatcher_task  # drains in-flight handler invocations before exit
         if getattr(app.state, "task_queue", None) is not None:
             await app.state.task_queue.aclose()
         if getattr(app.state, "kms", None) is not None:

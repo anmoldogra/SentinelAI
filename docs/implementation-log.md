@@ -2003,3 +2003,109 @@ requires and were left alone. Wave 2.1's remaining ADR-0005 items are closed by 
 by code: §2/§3 were satisfied before this increment, and §4's per-item-commit premise does not apply
 to the batch endpoint as built. The next roadmap item is Wave 2.2 — dispatcher to worker with
 `SKIP LOCKED` and per-aggregate ordering (ADR-0006).
+
+---
+
+## 2026-09-25 — IC-034: Wave 2.1 committed; Wave 2.2 dispatcher relocation + SKIP LOCKED (ADR-0006)
+
+**Type:** Release of Wave 2.1, then the event-transport increment. Eight migrations, one new
+entrypoint module, no schema change beyond indexes.
+
+### Wave 2.1 shipped
+
+Request-scoped transaction boundaries (IC-033) committed as `b6414d6` and pushed. ADR-0005 Accepted.
+
+### Wave 2.2: what was wrong
+
+The relay started in **every HTTP replica's lifespan** and polled with a plain
+`SELECT ... WHERE dispatch_status='pending'`. N replicas therefore ran N uncoordinated pollers over one
+set of tables: duplicate delivery (masked by inbox dedup, not prevented), wasted database load, and no
+ordering guarantee at all despite §18 claiming per-aggregate order.
+
+### The claim, and why the row lock alone is not enough
+
+`FOR UPDATE SKIP LOCKED` stops two dispatchers *selecting* the same row concurrently. It does not stop
+the second one selecting it a moment later: the lock is released when the claim transaction commits,
+and a row left `pending` while its handlers run is claimable again on the next poll — the same
+double-dispatch, arriving half a second later. I nearly shipped exactly that.
+
+So the claim transaction also stamps `last_attempted_at`, and the claim query skips rows stamped
+within `CLAIM_LEASE_SECONDS`. The stamp is a **lease** that outlives the lock.
+
+A `dispatching` status was the obvious alternative and is worse: a dispatcher killed mid-batch strands
+rows in it, needing a reaper and a "how long is too long" threshold. An expired lease needs neither —
+the row simply becomes claimable. At-least-once is unchanged; post-crash redelivery is absorbed by the
+Inbox guard as always. And the same gate *is* ADR-0006 §4's retry backoff: one mechanism, two
+requirements.
+
+### Ordering without a lock
+
+ADR-0006 §3 offers "advisory lock or hash-partition of schemas". Neither was needed. The claim takes
+**the oldest pending row per `aggregate_id`**, so a batch can never hold two events for one aggregate.
+Ordering across dispatchers then falls out of that plus the lease: while event 1 for aggregate X is in
+flight it is still `pending` and still leased, so it remains the oldest pending row for X — X yields
+nothing, and event 2 cannot be claimed until event 1 resolves. No lock to acquire, none to leak, no
+partition assignment to rebalance when a replica dies.
+
+`DISTINCT ON` sits in a subquery because Postgres rejects `SELECT DISTINCT ... FOR UPDATE` outright.
+
+### Relocation
+
+`entrypoints/consumers.py` now holds the registrar list. It was in `http/main.py` because the
+dispatcher ran there, and copying it into the worker would have been the obvious mistake: two lists
+drift, and the failure mode is a handler that silently never runs in production because only the
+process that no longer dispatches knew about it. The worker drains the relay **before** disposing the
+engine — the relay holds sessions, and tearing the pool out from under an in-flight handler would
+abort it mid-transaction, which §2.2 forbids.
+
+### Two defects the tests caught
+
+**Revision ids too long.** Alembic stores `version_num` in a `varchar(32)`;
+`202609250001_ingestion_dispatch_idx` is 35 characters, so the migration's final
+`UPDATE alembic_version` failed — not the migration body, which made the error read as unrelated.
+Shortened to `_idx`, and the reason is recorded in each migration's docstring so nobody lengthens
+them back.
+
+**Two commit-count assertions in `test_event_plumbing.py` were correct and became wrong.** The claim
+transaction adds a commit per drain, so 1→2 and 3→4. Updated with a comment naming the extra commit as
+the lease, because a bare number invites someone to "fix" it back.
+
+### One unexplained run, stated rather than buried
+
+The first execution of the new concurrency suite failed with every event delivered **twice** (24 for
+12). I could not reproduce it: the same test passes in isolation, the whole file passed four
+consecutive runs, and a direct probe of two concurrent claims showed 6/0 with zero overlap. The
+compiled SQL verifiably contains `FOR UPDATE SKIP LOCKED`.
+
+Rather than shrug, the test is now stronger than the one that flaked: it polls repeatedly instead of
+once (many interleavings, not one), and it asserts the **invariant directly** — the two dispatchers'
+claimed id sets must be disjoint each round — so a recurrence points at the claim rather than at a
+delivery count. I have no explanation for that run and am not claiming one.
+
+### Tests
+
+**11 new**, all against real Postgres, because `SKIP LOCKED` is a guarantee the database provides
+*between sessions* — a fake or a shared session cannot exhibit it, and a test that appeared to prove
+deduplication without real row locks would prove nothing.
+
+Covered: no double-dispatch under concurrent polling (with disjointness asserted per round); a leased
+row is invisible to a peer claim; an expired lease makes an orphaned row claimable again; only the
+oldest pending row per aggregate is claimed; per-aggregate delivery is oldest-first, including with two
+dispatchers competing on one aggregate; distinct aggregates still batch together (ordering is per
+aggregate, not global); a failed row waits out its backoff; it retries once the window passes; it
+dead-letters at the ceiling; terminal rows are never re-claimed.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (208 files), import-linter (2/2 kept), full suite **1019 passed
+/ 2 skipped**. Platform coverage **91.31%** against the 90% floor; `dispatcher.py` at **99%**. The
+migration round-trip (upgrade-head → downgrade-base, every schema) passes with the eight new indexes.
+
+### Carried forward
+
+With no worker running, the API writes outbox rows that nothing relays — events are not lost (rows
+stay `pending`) but nothing downstream reacts. Worker availability is now a correctness concern, the
+same shape as the anchor-cutter dependency from IC-031, and §28's `_outbox_pending_count` /
+`_oldest_pending_age_seconds` are the signal. Recorded in ADR-0006 and event-driven §2.
+
+Next roadmap item is Wave 2.3 — event authentication via signed outbox rows (ADR-0007).

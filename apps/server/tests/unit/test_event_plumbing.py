@@ -241,7 +241,10 @@ async def test_an_event_with_no_handler_is_marked_dispatched_not_retried() -> No
     session = _FakeSession(rows_per_select=[[_row(event_type="nobody.listens")]])
     dispatcher = _dispatcher(session)
     assert await dispatcher._poll_once() == 1
-    assert session.commits == 1  # the mark-dispatched update committed
+    # Two commits, not one: the claim transaction stamps the lease (ADR-0006 §2) before any handler
+    # runs, then the mark-dispatched update commits. The claim commit is the mechanism that stops a
+    # peer dispatcher re-claiming the row mid-flight, so it is load-bearing rather than incidental.
+    assert session.commits == 2
 
 
 async def test_each_handler_runs_in_its_own_transaction() -> None:
@@ -257,7 +260,8 @@ async def test_each_handler_runs_in_its_own_transaction() -> None:
     dispatcher.register("evidence.ingested", _one, inbox_schema=_SCHEMA)
     dispatcher.register("evidence.ingested", _two, inbox_schema=_SCHEMA)
     await dispatcher._poll_once()
-    assert session.commits == 3  # two handler commits + the outbox status update
+    # claim lease + two handler commits + the outbox status update (ADR-0006 §2 added the first).
+    assert session.commits == 4
 
 
 async def test_a_failing_handler_does_not_prevent_the_others_from_running() -> None:

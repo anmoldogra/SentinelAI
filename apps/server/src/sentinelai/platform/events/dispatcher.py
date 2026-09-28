@@ -1,20 +1,43 @@
-"""In-process event dispatcher — event-driven-architecture.md §2, §14-15.
+"""Outbox relay — event-driven-architecture.md §2, §14-15, §18; ADR-0006.
 
-Phase 1 transport: a single in-process poller that relays each module's
-``outbox_events`` rows to registered handlers. Phase 3+ replaces this relay half
-with a Redpanda producer/consumer — the outbox write, envelope, inbox check, and
-event catalog do NOT change, only the transport between "row written" and
-"handler invoked".
+Phase 1 transport: a poller that relays each module's ``outbox_events`` rows to registered handlers.
+Phase 3+ replaces this relay half with a Redpanda producer/consumer — the outbox write, envelope,
+inbox check, and event catalog do NOT change, only the transport between "row written" and "handler
+invoked".
 
-Design points honored here:
-- **Per-module poll** — each schema is drained independently, so one module's
-  backlog never delays another's dispatch.
-- **At-least-once** — a handler is invoked in its own transaction; the source
-  outbox row is marked ``dispatched`` only after all handlers succeed. On failure
-  the row stays ``pending`` (retry) until ``max_attempts`` → ``dead_letter``.
-  Duplicate delivery on retry is absorbed by each handler's Inbox guard.
-- **Graceful shutdown** — ``request_shutdown()`` lets the current drain finish and
-  stops between rows; it never aborts a handler mid-transaction.
+**Runs in the worker, not the API (ADR-0006 §1).** It used to start in every HTTP replica's
+lifespan, which meant N replicas ran N uncoordinated pollers over the same tables: duplicate
+delivery (masked by inbox dedup, not prevented), wasted database load, and no ordering guarantee.
+
+**Claiming, not reading (ADR-0006 §2).** The poll takes ``FOR UPDATE SKIP LOCKED`` and stamps
+``last_attempted_at`` inside the claim transaction. The row lock alone is not enough: it is released
+at commit, and a row left ``pending`` while its handlers run would be picked up again by the next
+poll — the double-dispatch this is meant to prevent. The stamp turns the claim into a **lease**, and
+the claim query skips rows leased within :data:`CLAIM_LEASE_SECONDS`.
+
+The lease is what makes a crashed dispatcher safe. A row it claimed and never finished simply
+becomes claimable again when the lease expires, with no reaper process and no ``dispatching`` status
+that could strand rows if the process holding them died. At-least-once is preserved exactly as
+before, and duplicate delivery after a crash is absorbed by each handler's Inbox guard, as always.
+
+**Per-aggregate ordering (ADR-0006 §3).** The claim takes the *oldest pending row per*
+``aggregate_id`` — never two rows for the same aggregate in one batch. Combined with the lease that
+is what gives strict ordering across dispatchers: while event 1 for aggregate X is in flight it is
+still ``pending`` and still leased, so it remains the oldest pending row for X and X yields nothing.
+Event 2 for X cannot be claimed until event 1 resolves. No advisory lock, no schema hash-partition —
+the ordering falls out of what the claim is allowed to select.
+
+**Backoff in the query (ADR-0006 §4).** The same ``last_attempted_at`` gate that implements the
+lease implements retry backoff: a failed row is not reconsidered until its lease window passes, so
+retries cannot hot-loop.
+
+Also honored, unchanged from Phase 1:
+- **Per-module poll** — each schema is drained independently, so one module's backlog never delays
+  another's dispatch.
+- **At-least-once** — a handler is invoked in its own transaction; the source row is marked
+  ``dispatched`` only after all handlers succeed, and ``dead_letter`` at ``max_attempts``.
+- **Graceful shutdown** — ``request_shutdown()`` lets the current drain finish and stops between
+  rows; it never aborts a handler mid-transaction.
 """
 
 from __future__ import annotations
@@ -24,10 +47,11 @@ import contextlib
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
+from sqlalchemy.engine.row import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sentinelai.platform.db.uow import UnitOfWork
@@ -47,6 +71,11 @@ DEFAULT_OUTBOX_SCHEMAS: tuple[str, ...] = (
     "investigation",
     "notification",
 )
+
+# How long a claimed row stays invisible to other dispatchers, and equally the minimum gap between
+# retry attempts (ADR-0006 §2/§4 are one mechanism here). Long enough that a normal handler finishes
+# well inside it; short enough that a dispatcher killed mid-batch does not strand its rows for long.
+CLAIM_LEASE_SECONDS: int = 60
 
 EventHandler = Callable[[EventEnvelope, UnitOfWork], Awaitable[None]]
 # A module supplies its own concrete UoW type as the factory so its handler gets
@@ -80,11 +109,13 @@ class EventDispatcher:
         poll_schemas: Sequence[str] = DEFAULT_OUTBOX_SCHEMAS,
         poll_interval_seconds: float = 1.0,
         batch_size: int = 100,
+        lease_seconds: int = CLAIM_LEASE_SECONDS,
     ) -> None:
         self._session_factory = session_factory
         self._poll_schemas = tuple(poll_schemas)
         self._poll_interval = poll_interval_seconds
         self._batch_size = batch_size
+        self._lease_seconds = lease_seconds
         self._handlers: dict[str, list[_Registration]] = defaultdict(list)
         self._shutdown = asyncio.Event()
 
@@ -148,15 +179,7 @@ class EventDispatcher:
         return total
 
     async def _drain_schema(self, schema: str) -> int:
-        table = get_outbox_table(schema)
-        async with self._session_factory() as read_session:
-            result = await read_session.execute(
-                select(table)
-                .where(table.c.dispatch_status == "pending")
-                .order_by(table.c.occurred_at.asc())
-                .limit(self._batch_size)
-            )
-            rows = result.mappings().all()
+        rows = await self._claim_batch(schema)
 
         processed = 0
         for row in rows:
@@ -165,6 +188,60 @@ class EventDispatcher:
             await self._process_row(schema, EventEnvelope.from_row(row))
             processed += 1
         return processed
+
+    async def _claim_batch(self, schema: str) -> Sequence[RowMapping]:
+        """Claim up to ``batch_size`` rows: one per aggregate, locked, leased — ADR-0006 §2/§3/§4.
+
+        The claim and the lease stamp share one transaction. If they did not, a dispatcher could
+        select rows, lose its connection before stamping, and leave them looking claimable while it
+        went on to dispatch them.
+
+        ``DISTINCT ON (aggregate_id)`` sits in a subquery because Postgres rejects ``SELECT DISTINCT
+        ... FOR UPDATE`` outright. The subquery picks the oldest pending row per aggregate; the
+        outer statement locks exactly those rows and skips any a peer already holds.
+        """
+        table = get_outbox_table(schema)
+        now = datetime.now(UTC)
+        lease_cutoff = now - timedelta(seconds=self._lease_seconds)
+
+        claimable = (
+            select(table.c.event_id)
+            .distinct(table.c.aggregate_id)
+            .where(
+                table.c.dispatch_status == "pending",
+                # Never claimed, or its lease has expired. This is simultaneously the
+                # double-dispatch guard and the retry backoff (ADR-0006 §4).
+                or_(
+                    table.c.last_attempted_at.is_(None),
+                    table.c.last_attempted_at < lease_cutoff,
+                ),
+            )
+            # `aggregate_id` first because DISTINCT ON requires it to lead; `occurred_at` is what
+            # makes the surviving row per aggregate the OLDEST one, which is the ordering guarantee.
+            .order_by(table.c.aggregate_id, table.c.occurred_at.asc())
+            .subquery()
+        )
+
+        async with self._session_factory() as session:
+            locked = await session.execute(
+                select(table)
+                .where(table.c.event_id.in_(select(claimable.c.event_id)))
+                .order_by(table.c.occurred_at.asc())
+                .limit(self._batch_size)
+                .with_for_update(skip_locked=True)
+            )
+            rows = locked.mappings().all()
+            if not rows:
+                return rows
+            # Stamping inside the claim transaction is what converts a row lock (released at commit)
+            # into a lease that outlives it.
+            await session.execute(
+                update(table)
+                .where(table.c.event_id.in_([row["event_id"] for row in rows]))
+                .values(last_attempted_at=now)
+            )
+            await session.commit()
+        return rows
 
     async def _process_row(self, schema: str, event: EventEnvelope) -> None:
         registrations = self._handlers.get(event.event_type, [])
@@ -216,6 +293,8 @@ class EventDispatcher:
         values: dict[str, object] = {"dispatch_status": status}
         if attempt_count is not None:
             values["attempt_count"] = attempt_count
+            # Re-stamped so the backoff window runs from THIS failure, not from the claim. A retry
+            # that inherited the claim stamp would become eligible again almost immediately.
             values["last_attempted_at"] = datetime.now(UTC)
         async with self._session_factory() as session:
             await session.execute(

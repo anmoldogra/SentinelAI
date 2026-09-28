@@ -5,17 +5,21 @@ row (``correlation_runs``, ``case_reports``) run here; the queue is only the
 execution mechanism. Job functions are contributed by domain modules as they land
 (Phase 3+ of the roadmap); the ``functions`` list below is wired up per module.
 
-The in-process ``EventDispatcher`` runs in the HTTP process (see entrypoints/http),
-not here, to avoid double-dispatch in Phase 1.
+The outbox relay (``EventDispatcher``) runs **here** as of Wave 2.2 (ADR-0006 §1). It used to run
+in the HTTP process, where every API replica polled the same outbox tables independently. It now
+runs in this process, claims rows with ``FOR UPDATE SKIP LOCKED``, and preserves per-aggregate
+ordering — so several worker replicas can run safely side by side.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, ClassVar
 
 from arq import cron
 from arq.connections import RedisSettings
 
+from sentinelai.entrypoints.consumers import register_all
 from sentinelai.modules.case_management.jobs import generate_case_report
 from sentinelai.modules.forensics.jobs import process_artifact
 from sentinelai.modules.ingestion.anchor_jobs import cut_anchor_batches
@@ -26,6 +30,7 @@ from sentinelai.modules.threat_intel.jobs import sync_feed_subscription
 from sentinelai.platform.config import settings
 from sentinelai.platform.crypto import create_kms
 from sentinelai.platform.db.session import async_session_factory, dispose_engine, engine
+from sentinelai.platform.events.dispatcher import EventDispatcher
 from sentinelai.platform.logging import configure_logging, log
 from sentinelai.platform.security.scanner import build_malware_scanner
 from sentinelai.platform.storage import build_object_storage
@@ -69,11 +74,27 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         if settings.is_production:
             raise
 
+    # ADR-0006 §1: the outbox relay lives here now. Started as a task rather than awaited, so arq
+    # goes on to serve jobs; `on_shutdown` drains it.
+    dispatcher = register_all(EventDispatcher(async_session_factory))
+    ctx["dispatcher"] = dispatcher
+    ctx["dispatcher_task"] = asyncio.create_task(dispatcher.run_forever())
+
     log.info("worker_startup", env=settings.app_env)
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
-    """Dispose the database connection pool + KMS resources on graceful shutdown."""
+    """Drain the relay, then dispose the pool and KMS resources on graceful shutdown."""
+    # Drained BEFORE the engine is disposed: the relay holds sessions, and tearing the pool out from
+    # under an in-flight handler would abort it mid-transaction — event-driven §2.2 requires the
+    # current drain to finish instead.
+    dispatcher = ctx.get("dispatcher")
+    task = ctx.get("dispatcher_task")
+    if dispatcher is not None:
+        dispatcher.request_shutdown()
+    if task is not None:
+        await task
+
     kms = ctx.get("kms")
     if kms is not None:
         await kms.aclose()

@@ -43,13 +43,15 @@ Four forces specific to this platform make request/response calls the wrong defa
 
 ## 2. Event Bus Architecture
 
-**Phase 1 — in-process relay, built on Outbox + Inbox from day one.** There is no message broker process to operate. Instead: a module's business transaction writes its state change **and** an outbox row in the *same database transaction* (Section 16); a single in-process **Event Dispatcher**, part of `apps/server/platform`, polls every module's `outbox_events` table on a short interval, and for each undispatched row, invokes the in-process handlers registered for that `event_type`. This is deliberately **not** a naive synchronous function call at the point of publish — publishing and handling are already decoupled, already retryable, and already idempotency-checked (Section 17), exactly as they will be once a real broker exists. Phase 1 is not a simplified version of the architecture; it is the same architecture with an in-process transport.
+**Phase 1 — in-process relay, built on Outbox + Inbox from day one.** There is no message broker process to operate. Instead: a module's business transaction writes its state change **and** an outbox row in the *same database transaction* (Section 16); an **Event Dispatcher**, part of `apps/server/platform`, polls every module's `outbox_events` table on a short interval, and for each undispatched row, invokes the in-process handlers registered for that `event_type`.
+
+**The dispatcher runs in the worker process, not the API (ADR-0006, Wave 2.2).** It originally started in every HTTP replica's lifespan, which meant N replicas ran N uncoordinated pollers over one set of tables — duplicate delivery (masked by inbox dedup, not prevented), wasted database load, and no ordering guarantee. It now claims rows with `SELECT ... FOR UPDATE SKIP LOCKED` and stamps `last_attempted_at` inside the claim transaction, so the claim is a **lease** rather than a lock that evaporates at commit. Several worker replicas can therefore run side by side, and the same lease gates retry backoff. **An API with no worker running writes outbox rows that nothing relays** — the events are not lost (rows stay `pending`) but nothing downstream reacts, which makes worker availability a correctness concern and not only a throughput one; Section 28's `_outbox_pending_count` and `_oldest_pending_age_seconds` are the signal. This is deliberately **not** a naive synchronous function call at the point of publish — publishing and handling are already decoupled, already retryable, and already idempotency-checked (Section 17), exactly as they will be once a real broker exists. Phase 1 is not a simplified version of the architecture; it is the same architecture with an in-process transport.
 
 ```mermaid
 flowchart TB
     subgraph P1["Phase 1 — apps/server (single process)"]
         MA["Module A business logic"] -->|"same DB transaction"| OBA[("Module A<br/>outbox_events")]
-        OBA -->|poll| DISP["platform: Event Dispatcher<br/>(in-process relay)"]
+        OBA -->|poll| DISP["platform: Event Dispatcher<br/>(in-process relay, runs in worker)"]
         DISP -->|"in-process call, per registered handler"| HB["Module B handler"]
         HB -->|"check-then-insert"| IBB[("Module B<br/>inbox_events")]
         IBB -->|"not yet processed → execute"| HB
@@ -381,7 +383,9 @@ sequenceDiagram
 
 ## 18. Event Ordering Guarantees
 
-**Guaranteed:** events concerning the *same aggregate* (same `aggregate_id`) are delivered and processed in the order they were published. Phase 1's relay processes each module's outbox table in `event_id`/insertion order; Phase 3+ Redpanda preserves this by partitioning topics on `aggregate_id`, so all events for one `evidence_id` or `case_id` land on the same partition and are consumed in order.
+**Guaranteed:** events concerning the *same aggregate* (same `aggregate_id`) are delivered and processed in the order they were published. Phase 1's relay enforces this in the claim query rather than by relying on insertion order (ADR-0006 §3, Wave 2.2): it claims **the oldest pending row per `aggregate_id`**, so a batch never holds two events for one aggregate, and while one is in flight it is still the oldest pending row for that aggregate and still leased — so the next event for it cannot be claimed until the first resolves. That holds across concurrent dispatcher replicas, which plain insertion order would not. Phase 3+ Redpanda preserves the same property by partitioning topics on `aggregate_id`, so all events for one `evidence_id` or `case_id` land on the same partition and are consumed in order.
+
+The supporting index is `(dispatch_status, aggregate_id, occurred_at)` on each module's `outbox_events`, with `aggregate_id` in the middle so the grouped claim is served by the index rather than degrading into a scan-then-sort.
 
 **Not guaranteed:** any ordering across *different* aggregates, or across different event types. `evidence.ingested` for item A and `evidence.ingested` for item B may be processed in either order or in parallel — handlers must not assume otherwise. Consumers requiring a strict cross-aggregate sequence (rare, and generally a sign the workflow should be redesigned) must implement their own sequencing via the `causation_id` chain (Section 11), not rely on bus-level ordering.
 
@@ -796,7 +800,7 @@ A condensed, practical checklist distilled from Sections 1–29 — for a develo
 | **Dead Letter Queue (DLQ)** | The terminal state (`dispatch_status = dead_letter`) for an event whose retries are exhausted — never silently dropped (Section 15) |
 | **At-least-once delivery** | The bus's actual guarantee — an event may be delivered more than once; handlers must be idempotent (Section 13) |
 | **Aggregate** | The entity an event is about (`evidence`, `case`, `relationship`, ...) — also the Redpanda partition key (Section 9, 18) |
-| **Relay / Dispatcher** | The process that moves events from `pending` outbox rows to delivered handlers — in-process in Phase 1, a broker producer/consumer pair in Phase 3+ (Section 2) |
+| **Relay / Dispatcher** | The process that moves events from `pending` outbox rows to delivered handlers — in Phase 1 an in-process poller hosted by the **worker** (ADR-0006), a broker producer/consumer pair in Phase 3+ (Section 2) |
 | **Thin event** | An event payload carrying only enough denormalized data for the common consumer case, plus a reference for anything more (Section 8) |
 | **Dual-publish / deprecation window** | Publishing both an old and new `event_version` simultaneously during a breaking change, until every consumer migrates (Section 23) |
 | **Idempotency key (business-level)** | A natural key on a handler's side effect that prevents duplicate downstream records even across genuinely distinct events converging on the same fact (Section 12, layer 2) |
