@@ -429,10 +429,31 @@ Full detail for `POST /api/v1/evidence`, `GET /api/v1/evidence`, `GET /api/v1/ev
 | GET | `/api/v1/cases/{case_id}/evidence` | List evidence linked to this case | investigator (case-scoped) | N/A |
 | POST | `/api/v1/cases/{case_id}/evidence` | Link evidence to this case | investigator (case-scoped) | Yes (key) |
 | DELETE | `/api/v1/cases/{case_id}/evidence/{evidence_id}` | Unlink evidence (does not delete the evidence itself) | investigator, supervisor (case-scoped) | Yes |
+| GET | `/api/v1/cases/{case_id}/members` | List who has access to this case | investigator (case-scoped) | N/A |
+| PUT | `/api/v1/cases/{case_id}/members/{user_id}` | Grant or re-grant case access | investigator, supervisor (case-scoped) | Yes (natural) |
+| DELETE | `/api/v1/cases/{case_id}/members/{user_id}` | Revoke case access | investigator, supervisor (case-scoped) | Yes (natural) |
 | GET | `/api/v1/cases/{case_id}/reports` | List generated reports | investigator (case-scoped) | N/A |
 | POST | `/api/v1/cases/{case_id}/reports` | Generate a case report (async) | investigator, supervisor (case-scoped) | Yes (key) |
 | GET | `/api/v1/reports/{report_id}` | Poll report job status / metadata | investigator (case-scoped) | N/A |
 | GET | `/api/v1/reports/{report_id}/download` | Presigned download URL for a completed report | investigator (case-scoped) | No |
+
+**`PUT /api/v1/cases/{case_id}/members/{user_id}`** and its `DELETE` are the case-scope grant
+`security-architecture.md` §6 evaluates (ADR-0017). Body: `{ "role": "lead"|"investigator"|
+"analyst"|"observer" }` — a label recorded for the audit trail and the UI, not a permission set;
+authorization still reads the caller's platform roles.
+
+`PUT` is **naturally idempotent** rather than key-idempotent (§2.9): the membership is identified
+by the URL, so re-granting updates the role in place and returns `200` instead of colliding.
+`DELETE` on a non-member returns `204` for the same reason. Both are case-scoped, so **granting
+access requires already having it** — the caller must be the owner or an existing member.
+
+Revoking the owner's access is refused with `422`: `owning_user_id` is not a membership row, and
+a case whose owner cannot open it would be unreachable by anyone. Transfer of ownership is not an
+operation this API offers.
+
+Every grant, revocation, **and denial** is written to `platform.audit_log` (`case_access_granted`,
+`case_access_revoked`, `case_access_denied`). §6 requires the denial specifically, so a compliance
+review can distinguish "this analyst never had access" from "this analyst had access and used it".
 
 Full detail for `POST /api/v1/cases`, `POST /api/v1/cases/{case_id}/evidence`, `POST /api/v1/cases/{case_id}/reports`, and `GET /api/v1/reports/{report_id}` is in Section 7.
 

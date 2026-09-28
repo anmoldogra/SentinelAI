@@ -83,3 +83,23 @@ class CaseReportRead(BaseModel):
     requested_at: datetime
     generated_at: datetime | None
     failure_reason: str | None
+
+
+class CaseMemberGrant(BaseModel):
+    """Body of ``PUT /cases/{case_id}/members/{user_id}`` (api-design.md §4.2).
+
+    The ``user_id`` is the path, not the body: the membership is identified by the URL, which is
+    what makes the endpoint naturally idempotent rather than needing an idempotency key.
+    """
+
+    role: str = Field(min_length=1, max_length=50)
+
+
+class CaseMemberRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    case_id: UUID
+    user_id: UUID
+    role: str
+    granted_by_user_id: UUID
+    granted_at: datetime

@@ -26,6 +26,8 @@ from sentinelai.modules.case_management.repository import (
 from sentinelai.modules.case_management.schemas import (
     CaseCreate,
     CaseEvidenceLinkRead,
+    CaseMemberGrant,
+    CaseMemberRead,
     CaseRead,
     CaseReportCreate,
     CaseReportRead,
@@ -162,6 +164,54 @@ async def list_status_history(
         pagination=Pagination(next_cursor=None, has_more=False, limit=len(items)),
         meta=_meta(request),
     )
+
+
+# --- case membership (ABAC case-scope grants, ADR-0017, api-design.md §4.2) ---
+#
+# Every route here is itself case-scoped: `require_case_access` means granting access requires
+# already having it, so this endpoint group cannot be used as a self-service escalation path.
+@router.get("/cases/{case_id}/members", response_model=ListEnvelope[CaseMemberRead])
+async def list_case_members(
+    case_id: UUID,
+    request: Request,
+    current_user: CurrentUser = Depends(require_case_access()),
+    service: CaseService = Depends(get_case_service),
+) -> ListEnvelope[CaseMemberRead]:
+    items = await service.list_members(case_id, current_user)
+    return ListEnvelope(
+        data=[CaseMemberRead.model_validate(i) for i in items],
+        pagination=Pagination(next_cursor=None, has_more=False, limit=len(items)),
+        meta=_meta(request),
+    )
+
+
+@router.put("/cases/{case_id}/members/{user_id}", response_model=Envelope[CaseMemberRead])
+async def grant_case_access(
+    case_id: UUID,
+    user_id: UUID,
+    payload: CaseMemberGrant,
+    request: Request,
+    current_user: CurrentUser = Depends(require_case_access()),
+    service: CaseService = Depends(get_case_service),
+    uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
+) -> Envelope[CaseMemberRead]:
+    """Grant or re-grant access. ``200`` either way — the membership is named by the URL, so a
+    repeat call updates the role in place rather than colliding (api-design.md §4.2)."""
+    member = await service.grant_access(case_id, user_id, payload.role, current_user)
+    return Envelope(data=CaseMemberRead.model_validate(member), meta=_meta(request))
+
+
+@router.delete("/cases/{case_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_case_access(
+    case_id: UUID,
+    user_id: UUID,
+    current_user: CurrentUser = Depends(require_case_access()),
+    service: CaseService = Depends(get_case_service),
+    uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
+) -> Response:
+    """Revoke access. ``204`` whether or not a membership existed — idempotent by design."""
+    await service.revoke_access(case_id, user_id, current_user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- case ↔ evidence links --------------------------------------------------

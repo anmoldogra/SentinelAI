@@ -108,6 +108,37 @@ class _FakeOutbox:
         self.published.append(kwargs)
 
 
+class _FakeMemberRepo:
+    """Stand-in for ``CaseMemberRepository`` (ADR-0017).
+
+    ``user_has_access`` reproduces the real query's owner-OR-member semantics, including its
+    dependence on the case store: a membership-only fake would let a DB-less test pass while the
+    real checker denied, because the real one resolves ownership in the same statement.
+    """
+
+    def __init__(self, cases: _FakeCaseRepo) -> None:
+        self._cases = cases
+        self.store: dict[tuple[UUID, UUID], Any] = {}
+
+    async def get(self, case_id: UUID, user_id: UUID) -> Any:
+        return self.store.get((case_id, user_id))
+
+    async def list_for_case(self, case_id: UUID) -> Sequence[Any]:
+        return [v for (c, _), v in self.store.items() if c == case_id]
+
+    async def add(self, member: Any) -> None:
+        self.store[(member.case_id, member.user_id)] = member
+
+    async def remove(self, member: Any) -> None:
+        self.store.pop((member.case_id, member.user_id), None)
+
+    async def user_has_access(self, case_id: UUID, user_id: UUID) -> bool:
+        case = await self._cases.get_by_id(case_id)
+        if case is not None and case.owning_user_id == user_id:
+            return True
+        return (case_id, user_id) in self.store
+
+
 class FakeUnitOfWork:
     """Duck-typed stand-in for ``CaseManagementUnitOfWork`` (no DB)."""
 
@@ -117,6 +148,7 @@ class FakeUnitOfWork:
         self.evidence_links = _FakeLinkRepo()
         self.status_history = _FakeHistoryRepo()
         self.reports = _FakeReportRepo()
+        self.members = _FakeMemberRepo(self.cases)
         self.outbox = _FakeOutbox()
         self.commits = 0
         self.rollbacks = 0
@@ -148,6 +180,14 @@ def _no_audit(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         "sentinelai.modules.ingestion.service.record_audit_event", _noop, raising=False
+    )
+    # Wave 3.1: an ABAC denial audits before it raises (ADR-0017 §4), which puts a real
+    # `record_audit_event` — and therefore a real session — on the 403 path of every case-scoped
+    # route. DB-less API tests must not reach for Postgres just to be refused; the denial audit
+    # itself is proven against a real database in
+    # `tests/integration/test_case_access_audit_db.py`.
+    monkeypatch.setattr(
+        "sentinelai.platform.auth.dependencies.record_audit_event", _noop, raising=False
     )
 
 

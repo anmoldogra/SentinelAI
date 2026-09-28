@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sentinelai.modules.case_management.models import (
     Case,
     CaseEvidenceLink,
+    CaseMember,
     CaseReport,
     CaseStatusHistory,
 )
@@ -150,6 +151,56 @@ class CaseReportRepository:
         return result.scalars().all()
 
 
+class CaseMemberRepository:
+    """Persists case-scope access grants (ADR-0017 §1)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, case_id: UUID, user_id: UUID) -> CaseMember | None:
+        result = await self._session.execute(
+            select(CaseMember).where(CaseMember.case_id == case_id, CaseMember.user_id == user_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def list_for_case(self, case_id: UUID) -> Sequence[CaseMember]:
+        result = await self._session.execute(
+            select(CaseMember)
+            .where(CaseMember.case_id == case_id)
+            .order_by(CaseMember.granted_at.asc())
+        )
+        return result.scalars().all()
+
+    async def add(self, member: CaseMember) -> None:
+        self._session.add(member)
+        await self._session.flush()
+
+    async def remove(self, member: CaseMember) -> None:
+        await self._session.delete(member)
+        await self._session.flush()
+
+    async def user_has_access(self, case_id: UUID, user_id: UUID) -> bool:
+        """Owner OR member, in one round trip — the ABAC case-scope decision (ADR-0017 §2).
+
+        A single ``EXISTS`` over the union rather than "fetch the owner, then maybe fetch the
+        membership": the two-query form makes the *owner's* check cheap and everyone else's cost
+        an extra round trip, which is backwards once a case has a team.
+
+        Returns a plain ``bool`` and never raises for a missing case. A caller asking about a
+        case that does not exist has no access to it, which is the answer that keeps the endpoint
+        from distinguishing "no such case" from "not yours" (api-design.md §2.4's 403/404
+        ambiguity, security-architecture.md §6).
+        """
+        owner_match = select(Case.case_id).where(
+            Case.case_id == case_id, Case.owning_user_id == user_id
+        )
+        member_match = select(CaseMember.case_id).where(
+            CaseMember.case_id == case_id, CaseMember.user_id == user_id
+        )
+        result = await self._session.execute(select(owner_match.exists() | member_match.exists()))
+        return bool(result.scalar_one())
+
+
 class CaseManagementUnitOfWork(UnitOfWork):
     """Transaction boundary exposing this module's repositories + outbox."""
 
@@ -159,6 +210,7 @@ class CaseManagementUnitOfWork(UnitOfWork):
         self.evidence_links = CaseEvidenceLinkRepository(session)
         self.status_history = CaseStatusHistoryRepository(session)
         self.reports = CaseReportRepository(session)
+        self.members = CaseMemberRepository(session)
         self.outbox = OutboxWriter(
             session,
             schema=_SCHEMA,

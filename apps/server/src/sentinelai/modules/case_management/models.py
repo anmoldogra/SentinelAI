@@ -45,6 +45,19 @@ REPORT_COMPLETED = "completed"
 REPORT_FAILED = "failed"
 REPORT_STATUSES = frozenset({REPORT_QUEUED, REPORT_RUNNING, REPORT_COMPLETED, REPORT_FAILED})
 
+# Case-membership roles (ADR-0017 §5, database-design.md §3.4). A **label**, not a permission set:
+# it records why someone is on a case, for the audit trail and the UI. Nothing branches on it —
+# authorization reads the caller's platform roles, because a per-case permission matrix layered
+# under the platform's roles would be a second authorization model to keep consistent with the
+# first, and security-architecture.md §6 describes one.
+MEMBER_ROLE_LEAD = "lead"
+MEMBER_ROLE_INVESTIGATOR = "investigator"
+MEMBER_ROLE_ANALYST = "analyst"
+MEMBER_ROLE_OBSERVER = "observer"
+MEMBER_ROLES: frozenset[str] = frozenset(
+    {MEMBER_ROLE_LEAD, MEMBER_ROLE_INVESTIGATOR, MEMBER_ROLE_ANALYST, MEMBER_ROLE_OBSERVER}
+)
+
 
 class Case(Base):
     __tablename__ = "cases"
@@ -143,3 +156,37 @@ class CaseReport(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=REPORT_QUEUED)
     requested_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class CaseMember(Base):
+    """A case-scope access grant — ADR-0017 §1, database-design.md §3.4.
+
+    This is the attribute ``security-architecture.md`` §6 evaluates first: "case-scope grant".
+    Before it existed, ``owning_user_id`` made a case reachable by exactly one person, so §6's own
+    worked example (an investigator denied evidence "linked to a case they are not assigned to")
+    described a check that could not be written.
+
+    **The owner is deliberately not a row here.** ``cases.owning_user_id`` is already the
+    authoritative fact; writing it into a membership row as well creates two places that can
+    disagree about who owns a case. Access is "owner OR member", resolved in one query.
+
+    **There is no ``revoked_at``.** A revocation deletes the row; ``platform.audit_log`` records
+    that it happened. The table holds current membership, not its history — the alternative is a
+    nullable column every access check must filter on, duplicating what the append-only ledger
+    already holds. Recorded in ADR-0017's Consequences as a deliberate limit, not an oversight.
+    """
+
+    __tablename__ = "case_members"
+    # Composite PK: a user is a member of a case once, with one role. This is also what makes
+    # `PUT .../members/{user_id}` naturally idempotent — a re-grant updates in place rather than
+    # inserting a second, conflicting membership.
+    __table_args__ = ({"schema": _SCHEMA},)
+
+    case_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey(f"{_SCHEMA}.cases.case_id"), primary_key=True
+    )
+    # app-ref to platform.users — no cross-schema FK (database-design.md §5).
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    role: Mapped[str] = mapped_column(String(50), nullable=False)
+    granted_by_user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    granted_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)

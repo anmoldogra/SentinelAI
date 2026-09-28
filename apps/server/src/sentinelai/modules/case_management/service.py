@@ -40,6 +40,7 @@ from sentinelai.modules.case_management.exceptions import (
     ReportNotReadyError,
 )
 from sentinelai.modules.case_management.models import (
+    MEMBER_ROLES,
     REPORT_COMPLETED,
     REPORT_FAILED,
     REPORT_QUEUED,
@@ -49,11 +50,13 @@ from sentinelai.modules.case_management.models import (
     TRANSITIONS,
     Case,
     CaseEvidenceLink,
+    CaseMember,
     CaseReport,
     CaseStatusHistory,
 )
 from sentinelai.modules.case_management.repository import (
     CaseManagementUnitOfWork,
+    CaseMemberRepository,
     get_case_management_uow,
 )
 from sentinelai.modules.case_management.schemas import (
@@ -79,6 +82,7 @@ from sentinelai.platform.tasks import TaskQueue, get_task_queue
 from sentinelai.shared.exceptions import (
     ForbiddenError,
     PreconditionFailedError,
+    ValidationFailedError,
 )
 from sentinelai.shared.pagination import PageParams, decode_cursor, encode_cursor
 
@@ -134,12 +138,20 @@ class CaseService:
         self._kms = kms
 
     # -- internal helpers ---------------------------------------------------
-    async def _load_owned(self, case_id: UUID, actor: CurrentUser) -> Case:
-        """Load a case the actor may access, or raise. Access = ownership (Phase 1)."""
+    async def _load_accessible(self, case_id: UUID, actor: CurrentUser) -> Case:
+        """Load a case the actor may access, or raise — owner OR member (ADR-0017 §2).
+
+        This is the service-layer half of the same decision ``require_case_access`` makes at the
+        router. Both run: the router's check is the one §6 audits and the one that protects
+        endpoints reached by path, and this one is defence in depth for any caller that reaches
+        the service another way (a job, a future consumer). Until ADR-0017 it was ownership-only,
+        which would have silently defeated membership — a member would pass the router's ABAC
+        check and then be refused here.
+        """
         case = await self._uow.cases.get_by_id(case_id)
         if case is None:
             raise CaseNotFoundError()
-        if case.owning_user_id != actor.user_id:
+        if not await self._uow.members.user_has_access(case_id, actor.user_id):
             raise ForbiddenError()
         return case
 
@@ -230,7 +242,7 @@ class CaseService:
     async def update_case(
         self, case_id: UUID, data: CaseUpdate, actor: CurrentUser, expected_etag: str
     ) -> Case:
-        case = await self._load_owned(case_id, actor)
+        case = await self._load_accessible(case_id, actor)
         if _normalize_etag(expected_etag) != _normalize_etag(case_etag(case)):
             raise PreconditionFailedError("case was modified by someone else (ETag mismatch)")
         changes = data.model_dump(exclude_unset=True)
@@ -244,26 +256,26 @@ class CaseService:
     async def change_status(
         self, case_id: UUID, data: CaseStatusUpdate, actor: CurrentUser, correlation_id: str
     ) -> Case:
-        case = await self._load_owned(case_id, actor)
+        case = await self._load_accessible(case_id, actor)
         await self._apply_transition(case, data.new_status, data.notes, actor, correlation_id)
         return case
 
     async def close_case(self, case_id: UUID, actor: CurrentUser, correlation_id: str) -> Case:
         """Convenience transition to ``closed`` (no dedicated endpoint — POST /status)."""
-        case = await self._load_owned(case_id, actor)
+        case = await self._load_accessible(case_id, actor)
         await self._apply_transition(case, STATUS_CLOSED, None, actor, correlation_id)
         return case
 
     async def reopen_case(self, case_id: UUID, actor: CurrentUser, correlation_id: str) -> Case:
         """Convenience transition back to ``open`` (only valid from ``closed``)."""
-        case = await self._load_owned(case_id, actor)
+        case = await self._load_accessible(case_id, actor)
         await self._apply_transition(case, STATUS_OPEN, None, actor, correlation_id)
         return case
 
     async def link_evidence(
         self, case_id: UUID, data: EvidenceLinkCreate, actor: CurrentUser, correlation_id: str
     ) -> CaseEvidenceLink:
-        case = await self._load_owned(case_id, actor)
+        case = await self._load_accessible(case_id, actor)
         if await self._uow.evidence_links.get(case_id, data.evidence_id) is not None:
             raise EvidenceAlreadyLinkedError(
                 f"evidence {data.evidence_id} is already linked to case {case_id}"
@@ -295,7 +307,7 @@ class CaseService:
     async def unlink_evidence(
         self, case_id: UUID, evidence_id: UUID, actor: CurrentUser, correlation_id: str
     ) -> None:
-        await self._load_owned(case_id, actor)
+        await self._load_accessible(case_id, actor)
         link = await self._uow.evidence_links.get(case_id, evidence_id)
         if link is None:
             raise EvidenceLinkNotFoundError(
@@ -330,7 +342,7 @@ class CaseService:
         enqueue happens after the insert so the job can never observe a row that does not exist
         yet; it rides the same transaction the entrypoint commits (ADR-0005).
         """
-        await self._load_owned(case_id, actor)
+        await self._load_accessible(case_id, actor)
         report = CaseReport(
             case_id=case_id,
             report_type=data.report_type,
@@ -452,9 +464,90 @@ class CaseService:
             report.status = REPORT_FAILED
             report.failure_reason = reason
 
+    # -- case membership (ADR-0017, api-design.md §4.2) ---------------------
+    async def list_members(self, case_id: UUID, actor: CurrentUser) -> Sequence[CaseMember]:
+        """Who has access to this case, besides its owner.
+
+        The owner is deliberately absent from the list, because they are absent from the table —
+        ``cases.owning_user_id`` is the authoritative fact and duplicating it would create two
+        places that can disagree (ADR-0017 §2). The case resource itself carries the owner.
+        """
+        await self._load_accessible(case_id, actor)
+        return await self._uow.members.list_for_case(case_id)
+
+    async def grant_access(
+        self, case_id: UUID, user_id: UUID, role: str, actor: CurrentUser
+    ) -> CaseMember:
+        """Grant or re-grant case access — idempotent by ``(case_id, user_id)``.
+
+        **Granting requires already having access.** ``_load_accessible`` is the check, so a
+        caller who cannot open a case cannot add themselves or anyone else to it. That is what
+        stops the endpoint from being a self-service escalation path.
+
+        Re-granting an existing membership updates its role in place and returns the same row,
+        which is what makes ``PUT`` naturally idempotent (api-design.md §4.2) rather than needing
+        an idempotency key: the membership is identified by the URL, not by a request body.
+        """
+        case = await self._load_accessible(case_id, actor)
+        if role not in MEMBER_ROLES:
+            raise ValidationFailedError(
+                [{"field": "role", "message": f"role must be one of {sorted(MEMBER_ROLES)}"}]
+            )
+        if user_id == case.owning_user_id:
+            # The owner already has access by a stronger route. Writing a membership row for them
+            # would create the duplicate ADR-0017 §2 exists to avoid, and revoking it later would
+            # produce a member-less owner who still has access — a row that lies.
+            raise ValidationFailedError(
+                [{"field": "user_id", "message": "the case owner already has access"}]
+            )
+
+        granted_at = datetime.now(UTC)
+        member = await self._uow.members.get(case_id, user_id)
+        if member is None:
+            member = CaseMember(
+                case_id=case_id,
+                user_id=user_id,
+                role=role,
+                granted_by_user_id=actor.user_id,
+                granted_at=granted_at,
+            )
+            await self._uow.members.add(member)
+        else:
+            member.role = role
+            member.granted_by_user_id = actor.user_id
+            member.granted_at = granted_at
+
+        # Membership IS the access-control state, so a change to it is more security-relevant
+        # than most of what the audit log already records (ADR-0017 §4).
+        await self._audit(
+            actor,
+            "case_access_granted",
+            case_id,
+            {"user_id": str(user_id), "role": role},
+        )
+        return member
+
+    async def revoke_access(self, case_id: UUID, user_id: UUID, actor: CurrentUser) -> None:
+        """Revoke case access. Idempotent: revoking a non-member is a no-op, not a 404.
+
+        Refuses to revoke the owner (``422``): ``owning_user_id`` is not a membership row, so
+        there is nothing to delete, and a case whose owner cannot open it would be unreachable by
+        anyone. Ownership transfer is not an operation this API offers.
+        """
+        case = await self._load_accessible(case_id, actor)
+        if user_id == case.owning_user_id:
+            raise ValidationFailedError(
+                [{"field": "user_id", "message": "the case owner's access cannot be revoked"}]
+            )
+        member = await self._uow.members.get(case_id, user_id)
+        if member is None:
+            return
+        await self._uow.members.remove(member)
+        await self._audit(actor, "case_access_revoked", case_id, {"user_id": str(user_id)})
+
     # -- queries ------------------------------------------------------------
     async def get_case(self, case_id: UUID, actor: CurrentUser) -> Case:
-        return await self._load_owned(case_id, actor)
+        return await self._load_accessible(case_id, actor)
 
     async def list_cases(
         self, actor: CurrentUser, filters: CaseSearchFilters, page: PageParams
@@ -491,7 +584,7 @@ class CaseService:
     async def list_status_history(
         self, case_id: UUID, actor: CurrentUser
     ) -> Sequence[CaseStatusHistory]:
-        await self._load_owned(case_id, actor)
+        await self._load_accessible(case_id, actor)
         return await self._uow.status_history.list_for_case(case_id)
 
     async def timeline(self, case_id: UUID, actor: CurrentUser) -> Sequence[CaseStatusHistory]:
@@ -501,18 +594,18 @@ class CaseService:
     async def list_case_evidence(
         self, case_id: UUID, actor: CurrentUser
     ) -> Sequence[CaseEvidenceLink]:
-        await self._load_owned(case_id, actor)
+        await self._load_accessible(case_id, actor)
         return await self._uow.evidence_links.list_for_case(case_id)
 
     async def list_reports(self, case_id: UUID, actor: CurrentUser) -> Sequence[CaseReport]:
-        await self._load_owned(case_id, actor)
+        await self._load_accessible(case_id, actor)
         return await self._uow.reports.list_for_case(case_id)
 
     async def get_report(self, report_id: UUID, actor: CurrentUser) -> CaseReport:
         report = await self._uow.reports.get_by_id(report_id)
         if report is None:
             raise ReportNotFoundError()
-        await self._load_owned(report.case_id, actor)  # enforce case-scoped access
+        await self._load_accessible(report.case_id, actor)  # enforce case-scoped access
         return report
 
     async def get_report_download_url(self, report_id: UUID, actor: CurrentUser) -> str:
@@ -553,21 +646,20 @@ def _normalize_etag(value: str) -> str:
 class DbCaseAccessChecker:
     """Adapter implementing the platform ``CaseAccessChecker`` port (guide Part 8).
 
-    Phase 1 access model = ownership (there is no case-membership table in
-    database-design.md §3.4). Registered via ``app.dependency_overrides``.
+    **Owner OR member** since ADR-0017 (Wave 3.1). It was ownership-only until then, not by
+    design but because ``database-design.md`` §3.4 had no membership table — which made
+    ``security-architecture.md`` §6's "case-scope grant" attribute unevaluable and every
+    collaborative workflow in the PRD unimplementable.
+
+    Registered via ``app.dependency_overrides`` because ``platform`` may not import a module
+    (import DAG); the composition root is allowed to reach into both.
     """
 
     def __init__(self, session: AsyncSession) -> None:
-        self._session = session
+        self._members = CaseMemberRepository(session)
 
     async def user_has_access(self, case_id: UUID, user_id: UUID) -> bool:
-        from sqlalchemy import select
-
-        result = await self._session.execute(
-            select(Case.owning_user_id).where(Case.case_id == case_id)
-        )
-        owner = result.scalar_one_or_none()
-        return owner is not None and owner == user_id
+        return await self._members.user_has_access(case_id, user_id)
 
 
 def get_case_service(

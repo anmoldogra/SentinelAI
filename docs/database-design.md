@@ -202,6 +202,11 @@ Additional module-specific tables:
 | | `previous_status`, `new_status` | text | no | |
 | | `actor_user_id` | uuid | app-ref | |
 | | `changed_at`, `notes` | timestamptz/text | mixed | see Section 5 note on `investigation` |
+| `case_members` | `case_id` | uuid | FK → `cases` | intra-schema; composite PK with `user_id` |
+| | `user_id` | uuid | app-ref | → `platform.users`, unenforced (Section 5) |
+| | `role` | text | no | `lead`\|`investigator`\|`analyst`\|`observer` — a label for audit/UI, not a permission set (ADR-0017 §5) |
+| | `granted_by_user_id` | uuid | app-ref | who granted it |
+| | `granted_at` | timestamptz | no | |
 | `case_reports` | `report_id` | uuid | PK | |
 | | `case_id` | uuid | FK → `cases` | |
 | | `report_type` | text | no | |
@@ -215,6 +220,16 @@ Additional module-specific tables:
 > `queued` state so the client has something to poll at `GET /reports/{report_id}`; the background
 > job fills `storage_ref`/`generated_at` and flips `status` on completion. That is why the two
 > completion columns are nullable — a report that has not run yet cannot have them.
+
+> **`case_members` is the ABAC case-scope grant.** `security-architecture.md` §6 evaluates
+> "case-scope grant" as the first ABAC attribute, and before ADR-0017 there was nothing to
+> evaluate — `owning_user_id` made a case reachable by exactly one person. Access is now **owner
+> OR member**: the owner is deliberately *not* written into `case_members` at case creation,
+> because `owning_user_id` is already the authoritative fact and a duplicate membership row
+> creates two places that can disagree about who owns a case.
+>
+> There is no `revoked_at`. A revocation deletes the row and the audit log records it; the table
+> holds current membership, not its history (ADR-0017 Consequences).
 
 ### 3.5 `investigation`
 
