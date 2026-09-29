@@ -73,6 +73,10 @@ async def on_evidence_ingested(event: EventEnvelope, uow: ThreatIntelUnitOfWork)
         evidence_id=evidence_id,
         category=str(event.payload.get("category", "")),
         correlation_id=str(event.correlation_id),
+        # §11: the event that directly caused the ones this scan publishes. One hop back, so the
+        # causal chain `evidence.ingested -> ioc_matched -> correlation_generated` is walkable —
+        # which is the chain §11's own worked example draws.
+        causation_id=str(event.event_id),
     )
     await guard.mark_processed(event.event_id, handler_name=_HANDLER_SCAN)
 
@@ -92,6 +96,7 @@ async def scan_evidence_for_matches(
     evidence_id: UUID,
     category: str,
     correlation_id: str,
+    causation_id: str | None = None,
     read_attributes: Callable[[UUID], Awaitable[dict[str, Any] | None]] | None = None,
 ) -> int:
     """Scan one evidence object against active IOCs; publish a match per hit. Returns the count.
@@ -118,6 +123,10 @@ async def scan_evidence_for_matches(
     between the event and this scan, and a handler that raised would dead-letter an event describing
     something that genuinely happened, then block its aggregate's queue under ADR-0006's
     per-aggregate ordering.
+
+    `causation_id` is the event this scan is reacting to (§11), passed through rather than derived
+    so this function stays callable from a replay tool or a backfill that has no envelope. ``None``
+    is the honest answer there: nothing caused it but an operator.
 
     `read_attributes` is injectable so a test can drive the matcher without an `ingestion` schema;
     the default is the real §181 fetch path.
@@ -156,9 +165,16 @@ async def scan_evidence_for_matches(
             payload={
                 "ioc_id": str(ioc.ioc_id),
                 "matched_evidence_id": str(evidence_id),
+                # §25's payload schema for `ioc_matched` 1.0.0 marks `indicator_type` and
+                # `matched_at` required, even though §25.4's catalog row lists only three key
+                # fields. The schema table is the contract, and the consumer needs both:
+                # `investigation` types the indicator entity from one, stamps it from the other.
+                "indicator_type": ioc.indicator_type,
                 "confidence": str(MATCH_CONFIDENCE),
+                "matched_at": now.isoformat(),
             },
             correlation_id=correlation_id,
+            causation_id=causation_id,
             # No `actor_ref`: a match is the platform's own observation, not a user's action.
             # Attributing it to whoever uploaded the evidence would misreport who decided it.
             actor_type="system",

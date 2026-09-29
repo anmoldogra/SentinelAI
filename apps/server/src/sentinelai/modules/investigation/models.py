@@ -12,7 +12,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import ARRAY, Boolean, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import ARRAY, Boolean, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -178,8 +178,20 @@ class RelationshipEvidence(Base):
 
 
 class EntityEvidenceMention(Base):
+    """CEM §11's MENTIONS edge: this evidence object references this entity.
+
+    Mirrors `202609290012_investig_mention`. The unique index is declared here too so `create_all`
+    in tests reproduces the real constraint — a suite whose schema lacked it would pass while
+    production depended on it. `(entity_id, evidence_id)` is set membership, not a countable
+    occurrence: §3.5 gives the table no offset, span or count column that could distinguish two rows
+    for one pair.
+    """
+
     __tablename__ = "entity_evidence_mentions"
-    __table_args__ = ({"schema": _SCHEMA},)
+    __table_args__ = (
+        Index("uq_entity_mention_pair", "entity_id", "evidence_id", unique=True),
+        {"schema": _SCHEMA},
+    )
 
     mention_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     entity_id: Mapped[UUID] = mapped_column(

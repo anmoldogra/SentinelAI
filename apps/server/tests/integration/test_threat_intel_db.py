@@ -384,6 +384,11 @@ async def test_an_indicator_present_in_evidence_produces_a_signed_match(
     assert len(matched_events) == 1
     event = matched_events[0]
     assert event["payload"]["matched_evidence_id"] == str(evidence_id)
+    # §25's payload schema for `ioc_matched` 1.0.0 marks these required, even though §25.4's
+    # catalog row lists only three key fields. `investigation` types the indicator entity from
+    # `indicator_type`, so a payload missing it would silently stop the graph projection.
+    assert event["payload"]["indicator_type"] == ioc.indicator_type
+    assert event["payload"]["matched_at"] is not None
     assert event["actor_type"] == "system", (
         "a match is the platform's observation, not a user's act"
     )

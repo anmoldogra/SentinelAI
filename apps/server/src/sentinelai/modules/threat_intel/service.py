@@ -14,10 +14,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from decimal import Decimal
 from uuid import UUID
 
 from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.modules.threat_intel.events import EVENT_IOC_REGISTERED
 from sentinelai.modules.threat_intel.exceptions import (
@@ -38,10 +38,16 @@ from sentinelai.modules.threat_intel.models import (
 )
 from sentinelai.modules.threat_intel.repository import (
     STATUS_ACTIVE,
+    IocRepository,
     ThreatIntelUnitOfWork,
     get_threat_intel_uow,
 )
-from sentinelai.modules.threat_intel.schemas import FeedCreate, IocCreate, ThreatActorCreate
+from sentinelai.modules.threat_intel.schemas import (
+    FeedCreate,
+    IocCreate,
+    IocRead,
+    ThreatActorCreate,
+)
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CurrentUser
 from sentinelai.platform.config import settings
@@ -52,15 +58,6 @@ from sentinelai.shared.exceptions import ValidationFailedError
 from sentinelai.shared.pagination import PageParams, decode_cursor
 
 _MODULE = "threat_intel"
-
-# A match found by exact comparison of a normalized indicator against a normalized evidence token is
-# not a heuristic — the indicator is either present or it is not. The confidence a match carries is
-# therefore the certainty of the *observation*, not a similarity score, and `matching.py` does not
-# produce fuzzy hits that would deserve a lower one.
-#
-# It is a named constant rather than a literal because §25.4's payload carries it and a future fuzzy
-# matcher would need a second value: the place to add one is here, beside the reason this is 1.
-MATCH_CONFIDENCE = Decimal("1.000")
 
 
 class ThreatIntelService:
@@ -74,8 +71,8 @@ class ThreatIntelService:
         self._uow = uow
         # Required: every audit entry is signed (ADR-0003 §1), so an optional KMS would make an
         # unsigned one reachable. Every method on this class is a user-facing, audited action — IOC
-        # matching is deliberately not one, and lives in the module-level
-        # `scan_evidence_for_matches` below, because a consumer has no KMS to give it.
+        # matching is deliberately not one, and lives in `events.py`'s
+        # `scan_evidence_for_matches`, because a consumer has no KMS to give it.
         self._kms = kms
         self._tasks = tasks
 
@@ -308,6 +305,31 @@ class ThreatIntelService:
             target_id=target_id,
             details=details,
         )
+
+
+async def read_ioc(session: AsyncSession, ioc_id: UUID) -> IocRead | None:
+    """Cross-module hook: one IOC as its owning module describes it, or ``None`` if it is gone.
+
+    This is the "thin event + reference" fetch `event-driven-architecture.md` §174 specifies.
+    `threat_intel.ioc_matched` carries `ioc_id`, `indicator_type`, `confidence` and `matched_at` —
+    §25's payload schema for it in full — but **not the indicator's value**, and
+    `investigation` needs that value to name the `digital_asset` entity a match produces. §174's
+    answer to exactly this is that "a consumer that needs more fetches the full object via the
+    owning module's public interface", which is cheaper than a payload change: adding a sixth field
+    would be a MINOR bump (§7) to a contract the document pins, and would put indicator values on
+    the bus, which §21 asks us to avoid where a fetch will do.
+
+    **A function over a session, not a ``ThreatIntelService`` method**, for the same reason
+    `ingestion.public.read_evidence_attributes` is one: the dispatcher hands a handler a session and
+    a signed outbox, and every method on the service is an audited user action requiring a KMS this
+    read never touches. It takes no actor because no principal is asking — a consumer that
+    fabricated one would be lying to every audit path it reached.
+
+    Returns the Pydantic schema rather than the ORM row: a caller in another module must not hold a
+    `threat_intel` model (guide Part 1), and `IocRead` is already this module's public shape for it.
+    """
+    ioc = await IocRepository(session).get_by_id(ioc_id)
+    return IocRead.model_validate(ioc) if ioc is not None else None
 
 
 def get_threat_intel_service(

@@ -267,12 +267,19 @@ Additional module-specific tables:
 | | `previous_status`, `new_status` | text | no | |
 | `relationship_evidence` | `relationship_id` | uuid | FK → `relationships` | composite PK with `evidence_id` |
 | | `evidence_id` | uuid | app-ref | → `ingestion.evidence`; every relationship must have ≥1 row here (CEM §13) |
-| `entity_evidence_mentions` | `mention_id` | uuid | PK | |
-| | `entity_id` | uuid | FK → `entities` | |
+| `entity_evidence_mentions` | `mention_id` | uuid | PK | CEM §11's MENTIONS edge |
+| | `entity_id` | uuid | FK → `entities` | unique with `evidence_id` (`uq_entity_mention_pair`) |
 | | `evidence_id` | uuid | app-ref | → `ingestion.evidence` |
 | `correlation_runs` | `run_id` | uuid | PK | AI job execution record |
 | | `case_id` | uuid | app-ref | → `case_management.cases` |
 | | `status`, `started_at`, `completed_at`, `findings_generated_count` | mixed | no | |
+
+**`uq_entity_mention_pair`** — unique `(entity_id, evidence_id)`. "This evidence mentions this
+entity" is set membership, not a countable occurrence: the table carries no offset, span or count
+that could distinguish two rows for one pair. It is also the business idempotency key
+`event-driven-architecture.md` §12 requires of `investigation`'s IOC-match consumer, which records a
+match as one MENTIONS edge — and a duplicate would double-count the evidence grounding a finding
+under CEM §13, in a record an analyst reviews and a court may read.
 
 ### 3.6 `notification`
 

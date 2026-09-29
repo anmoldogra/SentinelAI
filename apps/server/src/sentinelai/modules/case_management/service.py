@@ -55,6 +55,7 @@ from sentinelai.modules.case_management.models import (
     CaseStatusHistory,
 )
 from sentinelai.modules.case_management.repository import (
+    CaseEvidenceLinkRepository,
     CaseManagementUnitOfWork,
     CaseMemberRepository,
     get_case_management_uow,
@@ -662,6 +663,44 @@ class DbCaseAccessChecker:
         return await self._members.user_has_access(case_id, user_id)
 
 
+@dataclass(frozen=True, slots=True)
+class CaseEvidenceRef:
+    """One case an evidence object is linked to, plus that case's owner."""
+
+    case_id: UUID
+    owning_user_id: UUID
+
+
+async def read_cases_for_evidence(
+    session: AsyncSession, evidence_id: UUID
+) -> Sequence[CaseEvidenceRef]:
+    """Cross-module hook: which cases an evidence object is linked to, and who owns each.
+
+    `event-driven-architecture.md` §25.8 requires `investigation` to act on an IOC match "for the
+    case owning the matched evidence", and no evidence-bearing event carries a case — correctly,
+    since the link is `case_management`'s fact and can change after any of them. §174's "a consumer
+    that needs more fetches it via the owning module's public interface" is the documented way
+    across, and it is what keeps `database-design.md` §5 intact:
+    `investigation` never queries `case_management.case_evidence_links`, it asks this module.
+
+    The owner comes back with the case because `investigation.correlation_generated` carries
+    `recipient_user_id` (§25.8) — the investigator `notification` alerts. A consumer that could not
+    name one would publish a finding nobody is told about.
+
+    **A function over a session, not a ``CaseService`` method**, matching
+    `ingestion.public.read_evidence_attributes`: a dispatcher hands a handler a session and a signed
+    outbox, while `CaseService` needs object storage and a KMS for report generation and audit — one
+    of which this read would have to be given as ``None``.
+
+    **It takes no actor, and that is not an authorization hole.** It answers "which cases hold this
+    evidence", asked by the platform reacting to its own observation, not by a user — so there is no
+    principal to check and none is invented. Nothing it returns reaches a user: `investigation`'s
+    graph read re-checks case access through ADR-0017's checker on every request.
+    """
+    rows = await CaseEvidenceLinkRepository(session).list_cases_for_evidence(evidence_id)
+    return [CaseEvidenceRef(case_id=row[0], owning_user_id=row[1]) for row in rows]
+
+
 def get_case_service(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
     storage: ObjectStorage = Depends(get_object_storage),
@@ -677,6 +716,7 @@ def provide_case_access_checker(session: AsyncSession = Depends(get_session)) ->
 
 
 __all__ = [
+    "CaseEvidenceRef",
     "CaseSearchFilters",
     "CaseService",
     "DbCaseAccessChecker",
@@ -684,4 +724,5 @@ __all__ = [
     "get_case_service",
     "get_task_queue",
     "provide_case_access_checker",
+    "read_cases_for_evidence",
 ]

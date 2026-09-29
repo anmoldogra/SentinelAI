@@ -16,6 +16,7 @@ from uuid import UUID
 
 from fastapi import Depends
 from sqlalchemy import or_, select, tuple_
+from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.modules.case_management.models import (
@@ -106,6 +107,21 @@ class CaseEvidenceLinkRepository:
             .order_by(CaseEvidenceLink.linked_at.desc())
         )
         return result.scalars().all()
+
+    async def list_cases_for_evidence(self, evidence_id: UUID) -> Sequence[Row[tuple[UUID, UUID]]]:
+        """Every case this evidence is linked to, with each case's owner.
+
+        The reverse of ``list_for_case``, and the direction ``ix_case_links_evidence_id`` exists
+        for. The owner comes back in the same row because the only caller needs both and a second
+        query per case would be a join done in Python.
+        """
+        result = await self._session.execute(
+            select(Case.case_id, Case.owning_user_id)
+            .join(CaseEvidenceLink, CaseEvidenceLink.case_id == Case.case_id)
+            .where(CaseEvidenceLink.evidence_id == evidence_id)
+            .order_by(Case.case_id)
+        )
+        return result.all()
 
     async def remove(self, link: CaseEvidenceLink) -> None:
         await self._session.delete(link)

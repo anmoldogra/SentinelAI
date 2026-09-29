@@ -32,89 +32,64 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
+from sentinelai.modules.investigation.models import Relationship
+from sentinelai.modules.investigation.payloads import payload_uuid
 from sentinelai.modules.investigation.read.repository import GraphProjectionRepository
 from sentinelai.modules.investigation.repository import InvestigationUnitOfWork
 from sentinelai.platform.events.envelope import EventEnvelope
 from sentinelai.platform.logging import log
 
 
-def _uuid(value: object) -> UUID | None:
-    """Parse a payload id, returning ``None`` rather than raising on anything unusable.
+async def _project_entity(
+    projection: GraphProjectionRepository,
+    uow: InvestigationUnitOfWork,
+    *,
+    case_id: UUID,
+    entity_id: UUID,
+    now: datetime,
+) -> bool:
+    """Upsert one entity as a seed node of a case's graph. ``False`` if the entity is gone.
 
-    A projector must not dead-letter an event over a malformed field: the fact already happened on
-    the write side, and a poisoned projection row is recoverable by rebuild while a dead-lettered
-    event is not replayed automatically. A skipped projection is logged and converges on the next
-    rebuild; a crashed handler blocks the aggregate's whole queue (ADR-0006's per-aggregate order).
+    Read from **this module's own transactional tables** — a projector may read the write side it
+    projects, and every event here carries an id rather than a copy of the row (§25.8's "fetched via
+    GET if needed" convention), so the projection reflects the row as it stands rather than as it
+    was when the event was minted.
     """
-    if not isinstance(value, str):
-        return None
-    try:
-        return UUID(value)
-    except ValueError:
-        return None
-
-
-async def project_correlation_generated(event: EventEnvelope, uow: InvestigationUnitOfWork) -> None:
-    """Project a newly-generated relationship and its endpoints into a case's graph.
-
-    ``investigation.correlation_generated`` carries ``case_id`` beside ``relationship_id``
-    (§25.8), and that pairing is the whole reason this projection can exist: it is the case→entity
-    mapping `service.get_case_graph` was deferred for, supplied by the event stream rather than by a
-    cross-schema join `database-design.md` §5 forbids.
-
-    The relationship and both entities are read from **this module's own transactional tables** — a
-    projector may read the write side it projects, and the event deliberately carries an id rather
-    than a copy of the row (§25.8's "fetched via GET if needed" convention), so the projection
-    always
-    reflects the row as it stands rather than as it was when the event was minted.
-    """
-    payload = event.payload
-    case_id = _uuid(payload.get("case_id"))
-    relationship_id = _uuid(payload.get("relationship_id"))
-    if case_id is None or relationship_id is None:
-        # An `entity_id`-only variant is permitted by §25.8 and is not produced by any current
-        # publisher; it would need a case-scoped entity projection, which §25.8 does not define.
+    entity = await uow.entities.get_by_id(entity_id)
+    if entity is None:
         log.info(
-            "graph_projection_skipped",
-            reason="no case_id/relationship_id in payload",
-            event_type=event.event_type,
+            "graph_projection_missing_endpoint", case_id=str(case_id), entity_id=str(entity_id)
         )
-        return
+        return False
+    await projection.upsert_node(
+        case_id=case_id,
+        entity_id=entity.entity_id,
+        entity_type=entity.entity_type,
+        canonical_name=entity.canonical_name,
+        status=entity.status,
+        confidence=entity.confidence,
+        # Directly evidenced: every path into this function arrives from evidence that belongs to
+        # this case — a relationship generated for it, or an evidence item linked to it.
+        is_seed=True,
+        projected_at=now,
+    )
+    return True
 
-    relationship = await uow.relationships.get_by_id(relationship_id)
-    if relationship is None:
-        # The relationship was deleted between publish and projection. Nothing to project, and
-        # nothing wrong — the projection is a view, and a view of an absent row is absence.
-        log.info("graph_projection_skipped", reason="relationship not found", case_id=str(case_id))
-        return
 
-    projection = GraphProjectionRepository(uow.session)
-    now = datetime.now(UTC)
-
+async def _project_relationship(
+    projection: GraphProjectionRepository,
+    uow: InvestigationUnitOfWork,
+    *,
+    case_id: UUID,
+    relationship: Relationship,
+    now: datetime,
+) -> None:
+    """Upsert one relationship and both its endpoints into a case's graph."""
     for entity_id in (relationship.from_entity_id, relationship.to_entity_id):
-        entity = await uow.entities.get_by_id(entity_id)
-        if entity is None:
-            # A dangling endpoint. The edge is still projected below; the read query drops an edge
-            # whose endpoints are absent, which keeps §6's "endpoints guaranteed present in
-            # entities" true without this layer having to enforce it.
-            log.info(
-                "graph_projection_missing_endpoint",
-                case_id=str(case_id),
-                entity_id=str(entity_id),
-            )
-            continue
-        await projection.upsert_node(
-            case_id=case_id,
-            entity_id=entity.entity_id,
-            entity_type=entity.entity_type,
-            canonical_name=entity.canonical_name,
-            status=entity.status,
-            confidence=entity.confidence,
-            # Directly evidenced: this relationship was generated for this case.
-            is_seed=True,
-            projected_at=now,
-        )
-
+        # A dangling endpoint does not stop the edge: the read query drops an edge whose endpoints
+        # are absent, which keeps §6's "endpoints guaranteed present in entities" true without this
+        # layer having to enforce it.
+        await _project_entity(projection, uow, case_id=case_id, entity_id=entity_id, now=now)
     await projection.upsert_edge(
         case_id=case_id,
         relationship_id=relationship.relationship_id,
@@ -125,6 +100,94 @@ async def project_correlation_generated(event: EventEnvelope, uow: Investigation
         confidence=relationship.confidence,
         projected_at=now,
     )
+
+
+async def project_correlation_generated(event: EventEnvelope, uow: InvestigationUnitOfWork) -> None:
+    """Project a newly-generated finding and its endpoints into a case's graph.
+
+    ``investigation.correlation_generated`` carries ``case_id`` beside ``relationship_id`` **or**
+    ``entity_id`` (§25.8 — "one of"), and that pairing is the whole reason this projection can
+    exist: it is the case→entity mapping `service.get_case_graph` was deferred for, supplied by the
+    event stream rather than by a cross-schema join `database-design.md` §5 forbids.
+
+    **Both variants are now produced.** The relationship variant comes from the correlation job; the
+    ``entity_id`` variant comes from `events.on_ioc_matched`, because a threat-intel match grounds
+    exactly one entity — the indicator — and an entity is a node, not an edge. Projecting it is what
+    puts the match in front of an analyst.
+    """
+    payload = event.payload
+    case_id = payload_uuid(payload.get("case_id"))
+    relationship_id = payload_uuid(payload.get("relationship_id"))
+    entity_id = payload_uuid(payload.get("entity_id"))
+    if case_id is None or (relationship_id is None and entity_id is None):
+        log.info(
+            "graph_projection_skipped",
+            reason="no case_id, and no relationship_id or entity_id, in payload",
+            event_type=event.event_type,
+        )
+        return
+
+    projection = GraphProjectionRepository(uow.session)
+    now = datetime.now(UTC)
+
+    if relationship_id is None:
+        # The entity variant. The guard above establishes that `entity_id` is present.
+        if entity_id is not None:
+            await _project_entity(projection, uow, case_id=case_id, entity_id=entity_id, now=now)
+        return
+
+    relationship = await uow.relationships.get_by_id(relationship_id)
+    if relationship is None:
+        # The relationship was deleted between publish and projection. Nothing to project, and
+        # nothing wrong — the projection is a view, and a view of an absent row is absence.
+        log.info("graph_projection_skipped", reason="relationship not found", case_id=str(case_id))
+        return
+
+    await _project_relationship(
+        projection, uow, case_id=case_id, relationship=relationship, now=now
+    )
+
+
+async def project_evidence_linked(event: EventEnvelope, uow: InvestigationUnitOfWork) -> None:
+    """Project everything already grounded in an evidence item into the case it was just linked to.
+
+    **This is the ordering half of the case→evidence bridge.** ``on_ioc_matched`` projects into the
+    cases an evidence item belongs to *at match time*, and the common real order is the other way
+    round: evidence is ingested and scanned within seconds, then an analyst links it to a case
+    minutes or days later. Without this handler every match that arrived before the link would be
+    invisible in that case's graph forever — recorded on the write side, absent from the read model,
+    and with no event left to replay that would put it there.
+
+    ``evidence.linked_to_case`` carries ``case_id`` and ``evidence_id``, which is exactly what the
+    projection needs: the entities this evidence mentions (CEM §11's MENTIONS edges) and the
+    relationships it supports (CEM §13's ``supporting_evidence_ids``) are this case's graph as far
+    as this evidence is concerned.
+
+    It writes the projection directly rather than publishing a finding, because nothing was found —
+    the entities and relationships already existed and were already announced when they were
+    created. A rebuild replays this same event from `case_management`'s outbox and reconstructs the
+    same rows, which is the property ADR-0013 §2 requires.
+    """
+    case_id = payload_uuid(event.payload.get("case_id"))
+    evidence_id = payload_uuid(event.payload.get("evidence_id"))
+    if case_id is None or evidence_id is None:
+        log.info(
+            "graph_projection_skipped",
+            reason="no case_id/evidence_id in payload",
+            event_type=event.event_type,
+        )
+        return
+
+    projection = GraphProjectionRepository(uow.session)
+    now = datetime.now(UTC)
+    evidence_ids = [evidence_id]
+
+    for entity in await uow.entities.list_by_evidence_ids(evidence_ids):
+        await _project_entity(projection, uow, case_id=case_id, entity_id=entity.entity_id, now=now)
+    for relationship in await uow.relationships.list_by_evidence_ids(evidence_ids):
+        await _project_relationship(
+            projection, uow, case_id=case_id, relationship=relationship, now=now
+        )
 
 
 async def project_finding_reviewed(event: EventEnvelope, uow: InvestigationUnitOfWork) -> None:
@@ -143,7 +206,7 @@ async def project_finding_reviewed(event: EventEnvelope, uow: InvestigationUnitO
     the
     write side by reading the read model would invert the dependency CQRS establishes.
     """
-    relationship_id = _uuid(event.payload.get("relationship_id"))
+    relationship_id = payload_uuid(event.payload.get("relationship_id"))
     disposition = event.payload.get("disposition")
     if relationship_id is None or not isinstance(disposition, str):
         log.info("graph_projection_skipped", reason="malformed finding_reviewed payload")
@@ -166,4 +229,8 @@ async def project_finding_reviewed(event: EventEnvelope, uow: InvestigationUnitO
         )
 
 
-__all__ = ["project_correlation_generated", "project_finding_reviewed"]
+__all__ = [
+    "project_correlation_generated",
+    "project_evidence_linked",
+    "project_finding_reviewed",
+]

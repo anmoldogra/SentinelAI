@@ -503,7 +503,7 @@ The complete published/consumed event inventory per module. "Idempotency Key" in
 | `forensics` | 2 | 0 | Pure publisher |
 | `social_media` | 2 | 0 | Pure publisher |
 | `case_management` | 5 | 1 | Consumes `investigation.finding_reviewed` without storing a reference back (§5, §25.7) |
-| `investigation` | 3 | 4 | Broadest subscription set by design — the sole cross-domain reader (§5) |
+| `investigation` | 3 | 6 | Broadest subscription set by design — the sole cross-domain reader (§5), and the only module that also consumes two of its own events, to build its CQRS read model (ADR-0013) |
 | `notification` | 2 | 3 | Terminal consumer; tightest idempotency keys in the system (replay-safety, §19) |
 
 **Representative payload schemas** (three more of the catalog's higher-traffic events, in full — every other event's payload follows the same "key fields" style shown in each row below and is registered in `platform.event_schema_registry`, Section 22):
@@ -637,17 +637,25 @@ The complete published/consumed event inventory per module. "Idempotency Key" in
 | Event | Trigger | Payload (key fields) | Consumers | Retry Policy |
 |---|---|---|---|---|
 | `investigation.correlation_run_completed` / `_failed` | An AI correlation run finishes | `run_id`, `case_id`, `findings_generated_count` | `notification` | Standard |
-| `investigation.correlation_generated` | A new proposed entity/relationship is created | `case_id`, `relationship_id` or `entity_id`, `confidence`, `recipient_user_id` (the case owner, supplied by the correlation job) | `notification` | Standard |
-| `investigation.finding_reviewed` | An analyst confirms/rejects a proposed finding | `case_id`, `relationship_id`, `disposition`, `reviewed_by` | `case_management` | Standard |
+| `investigation.correlation_generated` | A new proposed entity/relationship is created | `case_id`, `relationship_id` or `entity_id`, `confidence`, `recipient_user_id` (the case owner, supplied by the correlation job or by the IOC-match consumer), `generated_by` | `notification`, `investigation` (its own graph projector — ADR-0013) | Standard |
+| `investigation.finding_reviewed` | An analyst confirms/rejects a proposed finding | `case_id`, `relationship_id`, `disposition`, `reviewed_by` | `case_management`, `investigation` (its own graph projector — ADR-0013) | Standard |
+
+**`investigation` subscribing to its own published events is deliberate** (ADR-0013 §2). The write
+path records the transactional row and announces it; the projector builds `investigation_read` from
+the announced fact. Routing the projection through the outbox rather than welding it to the write is
+what makes the read model rebuildable by replay — drop the schema, replay the events, get the same
+graph — and it is why a projection bug is never a data-loss bug.
 
 **Consumed**
 
 | Event | Source Module | Handler Action | Idempotency Key | Retry Policy |
 |---|---|---|---|---|
 | `evidence.ingested` | `ingestion` | Index new evidence for correlation candidacy | `evidence_id` (inbox check alone is sufficient — indexing is naturally idempotent per-item) | Standard |
-| `evidence.linked_to_case` | `case_management` | Mark evidence eligible for this case's correlation runs | `(case_id, evidence_id)` | Standard |
-| `evidence.unlinked_from_case` | `case_management` | Mark evidence ineligible; does not retroactively invalidate already-`confirmed` relationships | `(case_id, evidence_id)` | Standard |
-| `threat_intel.ioc_matched` | `threat_intel` | Consider the match as correlation input for the case owning the matched evidence | `(ioc_id, matched_evidence_id)` | Standard |
+| `evidence.linked_to_case` | `case_management` | Mark evidence eligible for this case's correlation runs; project the entities it mentions and the relationships it supports into that case's graph (ADR-0013) | `(case_id, evidence_id)` — the projection upserts per `(case_id, entity_id)`/`(case_id, relationship_id)` | Standard |
+| `evidence.unlinked_from_case` | `case_management` | Mark evidence ineligible; does not retroactively invalidate already-`confirmed` relationships, and does not retract projected graph rows (the projection holds no per-evidence provenance — see ADR-0013) | `(case_id, evidence_id)` | Standard |
+| `threat_intel.ioc_matched` | `threat_intel` | Record the indicator as a CEM §7 `digital_asset` entity grounded by a CEM §11 MENTIONS edge to the matched evidence; associate it (`associated_with`, CEM §8) with entities the same evidence mentions; announce each new finding as `investigation.correlation_generated` for every case the evidence is linked to | `(ioc_id, matched_evidence_id)`, enforced on this side as `(entity_id, evidence_id)` — the indicator entity is resolved from the IOC's value, so the pair is the same fact | Standard |
+| `investigation.correlation_generated` | `investigation` (own) | Project the announced entity or relationship, and the relationship's endpoints, into the case's graph | `(case_id, entity_id)` / `(case_id, relationship_id)` — an `ON CONFLICT DO UPDATE` upsert, so redelivery converges | Standard |
+| `investigation.finding_reviewed` | `investigation` (own) | Fold the disposition into every case graph showing that relationship | `relationship_id` — keyed on the relationship alone, since one disposition is one fact about one finding, not a per-case opinion | Standard |
 
 ### 25.9 `notification`
 

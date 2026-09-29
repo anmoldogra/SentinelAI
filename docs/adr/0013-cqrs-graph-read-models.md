@@ -9,7 +9,7 @@ event delivery to build projections), in place since Wave 2.2.
 |---|---|
 | §1 Separate read model, updated from integration events | **Built** — `investigation_read` schema, `case_graph_nodes` / `case_graph_edges` |
 | §1 Case subgraph projection | **Built** — and it closes `get_case_graph`, deferred since Phase 8 |
-| §1 Depth-bounded entity neighbourhood | **Built** as the traversal; **inert in practice** — see "what bounds `depth`" |
+| §1 Depth-bounded entity neighbourhood | **Built** as the traversal; still **inert in practice** — see "what bounds `depth`" |
 | §1 `status=proposed` review queue projection | **Not built** — the existing `list_relationships(status=...)` query serves it from the write side and is not a measured bottleneck |
 | §1 Case/finding statistics projection | **Not built** — no endpoint consumes one |
 | §2 Projections disposable and rebuildable from the event log | **Built** — proven by a drop-and-replay test, not asserted |
@@ -102,13 +102,28 @@ than overwritten, so replay *order* cannot demote a seed and silently change wha
 `correlation_generated` was generated for a case from evidence linked to it, so both endpoints are
 directly evidenced: hop zero.
 
-That is the only event that adds nodes, so **every projected node is a seed**, and a read at depth 1,
-2 or 3 returns the same subgraph — the case's own findings, which is exactly what §6's default
-(`depth=1`) should return. `depth` begins to discriminate when the projection also holds edges
-reaching *outside* the case's findings, and feeding those needs an entity-level projection event that
-§25.8 does not define. The traversal is built anyway because it is §3's decision and because it makes
-`depth` correct on the day those edges arrive rather than a migration away from it. Inventing an event
-to close the gap would violate `CLAUDE.md` rule 1.
+**Updated (the threat-intel loop).** §25.8's `entity_id` variant of `correlation_generated` is now
+produced — `investigation`'s `threat_intel.ioc_matched` consumer publishes it for each matched
+indicator, and `evidence.linked_to_case` projects what an evidence item already grounds into a case
+it is linked to afterwards. So the projection no longer holds only correlation-job output, and the
+entity-level projection this section said §25.8 did not define turned out to be the variant §25.8
+already specified.
+
+**`depth` still does not discriminate, and saying otherwise would be wrong.** Every node the
+projection holds is still a seed: a matched indicator is mentioned by evidence linked to the case, and
+so is every entity it is associated with, so all of them are hop zero. A read at depth 1, 2 or 3
+returns the same subgraph — the case's own findings, which is exactly what §6's default (`depth=1`)
+should return.
+
+What would change that is an edge reaching an entity *not* grounded in the case's evidence — threat
+actor attribution is the obvious one: the actor a matched indicator belongs to is a real entity one
+hop out, and `threat_intel.iocs.threat_actor_id` already records the attribution. It is not built
+because the relationship would have no honest `supporting_evidence_ids`: the case's evidence shows the
+indicator, not the attribution, whose provenance is the feed — and CEM §13 rejects a relationship
+without ≥1 supporting evidence. Closing it needs the IOC published into the CEM as its own evidence
+object (`iocs.evidence_id`, §3.3, still null), which is a separate increment. The traversal remains
+built ahead of that because it is §3's decision and because it makes `depth` correct on the day those
+edges arrive rather than a migration away from it.
 
 ### Two bugs the work surfaced
 

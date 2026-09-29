@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from fastapi import Depends
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.modules.investigation.models import (
@@ -57,6 +57,27 @@ class EntityRepository:
             stmt = stmt.where(Entity.entity_id > cursor_id)
         stmt = stmt.order_by(Entity.entity_id).limit(limit + 1)
         return (await self._session.execute(stmt)).scalars().all()
+
+    async def find_by_type_and_name(self, entity_type: str, canonical_name: str) -> Entity | None:
+        """The one entity of this type with this canonical name, or ``None``.
+
+        Entity resolution for the machine-created path: a `digital_asset` *is* its value, so the
+        same indicator arriving from two feeds, or matching two evidence items, must converge on one
+        node rather than littering the graph with duplicates of one domain.
+
+        Deliberately **not** backed by a unique constraint. Canonical names are not unique in
+        general — two people can both be "John Smith", and CEM §7's entity taxonomy has no
+        identifier that would separate them — so uniqueness belongs to the caller's type, not the
+        table. ``limit(1)`` rather than ``scalar_one_or_none`` for that reason: a pre-existing pair
+        of duplicates must not turn a match into a 500.
+        """
+        result = await self._session.execute(
+            select(Entity)
+            .where(Entity.entity_type == entity_type, Entity.canonical_name == canonical_name)
+            .order_by(Entity.entity_id)
+            .limit(1)
+        )
+        return result.scalars().first()
 
     async def list_by_evidence_ids(self, evidence_ids: Sequence[UUID]) -> Sequence[Entity]:
         if not evidence_ids:
@@ -123,6 +144,35 @@ class RelationshipRepository:
         )
         return result.scalars().all()
 
+    async def find_between(
+        self, *, rel_type: str, first_entity_id: UUID, second_entity_id: UUID
+    ) -> Relationship | None:
+        """An existing relationship of this type between these two entities, either way round.
+
+        Direction-insensitive because the caller creates ``associated_with``, which CEM §8 types
+        "Any to Any" and which this module stores with ``directional = False``: A-to-B and B-to-A
+        are one edge, and matching only on the stored order would produce a second one.
+        """
+        result = await self._session.execute(
+            select(Relationship)
+            .where(
+                Relationship.type == rel_type,
+                or_(
+                    and_(
+                        Relationship.from_entity_id == first_entity_id,
+                        Relationship.to_entity_id == second_entity_id,
+                    ),
+                    and_(
+                        Relationship.from_entity_id == second_entity_id,
+                        Relationship.to_entity_id == first_entity_id,
+                    ),
+                ),
+            )
+            .order_by(Relationship.relationship_id)
+            .limit(1)
+        )
+        return result.scalars().first()
+
     async def list_by_evidence_ids(self, evidence_ids: Sequence[UUID]) -> Sequence[Relationship]:
         if not evidence_ids:
             return []
@@ -171,6 +221,22 @@ class EntityMentionRepository:
     async def add(self, mention: EntityEvidenceMention) -> None:
         self._session.add(mention)
         await self._session.flush()
+
+    async def exists_for_pair(self, *, entity_id: UUID, evidence_id: UUID) -> bool:
+        """Whether this evidence already mentions this entity — §25.8's business idempotency key.
+
+        The cheap half of the guarantee ``uq_entity_mention_pair`` enforces: this keeps a
+        redelivered or replayed match quiet, the index makes a concurrent one impossible.
+        """
+        result = await self._session.execute(
+            select(EntityEvidenceMention.mention_id)
+            .where(
+                EntityEvidenceMention.entity_id == entity_id,
+                EntityEvidenceMention.evidence_id == evidence_id,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def list_for_entity(self, entity_id: UUID) -> Sequence[EntityEvidenceMention]:
         result = await self._session.execute(

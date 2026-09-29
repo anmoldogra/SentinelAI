@@ -4,6 +4,8 @@ Covers the full path the ADR promises: a domain command writes a relationship an
 one transaction, the dispatcher delivers it, the projector writes `investigation_read`, and the
 traversal serves the subgraph. Then the parts that only a real database can settle:
 
+* both variants of `correlation_generated` — §25.8's "one of `relationship_id`/`entity_id`" —
+  and the link-time projection that places already-grounded findings into a newly linked case;
 * the **recursive CTE** actually terminates on a cyclic graph and honours `depth`;
 * **idempotency** — the same event delivered twice leaves one row, not two, and not a corrupted one;
 * filters are applied **before** traversal, so an excluded edge cannot act as a bridge.
@@ -35,11 +37,14 @@ from sentinelai.modules.investigation.models import (
     STATUS_PROPOSED,
     STATUS_REJECTED,
     Entity,
+    EntityEvidenceMention,
     Relationship,
+    RelationshipEvidence,
 )
 from sentinelai.modules.investigation.read.models import CaseGraphEdge, CaseGraphNode
 from sentinelai.modules.investigation.read.projector import (
     project_correlation_generated,
+    project_evidence_linked,
     project_finding_reviewed,
 )
 from sentinelai.modules.investigation.read.repository import GraphProjectionRepository
@@ -95,6 +100,8 @@ async def _create_tables(engine: AsyncEngine) -> None:
             tables=[
                 Entity.__table__,
                 Relationship.__table__,
+                EntityEvidenceMention.__table__,
+                RelationshipEvidence.__table__,
                 CaseGraphNode.__table__,
                 CaseGraphEdge.__table__,
             ],
@@ -698,3 +705,138 @@ async def test_a_case_projection_can_be_dropped_and_rebuilt(
 
     assert {n.entity_id for n in after_nodes} == {n.entity_id for n in before_nodes}
     assert {e.relationship_id for e in after_edges} == {e.relationship_id for e in before_edges}
+
+
+# --- the entity variant and the link-time path ------------------------------
+async def _project_entity_finding(
+    db: async_sessionmaker[AsyncSession], case_id: UUID, entity: Entity
+) -> None:
+    """Run the projector for the `entity_id` variant of `correlation_generated` (§25.8)."""
+    async with db() as session:
+        await project_correlation_generated(
+            _event(
+                "investigation.correlation_generated",
+                {
+                    "case_id": str(case_id),
+                    "entity_id": str(entity.entity_id),
+                    "confidence": str(entity.confidence),
+                },
+            ),
+            InvestigationUnitOfWork(session),
+        )
+        await session.commit()
+
+
+async def _project_link(
+    db: async_sessionmaker[AsyncSession], case_id: UUID, evidence_id: UUID
+) -> None:
+    async with db() as session:
+        await project_evidence_linked(
+            _event(
+                "evidence.linked_to_case",
+                {"case_id": str(case_id), "evidence_id": str(evidence_id)},
+            ),
+            InvestigationUnitOfWork(session),
+        )
+        await session.commit()
+
+
+async def test_the_entity_variant_projects_a_seed_node_with_no_edge(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    """§25.8 permits `entity_id` in place of `relationship_id`, and `on_ioc_matched` now sends it.
+
+    A node with no edge is the correct projection of a single grounded entity — a matched indicator
+    relates to nothing until something else in the case's evidence does. Projecting a placeholder
+    edge would put a relationship in a legal record that no evidence supports (CEM §13).
+    """
+    case_id = uuid4()
+    indicator = _entity("evil-c2.example", entity_type="digital_asset", confidence="1.000")
+    await _seed(db, [indicator], [])
+
+    await _project_entity_finding(db, case_id, indicator)
+
+    nodes, edges = await _read(db, case_id)
+    assert [n.canonical_name for n in nodes] == ["evil-c2.example"]
+    assert nodes[0].is_seed is True, "a matched indicator is directly evidenced: hop zero"
+    assert nodes[0].entity_type == "digital_asset"
+    assert edges == []
+
+
+async def test_a_payload_with_neither_id_is_skipped_not_dead_lettered(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    """§25.8's "one of" means one is required: neither id projects nothing, and does not raise."""
+    case_id = uuid4()
+    async with db() as session:
+        await project_correlation_generated(
+            _event("investigation.correlation_generated", {"case_id": str(case_id)}),
+            InvestigationUnitOfWork(session),
+        )
+        await session.commit()
+
+    assert await _read(db, case_id) == ([], [])
+
+
+async def test_linking_evidence_projects_what_it_already_grounds(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    """The ordering half of the bridge: findings recorded before the link still reach the case.
+
+    Without this the common real sequence — evidence ingested and matched in seconds, linked to a
+    case later — would leave the match recorded on the write side and permanently absent from the
+    read model, with no event left to replay that would place it.
+    """
+    case_id, evidence_id = uuid4(), uuid4()
+    a, b = _entity("A"), _entity("B")
+    rel = _relationship(a, b)
+    await _seed(db, [a, b], [rel])
+    async with db() as session:
+        session.add(EntityEvidenceMention(entity_id=a.entity_id, evidence_id=evidence_id))
+        session.add(
+            RelationshipEvidence(relationship_id=rel.relationship_id, evidence_id=evidence_id)
+        )
+        await session.commit()
+
+    await _project_link(db, case_id, evidence_id)
+
+    nodes, edges = await _read(db, case_id)
+    assert {n.canonical_name for n in nodes} == {"A", "B"}, (
+        "the edge's far endpoint is projected too, so §6's self-containment holds"
+    )
+    assert [e.relationship_id for e in edges] == [rel.relationship_id]
+    assert all(n.is_seed for n in nodes)
+
+
+async def test_linking_the_same_evidence_twice_converges(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Redelivery reaches an upsert, not an insert — the second half of ADR-0013's doubled
+    idempotency, which has to hold on its own because a replay clears the inbox."""
+    case_id, evidence_id = uuid4(), uuid4()
+    a, b = _entity("A"), _entity("B")
+    rel = _relationship(a, b)
+    await _seed(db, [a, b], [rel])
+    async with db() as session:
+        session.add(EntityEvidenceMention(entity_id=a.entity_id, evidence_id=evidence_id))
+        session.add(
+            RelationshipEvidence(relationship_id=rel.relationship_id, evidence_id=evidence_id)
+        )
+        await session.commit()
+
+    await _project_link(db, case_id, evidence_id)
+    await _project_link(db, case_id, evidence_id)
+
+    nodes, edges = await _read(db, case_id)
+    assert (len(nodes), len(edges)) == (2, 1)
+
+
+async def test_linking_evidence_that_grounds_nothing_projects_nothing(
+    db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Ordinary, not an error: most evidence mentions no entity until something extracts one."""
+    case_id = uuid4()
+
+    await _project_link(db, case_id, uuid4())
+
+    assert await _read(db, case_id) == ([], [])

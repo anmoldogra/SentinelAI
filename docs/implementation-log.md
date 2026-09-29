@@ -3327,3 +3327,233 @@ to *other* evidence, which is a different relationship.
 the matches are recorded and announced but do not yet become graph edges. That handler is the next
 increment, and it is what would put non-seed edges into the Wave 4.1 projection and finally make
 `depth` mean something.
+
+---
+
+## 2026-09-29 — IC-043: the closed intelligence loop — `ioc_matched` becomes a case-graph finding
+
+**Type:** the increment IC-042 named as next. `investigation`'s `on_ioc_matched` was a deferred
+no-op, so a threat-intel match was recorded and announced and then went nowhere. It now produces
+graph findings, the Wave 4.1 projector consumes them, and `GET /api/v1/cases/{case_id}/graph`
+returns them. One migration (a unique index), one new pure module (`payloads.py`), two handlers that
+stopped being no-ops.
+
+### A match is a node, not an edge to the evidence — and that is the model, not a shortcut
+
+The task asked for an "`ioc_matched` edge linking the IOC entity to the evidence item". Three
+documents say that shape does not exist, and the third is the one that decides it:
+
+* **CEM §11** gives the graph one node type — `Entity` — and types its edges *between entities*.
+  Evidence appears as a MENTIONS edge from "a lightweight `Evidence` reference node", not as a node
+  the relationship layer can reach.
+* **CEM §8's relationship vocabulary is closed** and holds no `ioc_matched` type. Adding one would
+  be `CLAUDE.md` rule 1 ("never invent an endpoint, event, table, or field") and would also make the
+  value unfilterable by any client written against the contract.
+* **api-design.md §6's response body is `{ entities, relationships }`** and nothing else. An evidence
+  node would have nowhere to be returned, so an edge pointing at one could never be resolved by a
+  caller — which is precisely what §6's self-containment guarantee forbids.
+
+So "indicator I is present in evidence E" lands as a **`digital_asset` entity** (CEM §7's type,
+verbatim: "A file, domain, IP, URL, or indicator") **grounded by a MENTIONS row** — which is also
+what satisfies CEM §13's rule that a non-analyst entity needs ≥1 MENTIONS edge to exist at all. It
+is a node, because an edge needs two entities and a single match supplies one.
+
+**Where the edge does come from.** If the same evidence item mentions another entity, the two
+co-occur in it — and CEM §10 names "co-occurrence within the same evidence item" as a
+relationship-inference target, which CEM §8 types `associated_with` ("Any ↔ Any", "generic, weighted
+association where a more specific type doesn't apply"). That edge is grounded in the matched evidence
+**honestly**: the evidence genuinely shows both. Today the usual case is two indicators in one
+report — a C2 domain and a dropper hash — which is real intelligence an analyst wants. When an
+extraction layer starts writing mentions, the same code relates an indicator to the people and
+accounts named beside it, with no change here.
+
+The confidence on that edge is the one number in this increment no document fixes, and it is flagged
+as an assumption in the code: `0.500`. The co-occurrence is *certain*; what it implies about the two
+being related is not, which is why §8 calls the type "weighted" and why the finding is `proposed` for
+an analyst to dispose of (PRD FR-7.3). A real weight belongs to the correlation run's model.
+
+**What is deliberately not built**: the threat-actor edge. `iocs.threat_actor_id` already records
+the attribution, and the actor is a genuine entity one hop out — the first thing that would make
+`depth` mean something. It is not built because the relationship would have **no honest supporting
+evidence**: the case's evidence shows the indicator, not the attribution, whose provenance is the
+feed. CEM §13 rejects a relationship without ≥1 supporting evidence, and inventing one would be a
+provenance lie in a legal record. It unblocks when an IOC is published into the CEM as its own
+evidence object (`iocs.evidence_id`, §3.3 — still null).
+
+### Correcting IC-042: this does **not** make `depth` mean something
+
+IC-042 closed by saying this handler "is what would put non-seed edges into the Wave 4.1 projection
+and finally make `depth` mean something". That was wrong, and ADR-0013 now says so in the same
+breath as recording what did change. Every node the projection holds is still a seed: a matched
+indicator is mentioned by evidence linked to the case, and so is every entity it associates with, so
+all of them are hop zero. `depth` 1, 2 and 3 still return the same subgraph. The thing that would
+change it is the threat-actor edge above.
+
+### Both orderings, because the common one is the awkward one
+
+`on_ioc_matched` announces a finding per case the evidence is linked to **at match time**. The
+common real sequence is the other way round: evidence is ingested and scanned within seconds, and an
+analyst links it to a case minutes or days later. Without a second path every match that arrived
+before the link would be invisible in that case **forever** — recorded on the write side, absent from
+the read model, and with no event left to replay that would place it.
+
+So `evidence.linked_to_case` stopped being a no-op too. §25.8's action for it is "mark evidence
+eligible for this case's correlation runs" and §3.5 defines no eligibility table, but the useful half
+of that sentence is expressible in a CQRS world: the case's graph should now show the entities this
+evidence mentions and the relationships it supports. It **projects directly rather than publishing**,
+because nothing was found — those rows already existed and were already announced when they were
+created. A rebuild replays the same `case_management` event and reconstructs the same projection,
+which is the property ADR-0013 §2 requires.
+
+A match on evidence belonging to **no** case writes the entity and its MENTIONS row and publishes
+nothing, because `case_id` is required in §25.8's `correlation_generated` payload — there is no
+case-less form of the event, and the fact is about evidence rather than about a case. The link-time
+projection is what places it later.
+
+`evidence.unlinked_from_case` stays a no-op, and this one is a recorded gap rather than a decision:
+retracting what an unlinked evidence item contributed needs per-evidence provenance in the
+projection, and `investigation_read` holds none — a node can be grounded by several evidence items,
+so "drop what this one brought" is not answerable from the rows. §25.8 also states the write-side
+rule that an unlink does not invalidate already-`confirmed` relationships, so deleting projected rows
+would contradict it. The projection is rebuildable, so the fix is a provenance column or a case
+rebuild — a documented decision, not a handler detail.
+
+### Two defects the loop surfaced, both in code shipped last increment
+
+**`threat_intel.ioc_matched` was publishing an incomplete payload.** §25's payload schema for it
+marks five fields required; the publisher sent three. `indicator_type` and `matched_at` were missing —
+and `indicator_type` is exactly what the new consumer needs, so the loop would have been building
+graph nodes from a payload the document already said should carry it. §25.4's catalog row lists only
+three "key fields", which is what the implementation followed; the payload schema table is the
+contract. Fixed, and the existing match test now asserts both fields.
+
+**No handler-published event was setting `causation_id`.** §11 requires it ("the event/request that
+directly caused this one") and §11's *worked example* is this exact chain —
+`evidence.ingested → threat_intel.ioc_matched → investigation.correlation_generated`, "same
+`correlation_id`, new `causation_id`". Without it the causal chain an auditor walks is broken at the
+first hop. Fixed for `ioc_matched` and set on the new `correlation_generated` publishes. **Still
+missing in `notification`**, whose publishes go through `NotificationService` methods that receive a
+`correlation_id` string and never see the envelope — threading it through is a signature change
+across several call sites and belongs in its own increment. Recorded here rather than half-done.
+
+A service-level publish (one caused by an HTTP request, not by an event) correctly leaves it `NULL`:
+§11 makes the field nullable precisely because there is no causing event id to point at.
+
+### §25.8's catalog was missing two subscriptions Wave 4.1 added
+
+ADR-0013 made `investigation` consume its own `correlation_generated` and `finding_reviewed`, and
+`CLAUDE.md` requires a new subscription to be added to §25's catalog **in the same change**. It was
+not. Both rows are recorded now, with the reason a module consuming its own events is deliberate, and
+the module's consumed count corrected from 4 to 6.
+
+### The cross-module reads, and why two of them are functions
+
+`investigation` needs two things no event carries, and both are the §174 "thin event + reference"
+fetch the document prescribes:
+
+* **the indicator's value** — `ioc_matched` carries the IOC's *id* and type, not its value, so
+  `threat_intel.public` gained `read_ioc`. A payload field would have been a MINOR bump (§7) to a
+  contract the document pins at five required fields, and would put indicator values on the bus that
+  §21 asks us to keep off it where a fetch will do.
+* **which cases hold the evidence** — no evidence-bearing event carries a case, correctly, since the
+  link is `case_management`'s fact and can change after the event. `case_management.public` gained
+  `read_cases_for_evidence`, which returns the case **and its owner**, because
+  `correlation_generated` carries `recipient_user_id` (§25.8) — a consumer that could not name one
+  would publish a finding nobody is told about.
+
+Both are **functions over a session, not service methods**, exactly like
+`ingestion.public.read_evidence_attributes`: the dispatcher hands a handler a session and a signed
+outbox, while `ThreatIntelService` and `CaseService` need a KMS (and storage) for audit and reports.
+Neither takes an actor, and that is not an authorization hole — no principal is asking, and a consumer
+that fabricated one would be lying to every audit path it reached. Nothing they return reaches a user
+un-gated: the graph read re-checks ADR-0017's case access on every request, which one of the new tests
+asserts directly.
+
+`import-linter` keeps both honest: `investigation` sits above `case_management` and `threat_intel` in
+§5's DAG, so the imports are legal, and they go through `public.py` — never a model, a repository or a
+table.
+
+### The writes happen on the consumer path, and a match is still not audited
+
+Entities, MENTIONS rows and associations are created in `events.py`, not through
+`InvestigationService`, for the reason IC-042 established for `threat_intel`: every method on that
+service is an audited user action requiring a KMS the dispatcher does not provide. And a match is not
+a user action — `platform.audit_log` records what principals did, and no principal did this. One of
+the tests asserts exactly that: after a full loop the audit log holds the two IOC *registrations* and
+nothing else. The findings carry `actor_type="system"` and no `actor_ref`.
+
+### Idempotency, at both layers §12 requires
+
+`(ioc_id, matched_evidence_id)` is §25.8's business key, and it lands here as
+`(entity_id, evidence_id)` — the indicator entity is resolved from the IOC's value, so the pair is the
+same fact. Checked before inserting **and** enforced by a new unique index, `uq_entity_mention_pair`.
+
+The index is the half the check cannot provide: two dispatchers can both pass the check, and only one
+insert then succeeds. It is worth a migration because a duplicate MENTIONS row is not bookkeeping — it
+would double-count the evidence grounding a finding under CEM §13. It is also simply *true* of the
+table as §3.5 models it: there is no offset, span or count that could distinguish two rows for one
+pair, so "this evidence mentions this entity" is set membership.
+
+The fan-out is **capped at 25** co-mentioned entities per match, logged when it bites. `attributes`
+are connector-supplied and a future extraction layer will write many mentions per evidence item;
+without a bound one crowded report could turn a single match into a review queue nobody can work
+through.
+
+### Tests
+
+**33 new** — 16 unit, 12 end-to-end against real Postgres, 5 on the projector.
+
+The end-to-end file has no fakes in the middle of the chain: a signed `evidence.ingested` row goes
+into `ingestion`'s outbox, the **real dispatcher** in `VERIFY_STRICT` claims and verifies it,
+`threat_intel` matches and publishes, the dispatcher verifies *that*, `investigation` writes findings
+and publishes, the projector writes `investigation_read`, and the assertion is an HTTP `GET` on the
+real route. Because the dispatcher runs in strict mode, every assertion that a handler ran is also an
+assertion that the event it ran on **verified** under `EVENT_ROOT` — a forged one would be
+`dead_letter` with its handler never invoked.
+
+It covers the two idempotency layers separately, which matters because they fail differently: a
+redelivered `event_id` (inbox), and a **replay that clears the inbox** and re-delivers, where the
+business key is the only thing standing between an operator's re-scan and a second copy of every
+indicator in the graph. Plus the unique index holding when a duplicate is inserted behind the check,
+the link-after-match ordering, one indicator in two evidence items staying one node, and a withdrawn
+IOC projecting nothing rather than dead-lettering.
+
+The unit file uses in-memory repositories to reach the decisions the loop cannot isolate: malformed
+payloads, an unparseable confidence, no case links, several case links, and the fan-out cap (asserted
+through the real constant, so raising it is a deliberate edit in one place).
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (241 source files), import-linter (2/2 kept). Full suite
+**1487 passed / 2 skipped**. Migration round-trip green including the new index.
+
+**Coverage — a pre-existing CI failure this increment found and did not cause.** The gate CI runs is
+`pytest tests/unit --cov=sentinelai.platform --cov-fail-under=90`, and it reports **84.65%**. Verified
+pre-existing by stashing this work: byte-identical, 3675 statements and 564 missed either way. The
+**96%** figure reported in earlier increments is the same measurement over the *whole* suite, which is
+the number that reflects the intent ("≥90% on platform") — the missing statements are almost entirely
+`platform/admin/*` (0% under unit-only), `auth/repository.py` (39%) and `idempotency/guard.py` (39%),
+all of which are covered, by integration tests that CI runs in a different job with no coverage flag.
+So the code is tested and the *command* measures the wrong suites. Left as found, and flagged: the fix
+is either to attach the floor to the job that has a database, or to write DB-mocked unit tests for
+code whose whole job is SQL — and choosing between those is not a decision to make silently inside an
+unrelated increment.
+
+### Carried forward
+
+**`depth` still returns the same subgraph at 1, 2 and 3**, per the correction above. The threat-actor
+edge is what changes that, and it is blocked on publishing an IOC into the CEM.
+
+**Unlinking evidence does not retract projected graph rows** — recorded above, needs a provenance
+column or a rebuild.
+
+**`notification` still publishes without `causation_id`**, breaking §11's chain at its last hop.
+
+**No notification is raised for a matched indicator.** `notification`'s `correlation_generated`
+handler requires a `relationship_id` and ignores the entity variant, so the case owner is told about
+the association but not about the indicator on its own. §25.9's idempotency key for that handler is
+relationship-based, so extending it needs a documented key for the entity variant rather than a
+guess.
+
+**`forensics` and `social_media` are still scaffolds**, and there is still no feed transport and no
+retro-scan on IOC registration (IC-042).
