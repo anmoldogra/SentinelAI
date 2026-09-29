@@ -772,7 +772,7 @@ This is the API surface implementing the platform's core differentiator (PRD §6
 | Validation Rules | Case must have ≥1 linked evidence item |
 | Response Body | `{ run_id, status: "queued" }` |
 | Success Codes | 202 (`Location: /api/v1/correlation-runs/{run_id}`) |
-| Error Codes | 400, 401, 403, 404, 409 (a run is already in progress for this case) |
+| Error Codes | 400, 401, 403, 404, 409 (a run is already in progress for this case), 422 (the case has no linked evidence, or `scope.evidence_ids` names evidence not linked to it) |
 | Authentication | Required |
 | Authorization | `investigator` or `supervisor`, case-scoped |
 | Idempotency | `Idempotency-Key` required |

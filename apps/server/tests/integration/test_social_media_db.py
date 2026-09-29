@@ -398,7 +398,11 @@ async def test_capturing_from_an_unmonitored_handle_does_not_enrol_it(
     ("override", "field"),
     [
         ({"content_kind": "tweet"}, "content_kind"),
-        ({"captured_at": _NOW + timedelta(days=1)}, "captured_at"),
+        # Relative to the **real** clock, not to `_NOW`. `validate_captured_at` compares against
+        # `datetime.now(UTC)`, so a fixed "tomorrow" pinned to the fixture's date stops being in
+        # the future the moment the wall clock passes it — a test that quietly starts failing on a
+        # calendar boundary rather than on a code change.
+        ({"captured_at": datetime.now(UTC) + timedelta(days=1)}, "captured_at"),
     ],
     ids=["unknown-kind", "future-capture"],
 )

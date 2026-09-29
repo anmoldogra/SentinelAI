@@ -33,6 +33,11 @@ from sentinelai.platform.events.signing import EventSigner
 
 _SCHEMA = "ingestion"
 
+# Ids per statement when reading a set. Far under asyncpg's 32767-parameter ceiling, and
+# small enough that one chunk is a cheap index scan rather than a plan the optimizer gives up
+# on.
+_ID_CHUNK = 500
+
 
 class EvidenceRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -47,6 +52,32 @@ class EvidenceRepository:
     async def add(self, evidence: Evidence) -> None:
         self._session.add(evidence)
         await self._session.flush()
+
+    async def list_by_ids(self, evidence_ids: Sequence[UUID]) -> Sequence[Evidence]:
+        """Every evidence row in the given set, in id order, **read in bounded chunks**.
+
+        Chunked because asyncpg caps a single statement at 32767 bind parameters, and the caller is
+        a correlation run over a whole case's linked evidence — a set with no documented ceiling.
+        One `IN (...)` over it would work for years and then fail with an `InterfaceError` on the
+        first case large enough, which is the worst possible time to discover the limit.
+
+        Ordered by id so two reads of the same set come back in the same order; a correlation run
+        caps what it extracts per item, and a cap applied to an unstable order would make the run's
+        output depend on how Postgres felt about the query plan.
+        """
+        if not evidence_ids:
+            return []
+        rows: list[Evidence] = []
+        unique = sorted(set(evidence_ids))
+        for start in range(0, len(unique), _ID_CHUNK):
+            chunk = unique[start : start + _ID_CHUNK]
+            result = await self._session.execute(
+                select(Evidence)
+                .where(Evidence.evidence_id.in_(chunk))
+                .order_by(Evidence.evidence_id)
+            )
+            rows.extend(result.scalars().all())
+        return rows
 
     async def exists(self, evidence_id: UUID) -> bool:
         result = await self._session.execute(

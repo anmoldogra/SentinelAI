@@ -378,6 +378,20 @@ class _FakeByIdRepo:
         return rows[: limit + 1]
 
 
+class _FakeEntityRepo(_FakeByIdRepo):
+    def __init__(self) -> None:
+        super().__init__("entity_id")
+
+    async def find_by_type_and_name(self, entity_type: str, canonical_name: str) -> Any:
+        rows = [
+            r
+            for r in self.store.values()
+            if r.entity_type == entity_type and r.canonical_name == canonical_name
+        ]
+        rows.sort(key=lambda r: r.entity_id)
+        return rows[0] if rows else None
+
+
 class _FakeRelRepo(_FakeByIdRepo):
     async def list_for_entity(self, entity_id: UUID) -> Sequence[Any]:
         return [
@@ -385,6 +399,44 @@ class _FakeRelRepo(_FakeByIdRepo):
             for r in self.store.values()
             if r.from_entity_id == entity_id or r.to_entity_id == entity_id
         ]
+
+    async def find_between(
+        self, *, rel_type: str, first_entity_id: UUID, second_entity_id: UUID
+    ) -> Any:
+        pair = {first_entity_id, second_entity_id}
+        rows = [
+            r
+            for r in self.store.values()
+            if r.type == rel_type and {r.from_entity_id, r.to_entity_id} == pair
+        ]
+        rows.sort(key=lambda r: r.relationship_id)
+        return rows[0] if rows else None
+
+
+class _FakeCorrelationRunRepo(_FakeByIdRepo):
+    """``CorrelationRunRepository``'s two extra queries.
+
+    ``is_cancellation_requested`` reads the stored object rather than caching a value, mirroring why
+    the real one is a fresh `SELECT`: the flag is set by somebody else while a run is in flight, so
+    a fake that answered from a snapshot would let the cancellation test pass without the production
+    code ever re-reading anything.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("run_id")
+
+    async def find_in_progress_for_case(self, case_id: UUID) -> Any:
+        rows = [
+            r
+            for r in self.store.values()
+            if r.case_id == case_id and r.status in {"queued", "running"}
+        ]
+        rows.sort(key=lambda r: r.run_id)
+        return rows[0] if rows else None
+
+    async def is_cancellation_requested(self, run_id: UUID) -> bool:
+        run = self.store.get(run_id)
+        return bool(run is not None and run.cancellation_requested)
 
 
 class _FakeListRepo:
@@ -400,17 +452,24 @@ class _FakeListRepo:
     async def list_for_relationship(self, relationship_id: UUID) -> Sequence[Any]:
         return [i for i in self.items if getattr(i, "relationship_id", None) == relationship_id]
 
+    async def exists_for_pair(self, *, entity_id: UUID, evidence_id: UUID) -> bool:
+        return any(
+            getattr(i, "entity_id", None) == entity_id
+            and getattr(i, "evidence_id", None) == evidence_id
+            for i in self.items
+        )
+
 
 class FakeInvestigationUnitOfWork:
     def __init__(self) -> None:
         self.session = SimpleNamespace()
-        self.entities = _FakeByIdRepo("entity_id")
+        self.entities = _FakeEntityRepo()
         self.entity_revisions = _FakeListRepo()
         self.relationships = _FakeRelRepo("relationship_id")
         self.relationship_revisions = _FakeListRepo()
         self.relationship_evidence = _FakeListRepo()
         self.entity_mentions = _FakeListRepo()
-        self.correlation_runs = _FakeByIdRepo("run_id")
+        self.correlation_runs = _FakeCorrelationRunRepo()
         self.outbox = _FakeOutbox()
         self.commits = 0
 

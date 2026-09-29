@@ -7,9 +7,11 @@ only becomes ``confirmed``/``rejected`` by an explicit analyst action, guarded b
 
 Lifecycle (database-design.md §3.5): ``proposed → confirmed | rejected``; a finding
 already dispositioned returns 409 (api-design.md §6 — "explicit re-open flow", which
-has no documented endpoint yet). Cross-domain correlation itself (``run_correlation``)
-is AI/LLM-driven and deferred; the write-paths it will call (``create_relationship``)
-are implemented here.
+has no documented endpoint yet).
+
+Cross-domain correlation is **built** (`correlation.py`, driven by `jobs.run_correlation`). What
+lives here is its API surface: ``trigger_correlation_run`` enforces api-design.md §6's two
+pre-conditions and queues the pass, ``get_correlation_run`` serves the poll.
 """
 
 from __future__ import annotations
@@ -23,14 +25,20 @@ from uuid import UUID
 
 from fastapi import Depends
 
+from sentinelai.modules.case_management.public import read_case_evidence_scope
 from sentinelai.modules.investigation.events import (
     EVENT_CORRELATION_GENERATED,
     EVENT_FINDING_REVIEWED,
 )
 from sentinelai.modules.investigation.exceptions import (
+    CaseNotFoundError,
+    CorrelationRunInProgressError,
     CorrelationRunNotFoundError,
     EntityNotFoundError,
     RelationshipNotFoundError,
+)
+from sentinelai.modules.investigation.models import (
+    RUN_QUEUED as STATUS_RUN_QUEUED,
 )
 from sentinelai.modules.investigation.models import (
     STATUS_CONFIRMED as _STATUS_CONFIRMED,
@@ -56,13 +64,13 @@ from sentinelai.modules.investigation.repository import (
     InvestigationUnitOfWork,
     get_investigation_uow,
 )
-from sentinelai.modules.investigation.schemas import EntityCreate
+from sentinelai.modules.investigation.schemas import CorrelationScope, EntityCreate
 from sentinelai.platform.auth.audit import record_audit_event
 from sentinelai.platform.auth.dependencies import CurrentUser
 from sentinelai.platform.crypto import get_kms
 from sentinelai.platform.crypto.kms import KeyManagementService
 from sentinelai.platform.tasks import TaskQueue
-from sentinelai.shared.exceptions import PreconditionFailedError
+from sentinelai.shared.exceptions import PreconditionFailedError, ValidationFailedError
 from sentinelai.shared.pagination import PageParams, decode_cursor, encode_cursor
 
 # The status vocabulary and the review machine belong to the finding aggregates (ADR-0011 §1,
@@ -224,6 +232,7 @@ class InvestigationService:
         created_by_ref: UUID,
         correlation_id: str,
         case_owner_user_id: UUID | None = None,
+        generated_by: str | None = None,
     ) -> Relationship:
         """Persist an AI-proposed relationship + its mandatory supporting evidence
         (CEM §13, ≥1) and announce it. Called by the correlation job (deferred).
@@ -260,7 +269,16 @@ class InvestigationService:
             payload={
                 "case_id": str(case_id),
                 "relationship_id": str(relationship.relationship_id),
+                "entity_id": None,
                 "confidence": str(confidence),
+                # §25's payload schema marks `generated_by` **required** ("model/run reference, per
+                # CEM §10's `created_by`"), and this publisher omitted it. §25.8's row lists only
+                # the "key fields", but the payload-schema table is the contract — the same
+                # discrepancy `threat_intel.ioc_matched` had. `created_by_ref` is what produced the
+                # finding, which for this path is whatever the caller names as the creating run or
+                # model.
+                "generated_by": generated_by
+                or f"investigation.create_relationship:{created_by_ref}",
                 "recipient_user_id": (
                     str(case_owner_user_id) if case_owner_user_id is not None else None
                 ),
@@ -343,19 +361,90 @@ class InvestigationService:
 
     # -- correlation runs ---------------------------------------------------
     async def trigger_correlation_run(
-        self, case_id: UUID, actor: CurrentUser, correlation_id: str, task_queue: TaskQueue
+        self,
+        case_id: UUID,
+        actor: CurrentUser,
+        correlation_id: str,
+        task_queue: TaskQueue,
+        *,
+        scope: CorrelationScope | None = None,
     ) -> CorrelationRun:
+        """Queue an AI correlation pass over a case's linked evidence — api-design.md §6.
+
+        Enforces §6's two documented pre-conditions, which the engine behind this now makes
+        meaningful:
+
+        * **"Case must have >= 1 linked evidence item."** A run over an empty case would claim
+        itself,
+          find nothing, publish ``correlation_run_completed`` with zero findings and tell the
+          analyst the correlation pass they asked for is done — when what actually happened is that
+          there was nothing to correlate. Refusing says so at the point the mistake was made.
+        * **409 when a run is already queued or running for this case.** Two runs walk the same
+          evidence with the same extractor; entity resolution converges them onto the same nodes,
+          but each announces its own ``correlation_generated`` per finding, so the case owner is
+          notified twice for one fact.
+
+        **422, not 400, for the evidence rules.** §2.4 splits `VALIDATION_FAILED` into "request
+        malformed (400)" and "fails domain/business rules (422)", and both of these are domain rules
+        — the request is perfectly well-formed, the case simply is not in a state to be correlated.
+        §6's error list for this endpoint names 400 and omits 422, which is an inconsistency in that
+        table rather than a different rule; it is recorded in the implementation log.
+
+        ``scope`` narrows the run to specific evidence (§6's request body). The ids are validated
+        **against the case's own links**, not merely for existence: a run scoped to another case's
+        evidence would read records this requester may have no grant over, and every finding it made
+        would be announced against the wrong ``case_id``.
+        """
+        linked = await read_case_evidence_scope(self._uow.session, case_id)
+        if linked is None:
+            raise CaseNotFoundError()
+        if not linked.evidence_ids:
+            raise ValidationFailedError(
+                [
+                    {
+                        "field": "case_id",
+                        "message": "a correlation run requires the case to have"
+                        " >= 1 linked evidence item",
+                    }
+                ]
+            )
+        in_progress = await self._uow.correlation_runs.find_in_progress_for_case(case_id)
+        if in_progress is not None:
+            raise CorrelationRunInProgressError(
+                f"correlation run {in_progress.run_id} is already"
+                f" {in_progress.status} for this case"
+            )
+        requested = _requested_evidence_ids(scope, linked.evidence_ids)
+
         run = CorrelationRun(
             case_id=case_id,
-            status="pending",
+            status=STATUS_RUN_QUEUED,
             started_at=None,
             completed_at=None,
             findings_generated_count=0,
             cancellation_requested=False,
         )
         await self._uow.correlation_runs.add(run)
-        await task_queue.enqueue_job("run_correlation", run.run_id)
-        await self._audit(actor, "correlation.requested", run.run_id, {"case_id": str(case_id)})
+        # The scope is an **execution parameter, not run state**: `database-design.md` §3.5 gives
+        # `correlation_runs` no column for it, and §6's poll response does not echo it. So it
+        # travels with the job rather than being invented as a column — and arq preserves a job's
+        # arguments across retries, so a re-attempt correlates the same narrowed set.
+        #
+        # `correlation_id` travels too, so §11's causal chain survives the queue hop: the events the
+        # worker publishes minutes later belong to the workflow this request started.
+        await task_queue.enqueue_job("run_correlation", run.run_id, correlation_id, requested)
+        await self._audit(
+            actor,
+            "correlation.requested",
+            run.run_id,
+            {
+                "case_id": str(case_id),
+                "evidence_scoped": requested is not None,
+                "evidence_count": len(requested)
+                if requested is not None
+                else len(linked.evidence_ids),
+            },
+        )
         return run
 
     async def get_correlation_run(self, run_id: UUID, actor: CurrentUser) -> CorrelationRun:
@@ -404,6 +493,36 @@ class InvestigationService:
             min_confidence=min_confidence,
             depth=depth,
         )
+
+
+def _requested_evidence_ids(
+    scope: CorrelationScope | None, linked: Sequence[UUID]
+) -> list[UUID] | None:
+    """The evidence a scoped run may read, or ``None`` for "the whole case".
+
+    ``None`` rather than the full list, so the worker re-reads the case's links when it runs instead
+    of correlating a snapshot taken at trigger time. A run queued behind a backlog may start minutes
+    later, and evidence linked in the meantime belongs in the pass the analyst asked for.
+
+    A scoped run is checked **against the case's own links**, and the failure names the offending
+    ids. Silently intersecting would be the dangerous alternative: a request naming ten items, two
+    of them another case's, would run over eight and report success.
+    """
+    if scope is None or scope.evidence_ids is None:
+        return None
+    permitted = set(linked)
+    requested = list(dict.fromkeys(scope.evidence_ids))
+    unlinked = [str(evidence_id) for evidence_id in requested if evidence_id not in permitted]
+    if unlinked:
+        raise ValidationFailedError(
+            [
+                {
+                    "field": "scope.evidence_ids",
+                    "message": f"not linked to this case: {', '.join(sorted(unlinked))}",
+                }
+            ]
+        )
+    return requested
 
 
 def _decode_id_cursor(cursor: str | None) -> UUID | None:

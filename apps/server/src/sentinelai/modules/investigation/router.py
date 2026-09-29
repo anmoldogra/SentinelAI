@@ -20,6 +20,7 @@ from sentinelai.modules.investigation.repository import (
     get_investigation_uow,
 )
 from sentinelai.modules.investigation.schemas import (
+    CorrelationRunCreate,
     CorrelationRunRead,
     EntityCreate,
     EntityMentionRead,
@@ -250,14 +251,27 @@ async def list_relationship_evidence(
 async def trigger_correlation_run(
     case_id: UUID,
     request: Request,
+    response: Response,
+    body: CorrelationRunCreate | None = None,
     current_user: CurrentUser = Depends(require_case_access()),
     service: InvestigationService = Depends(get_investigation_service),
     task_queue: TaskQueue = Depends(get_task_queue),
     uow: InvestigationUnitOfWork = Depends(get_investigation_uow),
 ) -> Envelope[CorrelationRunRead]:
+    """Queue a correlation pass — api-design.md §6.
+
+    The body is optional: §6 documents ``{}`` and ``{ scope: { evidence_ids?: [uuid] } }``, and a
+    client sending no body at all means the same thing as ``{}``.
+    """
     run = await service.trigger_correlation_run(
-        case_id, current_user, request.state.correlation_id, task_queue
+        case_id,
+        current_user,
+        request.state.correlation_id,
+        task_queue,
+        scope=body.scope if body is not None else None,
     )
+    # §6: `202 Accepted` with `Location` pointing at the poll endpoint (§2.12's async pattern).
+    response.headers["Location"] = f"/api/v1/correlation-runs/{run.run_id}"
     return Envelope(data=CorrelationRunRead.model_validate(run), meta=_meta(request))
 
 

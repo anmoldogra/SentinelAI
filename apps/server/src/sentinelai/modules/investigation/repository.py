@@ -3,8 +3,10 @@
 Entities and relationships have no timestamp column (database-design.md §3.5), so
 keyset pagination orders by the UUID primary key (stable, though not time-ordered).
 The review queue is a ``status = 'proposed'`` filter (§7). Graph loading over an
-evidence-id set is provided here (real); the case→evidence bridge that would feed it
-is deferred (see service.get_case_graph).
+evidence-id set feeds the projectors; the case→evidence bridge that supplies it is the
+event stream, not a join (ADR-0013). ``CorrelationRunRepository``'s two extra queries
+serve the run: one answers api-design.md §6's 409, the other re-reads the cancellation
+flag that only another transaction can set.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.modules.investigation.models import (
+    RUN_IN_PROGRESS,
     CorrelationRun,
     Entity,
     EntityEvidenceMention,
@@ -258,6 +261,38 @@ class CorrelationRunRepository:
     async def add(self, run: CorrelationRun) -> None:
         self._session.add(run)
         await self._session.flush()
+
+    async def find_in_progress_for_case(self, case_id: UUID) -> CorrelationRun | None:
+        """A run for this case that is ``queued`` or ``running`` — api-design.md §6's 409.
+
+        ``queued`` counts: the row exists and a worker will claim it, so a second trigger would put
+        two runs over one case on the queue. Ordered by ``run_id`` and limited, because the answer
+        is "is there one" and a pre-existing pair must not turn a trigger into a 500.
+        """
+        result = await self._session.execute(
+            select(CorrelationRun)
+            .where(
+                CorrelationRun.case_id == case_id,
+                CorrelationRun.status.in_(sorted(RUN_IN_PROGRESS)),
+            )
+            .order_by(CorrelationRun.run_id)
+            .limit(1)
+        )
+        return result.scalars().first()
+
+    async def is_cancellation_requested(self, run_id: UUID) -> bool:
+        """Whether cancellation has been requested — read fresh, every time it is asked.
+
+        A dedicated query rather than the in-memory attribute on purpose. The flag is set by
+        *somebody else* while the run is in flight, which is the only way it can ever become true,
+        and the session was configured ``expire_on_commit=False`` — so the loaded instance would
+        keep answering ``False`` no matter what the row said. Reading the column is what makes guide
+        Part 12's cooperative cancellation actually cooperative.
+        """
+        result = await self._session.execute(
+            select(CorrelationRun.cancellation_requested).where(CorrelationRun.run_id == run_id)
+        )
+        return bool(result.scalar_one_or_none())
 
 
 class InvestigationUnitOfWork(UnitOfWork):

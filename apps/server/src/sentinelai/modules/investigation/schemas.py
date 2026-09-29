@@ -69,6 +69,23 @@ class RelationshipEvidenceRead(BaseModel):
     evidence_id: UUID
 
 
+class CorrelationScope(BaseModel):
+    """Optional narrowing of a correlation run — api-design.md §6's ``{ scope: { evidence_ids } }``.
+
+    Every id must be linked to the case, checked at trigger time: a run scoped to evidence from
+    another case would correlate records the requester may have no access to, and `case_id` is what
+    every finding is announced against (§25.8).
+    """
+
+    evidence_ids: list[UUID] | None = Field(default=None, min_length=1)
+
+
+class CorrelationRunCreate(BaseModel):
+    """The trigger body. ``{}`` means the whole case, which is the documented default."""
+
+    scope: CorrelationScope | None = None
+
+
 class CorrelationRunRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

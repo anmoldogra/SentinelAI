@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -1199,7 +1200,15 @@ def get_evidence_service(
     return EvidenceService(uow, storage=storage, kms=kms)
 
 
-__all__ = ["CUSTODY_EVENT_TYPES", "VALID_CATEGORIES", "EvidenceService", "get_evidence_service"]
+__all__ = [
+    "CUSTODY_EVENT_TYPES",
+    "VALID_CATEGORIES",
+    "EvidenceContent",
+    "EvidenceService",
+    "get_evidence_service",
+    "read_evidence_attributes",
+    "read_evidence_content",
+]
 
 
 async def read_evidence_attributes(
@@ -1237,3 +1246,60 @@ async def read_evidence_attributes(
     if evidence is None:
         return None
     return evidence.attributes
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceContent:
+    """One evidence object's readable content, for a consumer that must analyse rather than link.
+
+    **Carries ``status`` deliberately.** The obvious alternative was to filter here and hand back
+    only correlation-eligible rows, and it is the wrong place for that rule: which lifecycle states
+    an analysis may read is the *analysing* module's policy, and `ingestion` owns only the
+    vocabulary (`database-design.md` §3.2 — `pending_validation`, `validated`, `quarantined`,
+    `superseded`, `tombstoned`). Returning the state and letting the caller decide keeps one rule in
+    one place, and makes the caller's choice visible in its own tests instead of buried in this
+    module's default.
+
+    Content only: no custody ledger, no integrity fields, no ``payload_ref``. A consumer that needs
+    the bytes goes through `EvidenceService`, which enforces ADR-0008's verification and records the
+    `accessed` custody event — this read is metadata and would have no business short-circuiting it.
+    """
+
+    evidence_id: UUID
+    category: str
+    artifact_type: str
+    title: str
+    description: str | None
+    attributes: dict[str, Any]
+    collected_at: datetime
+    status: str
+
+
+async def read_evidence_content(
+    session: AsyncSession, evidence_ids: Sequence[UUID]
+) -> Sequence[EvidenceContent]:
+    """Cross-module hook: the readable content of a set of evidence objects.
+
+    The batch counterpart of `read_evidence_attributes`, for `investigation`'s correlation run,
+    which reads a whole case's linked evidence rather than reacting to one item. Batched rather than
+    looped because the alternative is one round trip per evidence item on a job that already walks
+    everything a case holds; the repository chunks internally so the set has no practical ceiling.
+
+    Ids that match no row are simply absent from the result — the run may have been queued before an
+    item was superseded or purged, and absence is an answer rather than a failure. The caller
+    therefore must not assume the result is the same length as its input, and does not.
+    """
+    rows = await EvidenceRepository(session).list_by_ids(evidence_ids)
+    return [
+        EvidenceContent(
+            evidence_id=row.evidence_id,
+            category=row.category,
+            artifact_type=row.artifact_type,
+            title=row.title,
+            description=row.description,
+            attributes=row.attributes,
+            collected_at=row.collected_at,
+            status=row.status,
+        )
+        for row in rows
+    ]

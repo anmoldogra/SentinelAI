@@ -14,11 +14,12 @@ events. Every handler performs the Inbox claim BEFORE any side effect (§17).
 * ``evidence.linked_to_case`` projects what is already grounded in that evidence into the case's
   graph, which is the ordering half of the same bridge.
 
-``evidence.ingested`` remains a deferred no-op: §25.8's action for it is "index new evidence for
-correlation candidacy", and §3.5 defines no table to record that in — the (future) correlation job
-reads eligible evidence live. ``evidence.unlinked_from_case`` is a no-op for a
-different reason, recorded in its docstring. Both still claim and mark the inbox so redelivery is
-absorbed and real events are not dead-lettered.
+``evidence.ingested`` remains a no-op, and now for a settled reason rather than a deferred one:
+§25.8's action for it is "index new evidence for correlation candidacy", §3.5 defines no table to
+record that in, and the correlation run reads a case's eligible evidence live when it starts
+(`correlation.py`) — so there is nothing an index would be consulted for.
+``evidence.unlinked_from_case`` is a no-op for a different reason, recorded in its docstring. Both
+still claim and mark the inbox so redelivery is absorbed and real events are not dead-lettered.
 """
 
 from __future__ import annotations
@@ -29,6 +30,10 @@ from typing import Literal
 from uuid import UUID
 
 from sentinelai.modules.case_management.public import CaseEvidenceRef, read_cases_for_evidence
+from sentinelai.modules.investigation.extraction import (
+    CO_OCCURRENCE_CONFIDENCE,
+    CO_OCCURRENCE_REL_TYPE,
+)
 from sentinelai.modules.investigation.models import (
     STATUS_PROPOSED,
     Entity,
@@ -81,21 +86,11 @@ _H_IOC = "investigation.consider_ioc_match"
 # value outside §7 would be unfilterable by any client written against the contract.
 INDICATOR_ENTITY_TYPE = "digital_asset"
 
-# CEM §8's type for "these two things turned up together": `associated_with`, "Any ↔ Any", "Generic,
-# weighted association where a more specific type doesn't apply". §8's list is closed and holds no
-# indicator-specific type, and CEM §10 names "co-occurrence within the same evidence item" as an
-# extraction target — so this is the documented edge a match can ground, and the only one.
-CO_OCCURRENCE_REL_TYPE = "associated_with"
-
-# **An assumption, flagged as one: no document fixes this number.** The co-occurrence itself is
-# certain — both indicators are present in the same evidence item, by exact match — but what it
-# implies about the two being *related* is not, which is precisely why §8 calls `associated_with`
-# "weighted" and why the finding is written `proposed` for an analyst to dispose of (PRD FR-7.3).
-# 0.500 says "grounded, unweighted": high enough to be returned by default, low enough that
-# api-design.md §6's `min_confidence` filter excludes it at any threshold above a half. A real
-# weight belongs to the correlation run's model, which is where the number should come from once
-# that exists.
-CO_OCCURRENCE_CONFIDENCE = Decimal("0.500")
+# `CO_OCCURRENCE_REL_TYPE` and `CO_OCCURRENCE_CONFIDENCE` come from `extraction.py`. They were
+# defined here when an IOC match was the only thing that produced a co-occurrence edge; the
+# correlation run now produces them too (CEM §10's "co-occurrence within the same evidence item"),
+# and one number meaning "grounded, unweighted" must not exist twice. `extraction.py` is the right
+# home: it is pure, it has no IO to import, and it is where the reasoning behind the number belongs.
 
 # `analyst` or `ai` are the two values database-design.md §3.5 documents for `created_by_type`, and
 # CEM §8's `created_by` says the same ("Analyst, or AI + model/version if AI-generated"). A
@@ -310,9 +305,10 @@ async def record_ioc_match(
 
     generated_by = f"threat_intel.ioc_match:{ioc_id}"
     for link in case_links:
-        await _publish_finding(
+        await publish_finding(
             uow,
-            event,
+            correlation_id=str(event.correlation_id),
+            causation_id=str(event.event_id),
             case_id=link.case_id,
             recipient_user_id=link.owning_user_id,
             confidence=confidence,
@@ -321,9 +317,10 @@ async def record_ioc_match(
             finding_id=entity.entity_id,
         )
         for relationship in findings:
-            await _publish_finding(
+            await publish_finding(
                 uow,
-                event,
+                correlation_id=str(event.correlation_id),
+                causation_id=str(event.event_id),
                 case_id=link.case_id,
                 recipient_user_id=link.owning_user_id,
                 confidence=CO_OCCURRENCE_CONFIDENCE,
@@ -406,10 +403,11 @@ async def _associate_co_mentioned(
     return created
 
 
-async def _publish_finding(
+async def publish_finding(
     uow: InvestigationUnitOfWork,
-    event: EventEnvelope,
     *,
+    correlation_id: str,
+    causation_id: str | None,
     case_id: UUID,
     recipient_user_id: UUID,
     confidence: Decimal,
@@ -421,9 +419,17 @@ async def _publish_finding(
 
     Published from the same transaction as the write it describes (§16), and threaded onto the
     workflow that caused it: the same ``correlation_id``, and ``causation_id`` pointing one hop back
-    at the ``ioc_matched`` event. §11's worked example is this exact chain —
-    ``evidence.ingested → threat_intel.ioc_matched → investigation.correlation_generated`` — so the
-    causal path an auditor walks is the one the document draws.
+    at the event that caused it. §11's worked example is this exact chain —
+    ``evidence.ingested -> threat_intel.ioc_matched -> investigation.correlation_generated`` — so
+    the causal path an auditor walks is the one the document draws.
+
+    **Shared with the correlation run** (`correlation.py`), which is why it takes the two ids rather
+    than an ``EventEnvelope``: a run is started by an HTTP request, not by an event, so it has a
+    ``correlation_id`` to thread and **no** parent event to name. ``causation_id=None`` is the
+    honest answer there, and inventing one would forge a causal link an auditor would follow to
+    nothing. One helper rather than two because §25.8's payload has a required field
+    (``generated_by``) and a mutually-exclusive pair (``entity_id``/``relationship_id``) that two
+    copies could drift on.
 
     ``kind`` selects which of §25.8's mutually-exclusive id fields carries the finding: the payload
     specifies "one of ``relationship_id``/``entity_id``", and taking one id plus its kind is what
@@ -449,8 +455,8 @@ async def _publish_finding(
             # §25.8's recipient — the case owner `notification` alerts.
             "recipient_user_id": str(recipient_user_id),
         },
-        correlation_id=str(event.correlation_id),
-        causation_id=str(event.event_id),
+        correlation_id=correlation_id,
+        causation_id=causation_id,
         # No `actor_ref`: the platform observed this, no principal did it.
         actor_type="system",
     )

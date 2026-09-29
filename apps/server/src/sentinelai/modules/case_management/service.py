@@ -58,6 +58,7 @@ from sentinelai.modules.case_management.repository import (
     CaseEvidenceLinkRepository,
     CaseManagementUnitOfWork,
     CaseMemberRepository,
+    CaseRepository,
     get_case_management_uow,
 )
 from sentinelai.modules.case_management.schemas import (
@@ -701,6 +702,55 @@ async def read_cases_for_evidence(
     return [CaseEvidenceRef(case_id=row[0], owning_user_id=row[1]) for row in rows]
 
 
+@dataclass(frozen=True, slots=True)
+class CaseEvidenceScope:
+    """Everything a correlation run needs to know about a case, in one answer.
+
+    The owner travels with the evidence list for the same reason it travels with `CaseEvidenceRef`:
+    `investigation.correlation_generated` carries ``recipient_user_id`` (§25.8), so a consumer that
+    knew the evidence but not the owner would publish findings nobody is told about — and fetching
+    the owner separately would be a join done in Python across a module boundary.
+    """
+
+    case_id: UUID
+    owning_user_id: UUID
+    evidence_ids: tuple[UUID, ...]
+
+
+async def read_case_evidence_scope(
+    session: AsyncSession, case_id: UUID
+) -> CaseEvidenceScope | None:
+    """Cross-module hook: a case's linked evidence and its owner, or ``None`` if there is no case.
+
+    **The reverse direction of `read_cases_for_evidence`, and the one a correlation run needs.** A
+    run correlates "a case's linked evidence" (api-design.md §6), and that set is
+    `case_management`'s fact: the link table is in this schema, and `database-design.md` §5 forbids
+    the cross-schema join `investigation` would otherwise need. §174's "a consumer that needs more
+    fetches it via the owning module's public interface" is the documented way across.
+
+    A tuple rather than a lazy iterable because the caller both counts it (the trigger endpoint's
+    documented "case must have >= 1 linked evidence item" rule) and iterates it in batches, and a
+    one-shot generator cannot do both.
+
+    **No actor, and not an authorization hole**, for the same reason `read_cases_for_evidence` takes
+    none: the trigger route is already gated by ADR-0017's case-access check, and the worker calling
+    this has no principal to check. Nothing it returns reaches a user directly — the graph read
+    re-checks access on every request.
+
+    ``None`` distinguishes "no such case" from "a case with nothing linked yet", which the two
+    callers answer differently: one is a 404, the other a documented validation failure.
+    """
+    case = await CaseRepository(session).get_by_id(case_id)
+    if case is None:
+        return None
+    links = await CaseEvidenceLinkRepository(session).list_for_case(case_id)
+    return CaseEvidenceScope(
+        case_id=case_id,
+        owning_user_id=case.owning_user_id,
+        evidence_ids=tuple(link.evidence_id for link in links),
+    )
+
+
 def get_case_service(
     uow: CaseManagementUnitOfWork = Depends(get_case_management_uow),
     storage: ObjectStorage = Depends(get_object_storage),
@@ -717,6 +767,7 @@ def provide_case_access_checker(session: AsyncSession = Depends(get_session)) ->
 
 __all__ = [
     "CaseEvidenceRef",
+    "CaseEvidenceScope",
     "CaseSearchFilters",
     "CaseService",
     "DbCaseAccessChecker",
@@ -724,5 +775,6 @@ __all__ = [
     "get_case_service",
     "get_task_queue",
     "provide_case_access_checker",
+    "read_case_evidence_scope",
     "read_cases_for_evidence",
 ]

@@ -4072,3 +4072,289 @@ the *pair* is known and validates nothing about `attributes` themselves — reco
 now load-bearing for four modules.
 
 **`osint`'s list endpoint still returns no cursor** (IC-045), now the only connector that does not.
+
+---
+
+## 2026-09-29 — IC-047: Phase 3 opens — the correlation engine
+
+**Type:** the first increment of Phase 3 (AI Investigation Engine). `investigation/jobs.py` held the
+last `NotImplementedError` outside `notification`; it is now a real cross-domain correlation run. No
+migration and no schema change — §3.5 already gave `correlation_runs` everything the state machine
+needs.
+
+### A port, and one adapter that is honest about what it covers
+
+`extraction.py` defines `EvidenceExtractor`: `async extract(record) -> Extraction`, returning CEM §7
+entities and CEM §8 relationships whose endpoints are **indices into the entity tuple**, not names —
+an extractor that found the same canonical name twice would be ambiguous by name, and an index can
+be validated mechanically before anything is written.
+
+Behind it, `HeuristicIdentifierExtractor` covers exactly one of CEM §10's eight targets —
+"Identifiers ... via pattern/NER extraction" — plus the co-occurrence half of "Relationship
+inference". Emails become `account`, IPs/domains/URLs/hashes `digital_asset`, wallet addresses
+`financial_instrument`. **Named entities, temporal expressions, geolocation, sentiment, cross-source
+correlation and entity resolution are the other six, they need a model, and there is no inference
+client in this codebase.** A regex cannot find a person's name, so the adapter does not claim to.
+That is the whole reason the port exists: a model-backed adapter lands beside this one and
+`correlation.py` does not change.
+
+The rules separating a useful extractor from a noisy one are the near-miss ones, and each has a test.
+A domain's final label must be **alphabetic and at least two characters**, or a forensic tool's `4.5`
+version string becomes an entity an analyst rejects once per evidence item forever. An `0x`-prefixed
+40-hex string is an Ethereum address and a bare one is a SHA-1, so the prefix is checked first.
+Base58 Bitcoin addresses are matched **case-sensitively**, because folding them both accepts invalid
+addresses and stores a canonical name that is not the address.
+
+`IDENTIFIER_CONFIDENCE` is `1.000`, and that is not overconfidence. It is confidence that the
+identifier is present and is what it was classified as — a decided question, settled by an anchored
+pattern on a string that is in the record. Whether it *matters* is what `proposed` and an analyst's
+review decide. Scoring it lower would make `min_confidence` hide findings that are certainly there,
+which is the opposite of what an analyst raising that threshold is asking for.
+
+### The cap is a review-load decision, not a performance one
+
+`MAX_ENTITIES_PER_EVIDENCE = 12`, **because co-occurrence is quadratic**. n identifiers in one item
+produce n(n-1)/2 `associated_with` edges and every one is a machine guess a human must dispose of
+(PRD FR-7.3). Twelve yields at most 66 edges from one document, which is already substantial; fifty
+would yield 1,225 from a single record, and no analyst works through that.
+
+The bound is on **entities**, never on pairs: the pairwise set over the entities kept is always
+complete. A truncated clique would leave an analyst unable to tell which associations the run
+considered from which it silently dropped. Where the cap bites it is logged
+(`correlation_extraction_capped`), because the run still reports `completed` and that log line is the
+only thing saying the item was not read exhaustively.
+
+### `queued`, not `pending` — a contract violation that was already shipped
+
+`trigger_correlation_run` wrote `status="pending"`. api-design.md §6 publishes the trigger response
+as `{ run_id, status: "queued" }` and the poll response's enum as `queued|running|completed|failed`;
+`engineering-roadmap.md` says the same. `pending` is not in that set, so a client switching on the
+documented enum had no branch for what it actually received. Fixed — ORM default and the explicit
+write — with no migration, because §3.5's column has no server default.
+
+The rest of the machine lives on the aggregate (ADR-0011 §1), where it is testable with no database,
+no queue and no worker:
+
+* **`claim()` returns `False` for an already-`completed` run** rather than raising. That is what a
+  redelivered arq job looks like, and it is ordinary rather than a violation. Re-walking a finished
+  run would re-announce every finding it made, and §25.9 keys `notification`'s idempotency on the
+  finding rather than on the run — so the analyst would be alerted twice for one fact.
+* **A `failed` run *is* re-claimable.** A failure is usually transient and arq's next attempt is the
+  retry; a run that could never be retried would turn every database blip into a case an analyst
+  re-triggers by hand.
+* **`started_at` is set once.** Overwriting it on a retry would make a run that has been failing for
+  an hour look fresh to whoever is polling it.
+* **`record_progress` is monotonic**, asserted. A count going backwards would read as findings having
+  been withdrawn, which never happens — a finding is rejected by review, never deleted. The
+  invariant has a sharp consequence that self-review caught: `findings_generated_count` is the run's
+  **cumulative** total across attempts, so a retry seeds its counter from the row rather than from
+  zero. A retry re-walks evidence whose findings the previous attempt already committed, convergence
+  means it creates nothing for those, and a counter starting at zero would hand `record_progress` a
+  number below the row's — failing every retry permanently, on exactly the runs that got furthest
+  before breaking. The regression test was checked against the unfixed code before it was kept.
+
+### Cancellation has no honest status, and the log says so
+
+Guide Part 12 requires a cooperative `cancellation_requested` checkpoint, and it is implemented at
+**batch boundaries** — between transactions, never mid-write — re-read from the row on each pass,
+because the flag is set by somebody else while the run is in flight and the session is
+`expire_on_commit=False`, so the loaded instance would answer `False` forever.
+
+A cancelled run ends **`failed`**. api-design.md §6's status enum is closed and has no `cancelled`
+value, and of the two available answers `completed` is the wrong one: a client reading it would
+believe the case had been correlated in full. The findings already made are kept — they are grounded
+and valid — and the distinction lives in a `correlation_run_cancelled` log line. **Nothing sets the
+flag today**: §6 documents no cancel endpoint, so the path is reachable only by an operator's
+`UPDATE`, which is exactly how the integration test drives it. Recorded rather than papered over with
+an endpoint nobody asked for.
+
+### Why the run is not one transaction
+
+Three boundaries, each earning its place. The **claim** commits before any extraction, so a poller
+sees `running` while the pass runs rather than `queued` until it ends — and so a second worker
+reading the row finds `running`, which is what makes a claim a claim. Each **batch of 25** commits
+with the findings it produced *and* the progress count that describes them, in one transaction (§16),
+so a failure in batch nine does not discard batches one to eight; those findings are correct,
+grounded, and an analyst can review them while the rest is retried. The **terminal status** commits
+with `correlation_run_completed`/`_failed`; a row saying `completed` while no event says so is the
+split-brain the outbox exists to prevent.
+
+ADR-0005 still holds: the service never commits. The job passes `uow.commit` in as a `checkpoint`
+callback, so the service says *where* a checkpoint is meaningful and the entrypoint says what one
+costs. A unit test passes nothing and the whole run stays in one uncommitted transaction.
+
+### Convergence is what makes a re-run safe
+
+Running the same case twice must not double its graph. Three resolutions make a second run a literal
+no-op: an entity resolves on `(entity_type, canonical_name)`, a MENTIONS edge on its
+`(entity_id, evidence_id)` pair (`uq_entity_mention_pair`), and an `associated_with` edge on its
+**unordered** endpoint pair. So a re-run creates nothing, publishes nothing and reports
+`findings_generated_count = 0` — the correct answer, not a failure, and asserted against real
+Postgres.
+
+Entity resolution is deliberately narrow: exact match on the normalized name, nothing fuzzy. CEM §10
+lists "entity-resolution candidates (the same real-world entity referenced differently across
+sources)" as a *separate* extraction target for a reason — deciding that two differently spelled
+names are one person is an analyst's judgement, and a run that merged them silently would assert an
+identity nobody reviewed.
+
+An entity that already exists still gains a MENTIONS edge from new evidence (CEM §1.6 wants that
+grounding recorded) but is **not** re-announced, because it is not new.
+
+### Two new cross-module read hooks, because §5 forbids the join
+
+A run needs a case's linked evidence and that evidence's content. Both live in other schemas, and
+`database-design.md` §5 forbids the cross-schema join — so both arrive through public interfaces,
+matching §174's "a consumer that needs more fetches it via the owning module's public interface":
+
+* **`case_management.public.read_case_evidence_scope(session, case_id)`** — the reverse direction of
+  `read_cases_for_evidence` (IC-043), returning the case's evidence ids **and its owner**, because
+  `correlation_generated` carries `recipient_user_id` (§25.8) and a consumer that knew the evidence
+  but not the owner would publish findings nobody is told about. `None` distinguishes "no such case"
+  (a 404) from "a case with nothing linked" (a documented validation failure).
+* **`ingestion.public.read_evidence_content(session, evidence_ids)`** — the batch counterpart of
+  `read_evidence_attributes`, chunked at 500 ids per statement because asyncpg caps a statement at
+  32767 bind parameters and a case's evidence set has no documented ceiling. One `IN (...)` would
+  work for years and then fail with an `InterfaceError` on the first case large enough.
+
+**`EvidenceContent` carries `status` deliberately.** Filtering inside `ingestion` was the obvious
+alternative and it is the wrong place: which lifecycle states an *analysis* may read is the analysing
+module's policy. `investigation` holds `ELIGIBLE_EVIDENCE_STATUSES = {"validated"}` and each
+exclusion is deliberate — `quarantined` is what a malware detection or a custody-chain gap sets, so
+extracting from it would put findings grounded in untrustworthy evidence in front of an analyst with
+nothing saying so; `superseded` has a replacement the investigation has already corrected to;
+`tombstoned` is gone. The extractor is then handed an `EvidenceRecord` with **no `status` field at
+all**, so an adapter — including a future one that sends text to an inference endpoint — cannot
+re-decide that rule or transmit a field it has no business seeing.
+
+### The trigger's documented pre-conditions were never enforced
+
+Both are §6's own, and the engine is what makes them matter:
+
+* **"Case must have >= 1 linked evidence item."** Without it the run claims itself, finds nothing,
+  publishes `correlation_run_completed` with zero findings and tells the analyst the pass they asked
+  for is done — when what happened is that there was nothing to correlate.
+* **409 when a run is already `queued` or `running` for this case.** `queued` counts: the row exists
+  and a worker will claim it. Two runs walk the same evidence with the same extractor; entity
+  resolution converges them onto the same nodes, but each announces its own `correlation_generated`
+  per finding, so the case owner is notified twice for one fact.
+
+**422, and api-design.md §6 now says so.** §2.4 splits `VALIDATION_FAILED` into "request malformed
+(400)" and "fails domain/business rules (422)"; both of these are domain rules — the request is
+perfectly well-formed, the case simply is not in a state to be correlated. §6's error list named 400
+and omitted 422, an inconsistency inside the document rather than a different rule, so the row was
+corrected in this change — the same 400/422 split IC-045 pinned for `forensics`.
+
+### `scope` is an execution parameter, not run state
+
+§6's `{ scope: { evidence_ids?: [uuid] } }` is now accepted, and the ids are validated **against the
+case's own links** — refused with the offending ids named, never silently intersected. A request
+naming ten items, two of them another case's, would otherwise run over eight and report success while
+announcing findings against a `case_id` that does not hold that evidence.
+
+It travels as a **job argument**, not a column: §3.5 gives `correlation_runs` nowhere to store it and
+§6's poll response does not echo it, so inventing a column would be inventing schema (`CLAUDE.md`
+rule 1). arq preserves a job's arguments across retries, so a re-attempt correlates the same narrowed
+set rather than quietly widening. `correlation_id` travels the same way, so §11's causal chain
+survives the queue hop — the events the worker publishes minutes later belong to the workflow the
+request started.
+
+An **unscoped** run re-reads the case's links when it starts rather than using a trigger-time
+snapshot: a job queued behind a backlog may start minutes later, and evidence linked in the meantime
+belongs in the pass the analyst asked for. A scoped run intersects with the same fresh read, so an
+item unlinked since the trigger is dropped.
+
+### `generated_by` was missing from a payload that requires it
+
+§25's payload-schema table marks `generated_by` **required** on `correlation_generated` ("model/run
+reference, per CEM §10's `created_by`"), and `InvestigationService.create_relationship` never sent
+one. Exactly the class of bug IC-043 found in `threat_intel.ioc_matched`: §25.8's catalog row lists
+only the "key fields", and the payload-schema table is the contract. Fixed, along with the missing
+explicit `entity_id: None` that makes the "one of `relationship_id`/`entity_id`" pair legible to a
+consumer.
+
+`_publish_finding` from IC-043 became `publish_finding`, taking `correlation_id` and `causation_id`
+rather than an `EventEnvelope`, and is now shared by the IOC consumer and the run. A run is started by
+an HTTP request, not by an event, so it threads a `correlation_id` and passes **`causation_id=None`**
+— the honest answer, where forging one would hand an auditor a causal link that leads nowhere. One
+helper rather than two, because that payload has a required field and a mutually-exclusive pair that
+two copies could drift on.
+
+### An inconsistency inside §25 itself
+
+**§25.8 names `notification` as the consumer of `correlation_run_completed`/`_failed`, and §25.9's
+`notification` Consumed table has no row for either.** Both events are published here per §25.8 (the
+publisher's table is unambiguous), and no handler exists for them — which §23 explicitly permits:
+"the dispatcher itself must never crash on an event type it has no registered handler for". Recorded
+rather than resolved: adding a `notification` subscription §25.9 does not document would be inventing
+one, and deleting the consumer column would be guessing which half of §25 is wrong. §25.9's "at a
+glance" count (`notification` consumes 3) already disagrees with its own four listed rows, so that
+table needs a documentation pass either way.
+
+### A pre-existing 500 this increment ran into
+
+`OutboxWriter`'s `correlation_id` column is a real `uuid`, and the HTTP middleware takes
+`X-Correlation-Id` **verbatim from the client** with no validation. A client sending
+`X-Correlation-Id: abc` to any endpoint that publishes an event gets a `ValueError` at publish time —
+a 500 from well-formed input, on every module's write path. Not touched here: the fix belongs in the
+middleware and changes behaviour for every endpoint, so it deserves its own increment and its own
+tests. Found because these tests used readable workflow ids and could not insert them.
+
+### A date-dependent test from IC-046, fixed
+
+`test_social_media_db.py`'s `future-capture` case built its "future" as `_NOW + 1 day` against a
+**fixed** `_NOW`, while `validate_captured_at` compares against the real clock. It passed when
+written and failed the moment the wall clock passed that instant — a test that breaks on a calendar
+boundary rather than on a code change. Both it and its `test_social_media_api.py` twin (which had the
+same bug with a 400-day fuse) are now relative to `datetime.now(UTC)`.
+
+### Tests
+
+**104 new** — 47 unit on the extraction rules, 38 unit on the state machine, the service and the
+trigger's guards, 19 against real Postgres.
+
+The Postgres file is the one that proves the increment: the real job function, the real adapter, the
+real signed outbox, the **real dispatcher in `VERIFY_STRICT`** (so every assertion that a finding was
+projected is also an assertion that its event verified), the real projector, and
+`GET /api/v1/cases/{case_id}/graph` over HTTP returning three `proposed` nodes and three
+`associated_with` edges with §6's self-containment guarantee checked. Plus the paths only a real
+database settles: a second run converging to zero, a retry of the same `run_id` publishing nothing, a
+failed run visible as `failed` with its claim clock intact and nothing half-written, a retry after a
+failure completing, cancellation stopping at a boundary, `quarantined` evidence never read, and a run
+observed as `running` **from a separate session** while it is still going — the only way to prove the
+claim commit happened rather than an attribute merely being set.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (246 source files), import-linter (2/2 kept). Unit +
+integration **1776 passed / 1 skipped** (the skip is the Vault contract test, which needs a Vault
+this machine does not run); platform coverage **95.42%** against the 90% floor. Migration round-trip
+green.
+
+### Carried forward
+
+**Six of CEM §10's eight extraction targets are unbuilt**, and they need a model rather than more
+regexes. The port is where they plug in.
+
+**Phone numbers are not extracted.** No CEM §7 type fits: `device` is about IMEI/IMSI/MAC rather than
+MSISDN, `account` is "a social media, email, or cloud account", and inferring a `person` from a number
+is the inference an analyst makes. Left out rather than filed under the nearest wrong type.
+
+**An existing relationship gains no supporting evidence.** When a run re-derives a co-occurrence that
+already exists it returns without adding a `relationship_evidence` row for the new evidence item.
+More grounding for the same claim would be defensible, but §25.8 has no event for "an existing finding
+gained evidence", so the fact would be unannounced and invisible in the projection — and inventing
+one would be inventing schema.
+
+**A cancelled run reports `failed`** (above), and **nothing can request cancellation** through the
+API.
+
+**`correlation_run_completed`/`_failed` have no consumer**, per §25.9's table (above).
+
+**`depth` is still inert.** Every projected node is a seed, so a graph read at depth 1, 2 or 3 returns
+the same subgraph. The run adds nodes through `correlation_generated`, which is the same
+seed-producing path — recorded in ADR-0013 since IC-043 and unchanged here.
+
+**`notification`'s service and repository (4 stubs each) are the remaining `NotImplementedError`s**,
+and they are the natural next Phase 3 increment: the run now announces findings that nothing yet
+turns into an alert.

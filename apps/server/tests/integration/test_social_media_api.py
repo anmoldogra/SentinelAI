@@ -280,7 +280,14 @@ async def test_a_rejected_capture_leaves_its_key_reusable(
     ("override", "field"),
     [
         ({"content_kind": "tweet"}, "content_kind"),
-        ({"captured_at": (_NOW + timedelta(days=400)).isoformat()}, "captured_at"),
+        # Relative to the **real** clock: the rule compares against `datetime.now(UTC)`, so a
+        # "future" pinned to the fixture's date stops being in the future once the wall clock
+        # passes it, and the test would start failing on a calendar boundary rather than on a
+        # code change.
+        (
+            {"captured_at": (datetime.now(UTC) + timedelta(days=400)).isoformat()},
+            "captured_at",
+        ),
     ],
     ids=["platform-vocabulary", "future-capture"],
 )
