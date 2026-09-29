@@ -1,8 +1,13 @@
 """Structured logging (structlog) — guide Part 10.
 
-``correlation_id`` / ``request_id`` / ``trace_id`` are bound once in the HTTP
-correlation middleware (guide Part 2) and appear on every subsequent log line for
-that request automatically via ``merge_contextvars`` — no call site threads them.
+``correlation_id`` / ``request_id`` / ``trace_id`` are bound once at the edge and appear on every
+subsequent log line automatically via ``merge_contextvars`` — no call site threads them. The HTTP
+correlation middleware binds them for a request (guide Part 2); the event dispatcher binds
+``correlation_id`` and ``trace_id`` for a handler (ADR-0018), so a log line from asynchronous work
+carries the same two ids as the request that caused it.
+
+``trace_id`` appears only when a tracer provider is configured. An untraced process logs without
+it rather than logging a zeroed placeholder that would resolve to no trace in Tempo.
 """
 
 from __future__ import annotations

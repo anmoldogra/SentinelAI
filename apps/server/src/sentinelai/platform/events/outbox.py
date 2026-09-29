@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.schema import Column
 
 from sentinelai.platform.events.signing import EventSigner
+from sentinelai.platform.tracing import current_traceparent
 
 # Dedicated metadata: these generic per-schema tables are created by each module's
 # hand-written migration, not by autogenerate against the ORM Base.
@@ -121,10 +122,22 @@ class OutboxWriter:
         ``event_id`` and ``occurred_at`` are generated here rather than left to a column default,
         because both are inside the signed message — an event's identity and time are part of what
         the publisher attests to, so they cannot be assigned after the signature is made.
+
+        ``trace_id`` defaults to the **active OTel trace context** as a W3C `traceparent`
+        (ADR-0018). This is the only place it can be captured: the span that belongs on the event
+        is the one open when the business transaction ran, and by the time the dispatcher relays the
+        row minutes later that span is long closed. An explicit argument still wins, so a replay
+        tool or a backfill can state its own context — or ``None`` for honestly untraced work.
+
+        It lands inside the signed message with everything else, which is why
+        `current_traceparent` returns ``None`` rather than a zeroed placeholder when nothing is
+        being traced: a signature is an attestation, and attesting to an execution path that never
+        existed would make the envelope say something false about how the evidence moved.
         """
         table = get_outbox_table(self._schema)
         event_id = uuid4()
         occurred_at = datetime.now(UTC)
+        trace_id = trace_id if trace_id is not None else current_traceparent()
         signed_fields: dict[str, Any] = {
             "event_id": event_id,
             "event_type": event_type,

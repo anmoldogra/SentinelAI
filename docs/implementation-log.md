@@ -3557,3 +3557,190 @@ guess.
 
 **`forensics` and `social_media` are still scaffolds**, and there is still no feed transport and no
 retro-scan on IOC registration (IC-042).
+
+---
+
+## 2026-09-29 — IC-044: Wave 4.3 — OpenTelemetry tracing across the event bus, and the CI coverage gate
+
+**Type:** the observability half of Wave 4.3, plus the gate fix IC-043 surfaced. One new ADR
+(**ADR-0018**, the write-up `engineering-roadmap.md`'s register has carried as pending for the
+monitoring stack), one new platform module, five new runtime dependencies, no schema change — the
+`trace_id` column has been in the envelope since §9 was written and every publisher wrote `NULL`
+into it.
+
+### The CI coverage gate: the command was wrong, not the tests
+
+IC-043 reported the finding; this closes it. CI's coverage job ran `pytest tests/unit
+--cov=sentinelai.platform --cov-fail-under=90` and got **84.65%**, and had been failing for several
+increments while the increments themselves reported ~96%. Both numbers were real: 96% is the same
+flag measured over the whole suite.
+
+The gap is not untested code. Over half of `platform` is code whose entire job is SQL —
+`platform/admin/*` (0% under unit-only), `auth/repository.py` (39%), `idempotency/guard.py` (39%) —
+and it is thoroughly tested, by the integration tests CI runs in a *different* job with no coverage
+flag. A unit-only floor on a database-heavy platform layer measures the wrong suites and cannot be
+satisfied except by mocking a database, which would be tests that assert the mock.
+
+So the floor moved to the job that has a database, over **unit and integration together**:
+**95.37%**, and `--cov-fail-under=90` now passes for the reason it was supposed to. The unit job
+stays, without the floor, because it fails in about a minute rather than after four containers come
+up. Unit tests run twice in CI; that costs a minute and is the cheaper half of the trade.
+`make test-coverage` runs exactly the CI command, and `COVERAGE_FLOOR` still lives in one place.
+
+**This is a gate being pointed at the right thing, not a gate being lowered** — the threshold is
+untouched at 90 and the measured figure went *up*, because the suites that exercise the code are now
+included. Recorded explicitly because "the gate was wrong" is the most abusable sentence in
+engineering.
+
+### What crosses the event bus is a `traceparent`, not a trace id
+
+§9 gives every event a nullable `trace_id` and §11 defines it as "W3C Trace Context, generated at the
+entrypoint ... possibly spanning process/network boundaries". The column now carries a **full
+`traceparent`** — `version-traceid-spanid-flags` — and the difference is the whole mechanism.
+
+A consumer handed only the 32-hex trace id could label its span with the right trace but could not be
+a **child** of anything in it. The result renders in Tempo as a pile of siblings with no shape, which
+answers "did this happen?" but not "what made this take nine seconds?" — the only question worth
+adding tracing for. §11's own wording anticipates this: the field "changes at every process/network
+boundary rather than staying constant like `correlation_id` does", which is true of a `traceparent`
+and false of a bare trace id.
+
+Captured in `OutboxWriter.publish` and nowhere else, because the span that belongs on an event is the
+one open when the business transaction ran. By the time the dispatcher relays the row, that span is
+closed and its context is gone; there is no later point at which this is recoverable.
+
+### `None`, never a zeroed placeholder — because the field is signed
+
+`trace_id` has always been inside ADR-0007's signed field set. So `current_traceparent()` returns
+`None` when nothing is being traced rather than a synthetic all-zero traceparent: a signature is an
+attestation, and attesting to an execution path that never existed would make an evidentiary record
+say something false about how the evidence moved. The cost of getting this wrong is not a confusing
+dashboard.
+
+A property fell out of that which was not a design goal and is worth having: **tampering with a
+stored `trace_id` is detected as forgery.** Editing the column breaks the signature, so the row
+dead-letters with a `critical` log line instead of quietly claiming the event came from a different
+request. The execution path recorded on an event is now as tamper-evident as its payload. The other
+face of the same coin: `trace_id` cannot be back-filled or corrected in place on a signed row, which
+is the right trade for a field inside an attestation. Both are tested.
+
+### The bug the tests found: `context=None` means "inherit", not "no parent"
+
+`context_from_traceparent` returns `None` for anything unusable — absent, malformed, or well-formed
+with an invalid span context — because `extract` does **not** raise on garbage: it returns the
+*current* context unchanged. A handler that passed that through would parent the consumer span onto
+whatever the dispatcher happened to be inside, inventing a causal link. In a platform whose purpose
+is proving provenance, a fabricated causal edge is the worst available failure.
+
+The guard was written first and was **defeated by the SDK's own semantics**: passing `context=None`
+to `start_as_current_span` does not mean "no parent", it means "use the current context" — exactly
+the ambient inheritance the guard existed to prevent. The integration test caught it only because it
+drives the dispatcher from *inside* an unrelated span; with no ambient context, the right and wrong
+implementations are indistinguishable. Fixed with a named `parent_context()` that returns an
+explicitly empty `Context`, and the trap is documented where the knowledge lives rather than in a
+commit message.
+
+`extracted or Context()` would have been the natural spelling and is also wrong: an OTel `Context` is
+a dict, so one carrying only a span is still falsy, and a perfectly good parent would be discarded.
+Both halves are pinned by tests.
+
+### Export is opt-in, and that is the air-gapped invariant
+
+`deployment-architecture.md` rule 6 requires air-gapped and classified deployments to have "zero
+configured or observed egress paths — verify, don't assume". A default OTLP endpoint — any default —
+would be a configured path out of the enclave that nobody chose. `OTEL_EXPORTER_OTLP_ENDPOINT` is
+therefore empty by default with no fallback.
+
+With no exporter the SDK still runs: spans are created, context still propagates through the outbox,
+and they are dropped at the processor. That is deliberate. It means the propagation path is exercised
+on every deployment and across the whole test suite, rather than being a code path that only executes
+where nobody is watching — the arrangement that lets tracing rot silently between releases.
+
+**Air-gapped deployments can still be traced**, and a test asserts it, so a later "harden the
+air-gapped profile" change cannot quietly take observability away from the deployments that can least
+afford to debug blind. A collector inside the enclave is east-west traffic, not egress; what the rule
+forbids is an endpoint the *platform* chose. The invariant that is actually checkable is enforced
+instead — console export is refused in production-grade profiles, where a span per request on stdout
+would bury the structured events Promtail ships to Loki.
+
+OTLP over **HTTP/protobuf, not gRPC**: the gRPC exporter pulls in `grpcio`, a native extension whose
+platform-specific wheels turn an offline mirror into a build toolchain. Tempo accepts both. Same
+reasoning `asn1crypto` already carries in `pyproject.toml`.
+
+### One span per handler, and `trace_id` on the log line
+
+A span per *handler*, not per event: two handlers on one event succeed and fail independently, and a
+single span over both would attribute one's failure to the other. Failures set the span status and
+record the exception, because a span that ended `OK` while its log line said otherwise sends an
+operator to the wrong place.
+
+`trace_id` is bound into the structlog context in both processes — the HTTP middleware for a request,
+the dispatcher for a handler — which is what makes Part 20's promise (Grafana joining a Loki line to
+a Tempo trace) true. `platform/logging.py`'s docstring had claimed the middleware did this since it
+was written; it did not. Now it does, and the docstring says under what condition.
+
+It is deliberately **not** echoed to clients as a response header, unlike `X-Request-Id` and
+`X-Correlation-Id`: §11 is explicit that `trace_id` "has no business meaning", and handing a caller a
+handle on internal execution topology describes the system to anyone who asks for nothing in return.
+
+### A test fixture that broke 111 unrelated tests
+
+Worth recording because the failure mode is so misleading. The tracing tests install a provider and
+restore the previous one, and the obvious spelling is wrong:
+`previous = trace.get_tracer_provider()` returns a **proxy** when none is set, and that proxy
+resolves every call by reading the module global — so restoring it *into* that global makes it
+delegate to itself. Every later test that built a FastAPI app died with `RecursionError`, in a
+different file, and only when a tracing test shared the session with them. A single-file run was
+green.
+
+The fix is to read the module global directly (unset is `None`), and it lives in
+`tests/fixtures/tracing.py` beside the second piece of the same knowledge:
+`set_tracer_provider` is guarded by a module-level `Once`, so clearing the provider without resetting
+that guard leaves the next call logging "Overriding of current TracerProvider is not allowed" and
+doing nothing — a test would then assert against whatever provider a previous test installed.
+
+### Tests
+
+**41 new** — 29 unit, 12 against real Postgres.
+
+The Postgres file fakes nothing between the two ends: a real `OutboxWriter` signs and inserts a row
+inside an active span, the real `EventDispatcher` claims it in **strict** signature mode, and the
+handler's span is inspected through a real in-memory exporter. Because verification is strict, every
+assertion that the handler ran is also an assertion that the event verified with a populated
+`trace_id` — a trace that broke event authentication would be a trade nobody agreed to. It also
+proves the chain survives a second hop: an event published *by* a handler carries the same trace with
+the handler's span as its parent, which is how `evidence.ingested → ioc_matched →
+correlation_generated` renders as one path.
+
+The unit file is built around absence — no active span, malformed input, a profile that forbids the
+exporter someone configured — and around two traps: the `context=None` semantics above, and
+`instrument_sqlalchemy` needing `engine.sync_engine` (passing the async wrapper attaches to nothing
+and fails **silently**, so it looks instrumented in review).
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (242 source files), import-linter (2/2 kept). Unit +
+integration **1524 passed / 1 skipped**; migrations, architecture, contract and performance green.
+Platform coverage **95.37%** against the 90% floor, measured by the command CI now runs.
+`platform/tracing.py` is at **100%**.
+
+### Carried forward
+
+**No spans for arq jobs.** There is no `opentelemetry-instrumentation-arq`, and hand-rolling one is
+its own piece of work. The worker still produces the dispatcher's consumer spans and the SQLAlchemy
+client spans beneath them, so a scheduled job's execution is visible in logs and metrics but not as a
+trace.
+
+**Wave 4.3's alerting half is not built.** Part 20's alert-routing table names the signals;
+`infra/` carries no Alertmanager configuration, and no OTel collector manifest ships with this change
+either — the endpoint is a setting with nothing on the other end of it yet.
+
+**No OTel metrics or logs pipeline**, deliberately (ADR-0018 §7): Prometheus and structlog already
+serve both, and Part 20's architecture is three pipelines into one Grafana, not one pipeline.
+
+**Tail sampling is not configured** — `OTEL_TRACES_SAMPLE_RATIO` is a head-sampling knob at 1.0.
+Keeping the slow and failed traces specifically is collector-side configuration, and belongs with the
+`infra/` work above.
+
+**`notification` still publishes without `causation_id`** (IC-043), so §11's causal chain still breaks
+at its last hop even though the *trace* now spans it.

@@ -10,9 +10,16 @@ PY := python
 export PYTHONUTF8 := 1
 export PYTHONIOENCODING := utf-8
 
-# Platform coverage floor — wave-1 §17's Tier-0 mandate, now met and enforced. Kept in one
-# place so the Makefile and .github/workflows/ci.yml agree.
+# Platform coverage floor — wave-1 §17's Tier-0 mandate. Kept in one place so the Makefile and
+# .github/workflows/ci.yml agree.
+#
+# Measured over unit AND integration together (`make test-coverage`), because that is what
+# exercises `platform`: over half of it is code whose whole job is SQL, and the unit suite alone
+# reaches 85% of it however well tested it is. Measuring the wrong suites is how this gate spent
+# several increments red while the code under it was covered.
 COVERAGE_FLOOR := 90
+# Owned by the `test-migrations` target and CI's `migrations` job, so the round-trip runs once.
+COVERAGE_PATHS := tests/unit tests/integration --ignore=tests/integration/test_migrations.py
 
 # Local bootstrap identity. `POST /auth/login` needs a user to exist and nothing else creates
 # one. Override per-developer: make create-admin ADMIN_EMAIL=me@agency.gov ADMIN_ROLE=supervisor
@@ -21,8 +28,8 @@ ADMIN_PASSWORD := sentinelai
 ADMIN_ROLE := admin
 
 .PHONY: help install lint format typecheck lint-imports test test-unit test-integration \
-        test-migrations hooks check run-api run-worker migrate compose-up compose-down \
-        compose-logs create-admin dev-token ensure-keys
+        test-coverage test-migrations hooks check run-api run-worker migrate compose-up \
+        compose-down compose-logs create-admin dev-token ensure-keys
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -50,11 +57,14 @@ test: ## Run the test suite
 test-migrations: ## Prove every migration is reversible (upgrade head -> downgrade base)
 	pytest tests/integration/test_migrations.py -v
 
-test-unit: ## Unit suite + the platform coverage floor CI enforces
-	pytest tests/unit --cov=sentinelai.platform --cov-report=term-missing --cov-fail-under=$(COVERAGE_FLOOR)
+test-unit: ## Unit suite only — fast, needs no services
+	pytest tests/unit
 
 test-integration: ## Integration suite (needs Postgres/Redis/MinIO/Vault reachable)
 	pytest tests/integration -v
+
+test-coverage: ## The platform coverage floor CI enforces (needs the same services as test-integration)
+	pytest $(COVERAGE_PATHS) --cov=sentinelai.platform --cov-report=term-missing --cov-fail-under=$(COVERAGE_FLOOR)
 
 hooks: ## Install the pre-commit hooks that mirror the CI gates
 	cd ../.. && pre-commit install

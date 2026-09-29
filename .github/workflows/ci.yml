@@ -112,9 +112,13 @@ jobs:
       - name: import-linter (module DAG + platform boundary)
         run: lint-imports
 
-  # 5 — Unit tests + coverage floor on platform.
+  # 5 — Unit tests. Fast feedback, no services, no coverage floor.
+  #
+  # The floor moved to job 6 (see the note there). This job stays because it fails in ~1 minute
+  # without waiting on Postgres, Redis, MinIO and Vault to come up — a broken unit test should not
+  # cost a container bootstrap to discover.
   unit:
-    name: Unit tests & coverage
+    name: Unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,23 +131,8 @@ jobs:
       # Selection is by PATH, not by marker: this repository's suites are separated by
       # directory (tests/unit, tests/integration, ...) and no test carries a pytest marker,
       # so `pytest -m unit` would silently collect zero tests and report a false green.
-      #
-      # wave-1 §17's Tier-0 mandate: ≥90% on platform. Met and enforced — this is a hard gate,
-      # not a ratchet. Keep in step with COVERAGE_FLOOR in apps/server/Makefile.
-      - name: pytest (unit) + coverage floor on platform
-        run: |
-          pytest tests/unit \
-            --cov=sentinelai.platform \
-            --cov-report=term-missing \
-            --cov-report=xml \
-            --cov-fail-under=90
-      - name: Upload coverage report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-xml
-          path: apps/server/coverage.xml
-          if-no-files-found: warn
+      - name: pytest (unit)
+        run: pytest tests/unit
 
   # 6 — Integration tests against real dependencies.
   #
@@ -255,8 +244,33 @@ jobs:
 
       # test_migrations.py is owned by the `migrations` job below — excluded here so the
       # round-trip runs once, not twice.
-      - name: pytest (integration)
-        run: pytest tests/integration --ignore=tests/integration/test_migrations.py -v
+      #
+      # **The platform coverage floor lives here, over unit AND integration together.** It used to
+      # sit on the unit job alone, where it measured 84.65% and had been failing: more than half of
+      # `platform` is code whose whole job is SQL — `platform/admin/*` (0% under unit-only),
+      # `auth/repository.py`, `idempotency/guard.py` — and it is thoroughly tested, by the
+      # integration tests that run in *this* job. The gate was measuring the wrong suites, not
+      # finding untested code. Running unit tests twice in CI costs about a minute and is the
+      # cheaper half of the trade.
+      #
+      # wave-1 §17's Tier-0 mandate: ≥90% on platform. A hard gate, not a ratchet. Keep in step
+      # with COVERAGE_FLOOR in apps/server/Makefile (`make test-coverage` runs exactly this).
+      - name: pytest (unit + integration) + coverage floor on platform
+        run: |
+          pytest tests/unit tests/integration \
+            --ignore=tests/integration/test_migrations.py \
+            --cov=sentinelai.platform \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=90 \
+            -v
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: apps/server/coverage.xml
+          if-no-files-found: warn
 
       # A skipped integration test in CI means a service container did not come up. Surface it
       # as a failure: the whole point of provisioning services is that these tests actually run.

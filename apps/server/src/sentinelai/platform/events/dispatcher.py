@@ -50,6 +50,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Final, cast
 
+import structlog
+from opentelemetry.trace import SpanKind, Status, StatusCode
 from sqlalchemy import or_, select, update
 from sqlalchemy.engine.row import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -63,6 +65,12 @@ from sentinelai.platform.events.envelope import EventEnvelope
 from sentinelai.platform.events.outbox import get_outbox_table
 from sentinelai.platform.events.signing import EventSigner
 from sentinelai.platform.logging import log
+from sentinelai.platform.tracing import (
+    current_trace_id,
+    get_tracer,
+    parent_context,
+    span_attributes,
+)
 
 # Schema→module map (database-design.md §2): every module owns an outbox_events
 # table; `platform` does not publish onto the event bus in Phase 1.
@@ -371,28 +379,81 @@ class EventDispatcher:
         )
 
     async def _deliver(self, event: EventEnvelope, registration: _Registration) -> bool:
-        """Invoke one handler in its own transaction. True on success, False on failure."""
-        try:
-            async with self._session_factory() as session:
-                uow = registration.uow_factory(session)
-                # The factory takes only a session (a contract every module implements), so the
-                # signer is attached here instead — otherwise an event published BY a handler, such
-                # as `notification.dispatched`, would be written unsigned and then refused by this
-                # same dispatcher on the next poll.
-                outbox = getattr(uow, "outbox", None)
-                if outbox is not None and getattr(outbox, "signer", None) is None:
-                    outbox.signer = self._signer
-                await registration.handler(event, uow)
-                await uow.commit()
-            return True
-        except Exception:
-            log.exception(
-                "event_handler_failed",
-                event_id=str(event.event_id),
-                event_type=event.event_type,
-                inbox_schema=registration.inbox_schema,
-            )
-            return False
+        """Invoke one handler in its own transaction. True on success, False on failure.
+
+        **The handler runs inside a span continuing the trace that published the event** (ADR-0018).
+        `envelope.trace_id` carries the publisher's W3C `traceparent`, so the consumer span becomes
+        a child of the HTTP request that caused the write — the whole asynchronous workflow renders
+        as one trace in Tempo rather than as an API request that mysteriously ends and unrelated
+        background work that mysteriously starts.
+
+        A span per *handler*, not per event, because that is the unit whose latency and failure an
+        operator acts on: two handlers on one event succeed and fail independently, and a single
+        span over both would attribute one's failure to the other. `trace_id` is bound into the log
+        context too, which is what makes Part 20's promise — Grafana joining Loki logs to a Tempo
+        trace — true for consumer-side logs and not just HTTP ones.
+
+        An event with no usable `trace_id` gets a **root** span, never a child of whatever the
+        dispatcher happened to be inside. See `context_from_traceparent`: inventing a parent would
+        draw a causal edge that does not exist.
+        """
+        # `parent_context`, not `context_from_traceparent` directly: the SDK reads `None` as
+        # "inherit the current context", which would parent this span onto the relay's own.
+        with (
+            get_tracer().start_as_current_span(
+                f"consume {event.event_type}",
+                context=parent_context(event.trace_id),
+                kind=SpanKind.CONSUMER,
+                attributes=span_attributes(
+                    **{
+                        # Loose messaging-convention naming: the outbox is the transport, the
+                        # module's schema is the destination, and the event id is the message id.
+                        "messaging.system": "sentinelai.outbox",
+                        "messaging.operation": "process",
+                        "messaging.destination.name": registration.inbox_schema,
+                        "messaging.message.id": str(event.event_id),
+                        "sentinelai.event_type": event.event_type,
+                        "sentinelai.correlation_id": str(event.correlation_id),
+                        "sentinelai.causation_id": (
+                            str(event.causation_id) if event.causation_id else None
+                        ),
+                        "sentinelai.attempt": event.attempt_count,
+                    }
+                ),
+            ) as span,
+            # Evaluated after the span above is entered (context expressions are evaluated in
+            # order), so this is that span's trace — the one a consumer-side log line must name.
+            structlog.contextvars.bound_contextvars(
+                correlation_id=str(event.correlation_id),
+                trace_id=current_trace_id(),
+            ),
+        ):
+            try:
+                async with self._session_factory() as session:
+                    uow = registration.uow_factory(session)
+                    # The factory takes only a session (a contract every module implements), so the
+                    # signer is attached here instead — otherwise an event published BY a handler,
+                    # such as `notification.dispatched`, would be written unsigned and then refused
+                    # by this same dispatcher on the next poll.
+                    outbox = getattr(uow, "outbox", None)
+                    if outbox is not None and getattr(outbox, "signer", None) is None:
+                        outbox.signer = self._signer
+                    await registration.handler(event, uow)
+                    await uow.commit()
+                return True
+            except Exception as exc:
+                # Recorded on the span as well as logged: a failed handler is the thing an operator
+                # opens the trace to find, and a span that ended `OK` while its log line said
+                # otherwise would send them to the wrong place.
+                span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+                span.record_exception(exc)
+                log.exception(
+                    "event_handler_failed",
+                    event_id=str(event.event_id),
+                    event_type=event.event_type,
+                    inbox_schema=registration.inbox_schema,
+                )
+                return False
 
     async def _mark(
         self,

@@ -51,7 +51,7 @@ Nothing evidentiary is trustworthy until these exist.
 |---|---|---|---|---|---|---|
 | 4.1 | **CQRS / graph read models** | 0013 | 2.2 | XL | internal | benchmark-gated graph-store decision |
 | 4.2 | **Multi-tenancy** | 0014 | 3.1 | XL | schema | product decision on profiles first |
-| 4.3 | **Observability** (OTel traces/metrics/logs, alerting) | — | 2.2 | L | internal | wire the trace_id already in the envelope |
+| 4.3 | **Observability** (OTel traces/metrics/logs, alerting) | 0018 | 2.2 | L | internal | **traces built** (IC-044) — the `trace_id` in the envelope now carries a W3C `traceparent` and consumer spans continue the publisher's trace. Metrics/logs stay on Prometheus + structlog by decision (ADR-0018 §7); **alerting not built** |
 | 4.4 | **DR / backup + independent integrity attestation** | 0003/0004 | 1.4 | L | ops | anchored roots enable DR integrity proofs |
 | 4.5 | **Redpanda transport** | — (event-driven §Phase-3) | 2.2, 2.3 | L | internal | signatures + envelope already transport-independent |
 

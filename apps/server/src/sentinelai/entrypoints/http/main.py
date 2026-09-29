@@ -45,6 +45,11 @@ from sentinelai.platform.migrations.currency import check_migrations_current
 from sentinelai.platform.security.scanner import build_malware_scanner
 from sentinelai.platform.storage import build_object_storage
 from sentinelai.platform.storage.worm import WormMisconfigured, verify_worm_bucket
+from sentinelai.platform.tracing import (
+    configure_tracing,
+    instrument_fastapi,
+    instrument_sqlalchemy,
+)
 
 # Registered in database-design.md §5 DAG order.
 _MODULE_ROUTERS = (
@@ -64,6 +69,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Validate config, build process-wide resources, and dispose the pool on shutdown."""
     settings.validate_for_profile()  # fail closed on misconfig BEFORE opening any connection
     configure_logging(settings.log_level, json_logs=settings.app_env != "development")
+    # ADR-0018. Here rather than in `create_app()` for two reasons: a tracer provider is
+    # process-wide state, and `create_app()` is called dozens of times by the test suite; and the
+    # provider must exist before the first request, not before the app object does. The ASGI
+    # instrumentation attached in `create_app()` resolves its tracer lazily through the API's proxy
+    # provider, so attaching first and configuring second is the supported order, not a race.
+    configure_tracing(settings, service_name="sentinelai-http", service_version=__version__)
+    instrument_sqlalchemy(engine)
     log.info("http_startup", version=__version__, env=settings.app_env)
 
     # ADR-0006 §1: the outbox relay runs in the WORKER, not here. It used to start in this lifespan,
@@ -190,6 +202,11 @@ def create_app() -> FastAPI:
     )
 
     register_middleware(app)
+    # ADR-0018. **After** `register_middleware`, deliberately: Starlette inserts each new
+    # middleware at the front of the stack, so the last one added runs outermost — which means the
+    # server span is open by the time the correlation middleware binds `trace_id` into the log
+    # context. Added first, it would wrap nothing and every request log line would be traceless.
+    instrument_fastapi(app)
     register_exception_handlers(app)
 
     # Well-known infra endpoints (unversioned).

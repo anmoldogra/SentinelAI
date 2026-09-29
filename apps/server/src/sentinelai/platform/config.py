@@ -154,6 +154,22 @@ class Settings(BaseSettings):
     # and watches `sentinelai_event_signature_failures_total{reason="missing"}` fall to zero.
     events_signature_mode: str = "strict"
 
+    # --- tracing (ADR-0018, deployment-architecture.md Part 20) ---
+    # The OTLP collector to export spans to. **Empty by default, and that is the security-relevant
+    # default**: rule 6 requires air-gapped and classified deployments to have zero configured
+    # egress paths, so a built-in endpoint would be a path out of the enclave nobody chose. An
+    # operator names their in-cluster collector (east-west traffic, not egress) or gets no export —
+    # spans are still created and context still propagates, they are simply dropped.
+    otel_exporter_otlp_endpoint: str = ""
+    # Print spans to stdout. For a developer with no collector; refused in production-grade
+    # profiles, where it would dump span-per-request noise into the structured log stream Loki
+    # parses.
+    otel_console_export: bool = False
+    # Head sampling ratio, applied `ParentBased` so one decision covers a whole workflow rather
+    # than leaving traces with holes in them. 1.0 keeps everything, which is right until volume
+    # says otherwise.
+    otel_traces_sample_ratio: float = 1.0
+
     # --- notification delivery (security-architecture §25) ---
     # log (Phase 1: the in-app notification row is the durable delivery) | smtp | slack, later.
     notification_sender_provider: str = "log"
@@ -246,10 +262,27 @@ class Settings(BaseSettings):
                 "(ADR-0003 §3)."
             )
 
+        # Checked for every profile: a ratio outside [0, 1] is not a policy choice, it is a
+        # typo, and `TraceIdRatioBased` would silently clamp it rather than say so.
+        if not 0.0 <= self.otel_traces_sample_ratio <= 1.0:
+            raise ConfigurationError(
+                f"invalid configuration for profile '{self.app_env}': "
+                "OTEL_TRACES_SAMPLE_RATIO must be between 0.0 and 1.0"
+            )
+
         if not self.is_production:
             return
 
         problems: list[str] = []
+
+        # Span-per-request on stdout would flood the log stream Promtail ships to Loki and bury the
+        # structured events an operator actually greps (deployment-architecture.md Part 20). A
+        # production-grade deployment that wants traces has a collector.
+        if self.otel_console_export:
+            problems.append(
+                "OTEL_CONSOLE_EXPORT must be false in a production-grade profile — set "
+                "OTEL_EXPORTER_OTLP_ENDPOINT to an in-cluster collector instead"
+            )
 
         if self.events_signature_mode not in _EVENT_SIGNATURE_MODES:
             problems.append(

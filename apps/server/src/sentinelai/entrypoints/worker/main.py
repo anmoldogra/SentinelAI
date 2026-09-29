@@ -19,6 +19,7 @@ from typing import Any, ClassVar
 from arq import cron
 from arq.connections import RedisSettings
 
+from sentinelai import __version__
 from sentinelai.entrypoints.consumers import register_all
 from sentinelai.modules.case_management.jobs import generate_case_report
 from sentinelai.modules.forensics.jobs import process_artifact
@@ -37,12 +38,22 @@ from sentinelai.platform.logging import configure_logging, log
 from sentinelai.platform.security.scanner import build_malware_scanner
 from sentinelai.platform.storage import build_object_storage
 from sentinelai.platform.storage.worm import WormMisconfigured, verify_worm_bucket
+from sentinelai.platform.tracing import configure_tracing, instrument_sqlalchemy
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
     """Configure logging and share the engine/session factory with job functions."""
     settings.validate_for_profile()  # fail closed on misconfig BEFORE opening any connection
     configure_logging(settings.log_level, json_logs=settings.app_env != "development")
+    # ADR-0018. A distinct `service.name` from the HTTP process is what makes a trace that crosses
+    # the outbox legible in Tempo: the request span and the consumer span it parents belong to two
+    # processes, and one name for both would render the hop as a service calling itself.
+    #
+    # There is no arq instrumentation package, so a *job* gets no span of its own — the spans this
+    # process produces are the dispatcher's per-handler consumer spans and the SQLAlchemy client
+    # spans beneath them. Recorded as a gap rather than papered over with a hand-rolled wrapper.
+    configure_tracing(settings, service_name="sentinelai-worker", service_version=__version__)
+    instrument_sqlalchemy(engine)
     ctx["engine"] = engine
     ctx["session_factory"] = async_session_factory
     ctx["kms"] = create_kms(settings)  # ADR-0009: jobs sign/verify/encrypt via the KMS facade

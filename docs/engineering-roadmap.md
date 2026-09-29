@@ -1131,7 +1131,7 @@ The consolidated list of every "should be recorded as an ADR" flag raised across
 | Background job framework (arq) | `backend-implementation-guide.md` Part 12 | **Resolved** — formal ADR write-up still pending | — |
 | Container registry, image signing product (Harbor, cosign) | `deployment-architecture.md` Part 5 | **Resolved** — formal ADR write-up still pending | — |
 | GitOps controller (ArgoCD) | `deployment-architecture.md` Part 18 | **Resolved** — formal ADR write-up still pending | — |
-| Monitoring stack (Prometheus/Grafana/Loki/Tempo/Alertmanager) | `deployment-architecture.md` Part 20 | **Resolved** — formal ADR write-up still pending | — |
+| Monitoring stack (Prometheus/Grafana/Loki/Tempo/Alertmanager) | `deployment-architecture.md` Part 20 | **Resolved and recorded** — ADR-0018 (tracing built; alerting still open) | — |
 | Feature flag service (Unleash) | `deployment-architecture.md` Part 12 | **Resolved** — formal ADR write-up still pending | — |
 
 Every "Open" row above is this document's honest admission of what remains undecided — Part 28's risk register and Part 5–8's phase scoping both already account for the ones that block near-term work. Every "Resolved — formal ADR write-up still pending" row is a lower-urgency but still real task: the decision has already been made and is already being scheduled against elsewhere in this document, but the written record `CLAUDE.md`'s convention requires does not yet exist — Part 24's documentation tasks and Part 30's final checklist both call this out as something to close before, not during, Phase 1's first sprint.

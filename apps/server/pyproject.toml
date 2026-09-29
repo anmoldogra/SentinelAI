@@ -43,6 +43,17 @@ dependencies = [
     # S3-compatible object storage client (MinIO/S3) — the client named by
     # backend-implementation-guide.md Part 9's ObjectStorage sketch (ADR-0008).
     "aioboto3>=13.0",
+    # Distributed tracing (ADR-0018). deployment-architecture.md Part 20 commits to Tempo
+    # receiving OpenTelemetry spans, and guide Part 10 to instrumenting FastAPI and SQLAlchemy.
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+    # OTLP over **HTTP/protobuf**, not gRPC. Same reasoning as asn1crypto above: the gRPC exporter
+    # pulls in `grpcio`, a native extension whose wheels are platform-specific and whose absence
+    # turns an air-gapped mirror into a build toolchain. Tempo accepts both; only one of them
+    # mirrors cleanly into an enclave (deployment-architecture.md Part 1).
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
 ]
 
 [project.optional-dependencies]
