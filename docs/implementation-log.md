@@ -3028,3 +3028,146 @@ actively read.
 Next roadmap items in Wave 4: multi-tenancy (ADR-0014, gated on a product decision about deployment
 profiles), observability (OTel over the `trace_id` already in the envelope), and DR/backup with
 independent integrity attestation.
+
+---
+
+## 2026-09-29 — IC-041: Phase 2 begins — the OSINT connector pipeline (api-design.md §4.3, CEM §9)
+
+**Type:** The first feature increment after eleven infrastructure ones. No new schema, no new table, no
+new endpoint — the `osint` module's seven routes already existed and were already registered. What did
+not exist was any of their behaviour.
+
+### What was actually there
+
+`osint` and `threat_intel` both looked complete from the outside: routers wired, migrations applied,
+consumers registered, ETag headers declared. **Every service and repository method raised
+`NotImplementedError`**, and neither module published a single event. The routers were signatures over
+nothing — which is worse than absent, because the surface reads as working.
+
+One domain, done end to end, rather than two half-built: **OSINT**. It is the self-contained pipeline
+(register a source → capture a finding → normalize into the CEM), it has a fully-specified publish
+contract in §4.3, and its events are documented in §25.3. `threat_intel`'s `ioc_matched` needs matching
+IOCs against ingested evidence, which is a cross-module correlation problem rather than an intake one,
+and is left for its own increment.
+
+### The constraint that had to be resolved against the docs
+
+The instruction was that the domain module "must not write directly to ingestion or investigation; it
+must communicate strictly via outbox events". Strictly-via-outbox is not implementable against the
+documented contract, and the conflict is worth recording rather than silently resolving:
+
+`api-design.md` §4.3 specifies publish's outcome as a **`200` whose body carries `evidence_id`**, plus
+an `ingestion.evidence_custody_events` genesis entry. An outbox hand-off cannot produce either — the
+evidence does not exist when the response is written. §4.3 also says `evidence.ingested` is published
+"**indirectly** ... by `ingestion` once the evidence row commits", which only makes sense if `osint`
+called `ingestion` synchronously.
+
+So publish calls `ingestion` through its `public.py`, which `CLAUDE.md` names as the sanctioned
+cross-module path ("only through that module's `public.py`"); what is forbidden is importing another
+module's `models.py`/`repository.py` or touching its tables, and neither happens. The stricter reading
+of the constraint — no direct *table* access — holds. The import DAG already permits it
+(`osint` sits above `ingestion`), and import-linter confirms it.
+
+`ingestion.public` gained `EvidenceCreate` and `get_evidence_service`. Exporting the **provider** and
+not just the class is the part that keeps the boundary honest: a sibling asks for a configured service
+and never learns how one is built, so ingestion's storage and KMS wiring stay ingestion's.
+
+### CEM §9's mapping profile does not exist, and was not invented
+
+§9 step 2 specifies a "connector mapping profile — a versioned, declarative field-mapping definition,
+**not** per-connector business logic embedded in the ingestion path". `database-design.md` §3.2 records
+a `mapping_profile_version` on `connector_registry` and models **no table holding the profiles**. There
+is nowhere to read a declarative mapping from.
+
+Writing the per-connector logic §9 forbids was the wrong answer; so was inventing a table
+(`CLAUDE.md` rule 1). Publish instead maps a **fixed envelope**: the connector states the CEM fields in
+`raw_attributes`, and anything missing is a `422` naming exactly which. That keeps the mapping
+declarative — the connector declares it — keeps §9's Validate step loud rather than silent (FR-1.3), and
+leaves the profile store as a recorded gap. A finding whose fields are wrong stays captured and
+re-publishable once a profile store exists.
+
+Two things are deliberately **not** taken from the payload. `category` is fixed to `osint`, and `source`
+is built from the registered `OsintSource` — a connector must not be able to attribute its output to a
+different system or mislabel its own provenance.
+
+### Where the pipeline's steps live
+
+CEM §9 is Extract→Map→Enrich→Validate→Commit, and only the middle step is `osint`'s. Extract is the
+connector's (`raw_attributes` holds the raw output, stored **unmodified** per §9 step 1 — validating its
+CEM shape at capture would reject findings a future profile could handle, and the raw record is what an
+examiner returns to when a mapping is later found wrong). Enrich, Validate and Commit are `ingestion`'s.
+That split is the point: §13's rules and the custody genesis entry belong to the module that owns the
+evidence table, and a second implementation here would give the platform two places to disagree about
+whether an evidence object is admissible. A test asserts osint does not bypass it — an unregistered
+`(schema_version, category, artifact_type)` triple is refused.
+
+### Two bugs the tests found
+
+**The mapping omitted `source.collector_id`.** `ingestion` requires both `system` and `collector_id` for
+provenance; CEM §5's OSINT example shows `system` and `collection_method`, so the example's shape alone
+was not sufficient. `collector_id` is now the registered source's own id, which ties every published
+evidence object back to the exact feed configuration and survives the source being renamed.
+
+**The findings cursor passed an ISO string into a `timestamptz` comparison.** Keyset pagination over
+`(collected_at, finding_id)` needs the sort value parsed back to a `datetime`; the string produced a
+Postgres type error rather than a wrong answer, which is the good failure mode — but only because the
+row-value comparison is typed at all.
+
+### Decisions recorded rather than left implicit
+
+`osint.finding_captured` fires on **capture**, not publish. §25.3's trigger is "a connector or manual
+entry creates a finding"; §4.3 also lists the event under publish's "Events Published". §25.3 is
+authoritative for the event catalog and is what the code follows.
+
+`register_source` publishes `osint.source_activated`, because a newly-registered source *is* newly
+active — a consumer tracking live feeds would otherwise miss every source never toggled after creation.
+`update_source` publishes only on an actual transition, so editing a reliability baseline does not
+announce a toggle that did not happen.
+
+The pre-publish finding status (`captured`) is an assumption: §3.3 requires a `status` column and §4.3
+fixes only the post-publish value. It matches the event name so the two cannot drift into describing
+different things.
+
+`collected_at` is server-assigned. A connector does not get to state when the platform received its
+finding — backdating a record into an already-anchored window is the failure ADR-0003's anchor watermark
+exists to prevent, and a test pins it.
+
+### Tests
+
+**41 new** — 25 against real Postgres, 16 over HTTP.
+
+The Postgres suite spans three schemas because the pipeline genuinely does: the finding in `osint`, the
+evidence and custody entry in `ingestion`, the audit entry in `platform`. It **verifies the outbox
+signature with the real `EventSigner`** rather than asserting the column is non-null — ADR-0007's claim
+is that a consumer can prove provenance, and populated bytes that verify against nothing would satisfy
+a weaker test. It also proves each module publishes only its own facts to its own outbox
+(`osint.finding_captured` in `osint`, `evidence.ingested` in `ingestion`, and no `evidence.*` in
+`osint`), which is the module boundary made observable.
+
+The HTTP suite checks the contract a connector programs against: the `Idempotency-Key` replay, the
+`409` on a reused key with a different payload, §4.3's per-endpoint RBAC, and the ETag guard. Both
+idempotency assertions check a **call counter**, not just matching bodies — "a retried push does not
+double-create" means the service was not re-entered.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (237 files), import-linter (2/2 kept — `osint → ingestion` is
+within the documented DAG). Full suite **1357 passed / 2 skipped**. Platform coverage **95.65%** against the 90%
+floor.
+
+### Carried forward
+
+**`threat_intel` is still a scaffold** — every service and repository method raises
+`NotImplementedError`, as do `forensics` and `social_media`. The same is true of `osint`'s
+`ConnectorStateRepository.get_for_source`, which exists for the polling loop that does not yet run: the
+intake surface is built, the *automated collection* behind it is not.
+
+**No connector mapping-profile store**, per above. Until it exists, every publisher must state the CEM
+envelope itself, which works for manual entry and for a connector written against this API but not for
+a declarative profile an operator edits.
+
+**No OSINT polling schedule.** §25.3 describes osint as "driven by its own connector polling schedule";
+nothing schedules one, so findings arrive only by push.
+
+Next: `threat_intel`'s intake is the natural sibling increment, and the IOC-matching path that feeds
+`threat_intel.ioc_matched` is the first genuinely cross-domain correlation work.

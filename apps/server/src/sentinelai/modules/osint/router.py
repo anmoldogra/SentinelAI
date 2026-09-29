@@ -72,7 +72,9 @@ async def update_source(
     current_user: CurrentUser = Depends(require_role("admin")),
     service: OsintService = Depends(get_osint_service),
 ) -> Envelope[SourceRead]:
-    source = await service.update_source(source_id, payload, current_user, if_match)
+    source = await service.update_source(
+        source_id, payload, current_user, if_match, request.state.correlation_id
+    )
     return Envelope(data=SourceRead.model_validate(source), meta=_meta(request))
 
 
