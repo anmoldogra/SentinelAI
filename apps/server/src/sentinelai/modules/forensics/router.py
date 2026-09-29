@@ -1,4 +1,4 @@
-"""forensics HTTP routes — api-design.md §5 (Forensics). Parse and delegate only."""
+"""forensics HTTP routes — api-design.md §4.5. Parse and delegate only."""
 
 from __future__ import annotations
 
@@ -39,10 +39,10 @@ async def list_artifacts(
     current_user: CurrentUser = Depends(require_role("investigator")),
     service: ForensicsService = Depends(get_forensics_service),
 ) -> ListEnvelope[ArtifactRead]:
-    items = await service.list_artifacts(current_user, page)
+    items, next_cursor, has_more = await service.list_artifacts(current_user, page)
     return ListEnvelope(
         data=[ArtifactRead.model_validate(i) for i in items],
-        pagination=Pagination(next_cursor=None, has_more=False, limit=page.limit),
+        pagination=Pagination(next_cursor=next_cursor, has_more=has_more, limit=page.limit),
         meta=_meta(request),
     )
 

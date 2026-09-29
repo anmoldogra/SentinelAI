@@ -3744,3 +3744,178 @@ Keeping the slow and failed traces specifically is collector-side configuration,
 
 **`notification` still publishes without `causation_id`** (IC-043), so §11's causal chain still breaks
 at its last hop even though the *trace* now spans it.
+
+---
+
+## 2026-09-29 — IC-045: forensics — artifact intake, CEM publication, and ADR-0008's hash check
+
+**Type:** Phase 2's third connector module. `forensics` was a signature-only scaffold like `osint`
+and `threat_intel` before it — routers wired, migrations applied, every service and repository method
+raising `NotImplementedError`. No migration was needed: `database-design.md` §3.3's columns were
+already right.
+
+### Forensics is stricter than `osint`, and both reasons are legal rather than technical
+
+**Legal authority is mandatory and has no default.** CEM §13 requires
+`classification.legal_authority_ref` for `digital_forensics` and `mobile_forensics`, and `osint`'s
+answer — the `public_source_no_authority_required` sentinel — is unavailable by definition: a device
+extraction is not a public source. So publication demands the reference and refuses without it.
+There is nothing safe to fall back to, and inventing one would put evidence in a case file with a
+fabricated lawful basis.
+
+**The acquisition hash is a claim, and ADR-0008 §3 tests it.** `acquisition_hash` is what the imaging
+tool reported. On publish it becomes the evidence object's `integrity.hash`, which `ingestion`
+**recomputes from the stored bytes and rejects on mismatch** — so an image whose stored object does
+not match the tool's manifest cannot become evidence. That is the point of carrying the hash through
+rather than trusting it, and it is what the task meant by linking artifact verification to ADR-0008's
+streaming check: the two hashes are compared by the module that can see the bytes. Tested with a
+well-formed digest of a *different* image, which is the case only a server-side recompute catches.
+
+### `acquisition_hash` carries its own algorithm, and that was forced
+
+§4.5 requires the hash and requires that it "match the declared algorithm's format" — while §3.3
+gives the table no algorithm column. Length cannot supply one: 64 hex characters are a SHA-256 **or**
+a SHA-3-256, and guessing puts the wrong label on an evidentiary integrity field, where the label is
+what a verifier trusts. A mislabelled digest verifies against nothing, forever, and nothing
+downstream notices.
+
+So the value is self-describing: `ALGORITHM:hexdigest`. That is **not a new format** — it is exactly
+what `shared.cem.IntegrityHash.__str__` already renders, so the parse is that value object's own
+inverse and now lives on it as `IntegrityHash.parse`. Two places that write a format and one that
+reads it is how a format drifts; both halves belong together. `parse` also inherits the check that
+matters most, the length-versus-label one, and re-points the `422` at the caller's field name so an
+examiner is told `acquisition_hash` is wrong rather than a field name from ingestion's vocabulary.
+
+The mapping re-parses the stored value rather than splitting the string, deliberately. The column is
+plain text with no database constraint, so a row could reach publication carrying something this
+platform would no longer accept — a migration, a manual fix, an older client — and re-parsing means
+it fails loudly instead of handing `ingestion` an algorithm/digest pair assembled from garbage.
+
+### `device_info` is the envelope, and its name is narrower than the job
+
+§3.3 gives this table four artifact columns plus the common three. The CEM fields they do not cover —
+`schema_version`, `title`, `attributes`, `legal_authority_ref` — have to come from somewhere, and
+CEM §9's "connector mapping profile" store still does not exist (§3.2 records a
+`mapping_profile_version` and models no table to hold the profiles). So `device_info` carries them,
+the same fixed-envelope decision `osint` made for `raw_attributes`, for the same recorded gap.
+
+**Called out rather than smoothed over**, because reading a warrant reference out of a field named
+`device_info` is not self-evidently right. The two alternatives are worse: writing the per-connector
+logic §9 explicitly forbids, or inventing columns §3.3 does not model. It is the least wrong option
+until the profile store exists, and an artifact whose envelope is incomplete stays registered and
+publishable later rather than being lost.
+
+### One module, two CEM categories — so the kind decides, not the caller
+
+`osint` fixes `category` to a constant. `forensics` cannot: CEM §5 keeps `mobile_forensics` separate
+from `digital_forensics` precisely because the tools and attribute shapes differ, and this one module
+produces both. So `category` is **derived from `artifact_kind`** against CEM §6's two lists, which
+also closes a hole a fixed constant would not have had: a caller who could name the category could
+file a phone extraction as a disk image and dodge a different attributes schema.
+
+The same derivation is §4.5's validation rule ("`artifact_kind` ∈ CEM §6's
+`digital_forensics`/`mobile_forensics` artifact types"), so it is enforced in one place and
+registration and publication cannot disagree about which kinds exist.
+
+**A kind can be registerable and not yet publishable**, and that is asserted rather than left to
+surprise someone. `202608300002_ingestion_seed` registers attribute schemas for exactly two forensic
+triples — `digital_forensics/forensic_image` and `mobile_forensics/oxygen_extraction` — and CEM §13
+refuses an unregistered one. The other fourteen kinds register fine and fail at publish until their
+schema exists. The registry is additive by §12, so this is a state to grow out of, not a bug.
+
+### The catalog conflict, resolved the same way as IC-042
+
+§25.5 triggers `forensics.artifact_registered` when "`POST /forensics/artifacts` commits";
+api-design.md §4.5's table for the same endpoint says "Events Published: **none at this step**". They
+cannot both hold, and `CLAUDE.md` makes `event-driven-architecture.md` authoritative for the event
+catalog — identical to the `threat_intel.ioc_registered` conflict in IC-042, resolved identically, so
+the platform does not end up with two rules about which document wins.
+
+`forensics.artifact_processed` is published on publication, carrying the `evidence_id` it produced
+(§25.5's payload). Both events are signed under `EVENT_ROOT`, and both carry an `actor_ref`: unlike a
+threat-intel match, an examiner did perform these acts.
+
+### The parser is not built, and the job says so
+
+§25.5's trigger for `artifact_processed` is "artifact parsing/normalization completes", and the two
+halves are built to different depths. *Normalization* — mapping the registered record onto the CEM —
+is built and runs synchronously on publish. *Parsing* — opening an E01 image, walking an Oxygen
+extraction, decoding a `registry_hive` into rows — is not: every format needs its own parser.
+
+`jobs.process_artifact` therefore raises a named `ArtifactParserNotConfigured`, the same shape
+`threat_intel`'s `FeedTransportNotConfigured` took in IC-042. Stamping an artifact `processed` and
+announcing it for content nobody extracted would tell an examiner their disk image had been analysed
+when the platform had not read a byte of it. In a domain whose output is evidence, a silent no-op is
+the worst available outcome.
+
+### Two things done differently from `osint`, on purpose
+
+**The mapping is module-level, not a service method.** `map_artifact_to_cem` and `category_for_kind`
+touch no service state — one needs an artifact and the examiner, the other a string. That is the
+shape `threat_intel`'s matcher settled on and it is better: the validation an examiner hits most
+often is reachable without constructing a service around an object storage client and a KMS it never
+calls, which is why this module's mapping rules have 29 unit tests and `osint`'s have none.
+
+**The list endpoint returns a real cursor.** `osint`'s hands back `next_cursor: null` unconditionally
+while its repository supports keyset paging, so a client cannot page it — a pre-existing gap, now
+recorded. `forensics` computes the cursor from one extra fetched row, so "is there a next page" is
+answered by the query rather than guessed, and a test asserts the cursor actually advances.
+
+### A shared test double, because this was the third copy
+
+The `AsyncSession` stand-in every "Yes (key)" endpoint's suite needs had already been copied into
+`test_osint_api.py` and `test_threat_intel_api.py`; this increment would have made three. It is now
+`tests/fixtures/idempotency.py`, with the part that must not be simplified away spelled out: the
+claim row shares the request's transaction, so "a failed submission leaves its key reusable" is a
+property of ROLLBACK, and a double that kept the row would assert the opposite of production while
+passing.
+
+### A test that was wrong about the platform, not the platform about itself
+
+The first draft asserted `422` for a request body missing a required field. It is **400**, and §2.4
+says so explicitly: `VALIDATION_FAILED` is "400 or 422 — request malformed (400) or fails
+domain/business rules (422)". A body missing a field never reached a domain rule. The test now pins
+the split in both directions, because it is exactly the kind of distinction that drifts endpoint by
+endpoint.
+
+Also worth recording for the next connector: `_NOW` in the first draft of the Postgres suite was
+*ahead* of the test clock, and CEM §13's clock-skew rule fires before the payload recompute — so
+every integrity assertion in the file failed while pointing at the wrong rule. Acquisition times in
+tests belong in the past.
+
+### Tests
+
+**69 new** — 29 unit on the mapping, 5 on `IntegrityHash.parse`, 21 against real Postgres, 19 over
+HTTP (with two existing suites moved onto the shared double).
+
+The Postgres file wires the real `ForensicsService` to the real `EvidenceService` over **one
+session**, which is what production does (ADR-0005) and what makes "the artifact and its evidence
+commit together" testable: a rejected publish is asserted to leave the artifact unpublished, with no
+`artifact_processed` event announcing something that did not happen. The unit file is built around
+the rules with legal consequences — which category an acquisition is filed under, whether a warrant
+reference is present, whether the integrity hash means what its label says.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (242 source files), import-linter (2/2 kept). Unit +
+integration **1598 passed / 1 skipped**; platform coverage **95.37%** against the 90% floor,
+measured by the command CI runs since IC-044.
+
+### Carried forward
+
+**No acquisition-format parser**, per above — `jobs.process_artifact` refuses by name, and
+per-artifact rows are not extracted from a container.
+
+**`social_media` is the last scaffold.** Every service and repository method still raises
+`NotImplementedError`, exactly as `osint`, `threat_intel` and `forensics` did.
+
+**Fourteen of CEM §6's sixteen forensic kinds cannot publish yet** — no registered attribute schema.
+Seeding them is an `ingestion` migration, not a forensics change.
+
+**`osint`'s list endpoint still returns no cursor**, now that the difference is visible. A two-line
+fix in its service and router, deliberately not bundled into another module's increment.
+
+**No custody `collected` entry distinct from `ingested`.** CEM §13 permits either as the genesis
+event, and `ingestion` writes `ingested`. A forensic acquisition arguably happened at `collected_at`,
+before the platform saw it — representing that faithfully is a custody-model question for
+`ingestion`, not something to decide inside a connector.

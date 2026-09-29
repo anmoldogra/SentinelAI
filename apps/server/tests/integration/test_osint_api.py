@@ -35,6 +35,7 @@ from sentinelai.platform.auth.dependencies import CurrentUser, get_current_user
 from sentinelai.platform.crypto import get_kms
 from sentinelai.platform.idempotency.guard import HEADER_NAME, REPLAY_HEADER
 from sentinelai.shared.exceptions import PreconditionFailedError
+from tests.fixtures.idempotency import IdempotencySession
 from tests.fixtures.kms import kms_for_tests
 
 _KEY = "osint-idem-key-00000001"
@@ -128,85 +129,7 @@ class _StubService:
         return self._finding(published=True)
 
 
-class _IdempotencySession:
-    """The slice of ``AsyncSession`` the idempotency repository uses, honouring rollback.
-
-    Modelling rollback is not optional: the claim shares the request's transaction, so "a failed
-    push
-    leaves its key reusable" is a property of ROLLBACK, and a fake that kept the row would assert
-    the
-    opposite of production.
-    """
-
-    def __init__(self) -> None:
-        self.rows: dict[tuple[UUID, str, str], Any] = {}
-        self._pending: list[tuple[UUID, str, str]] = []
-        self.commits = 0
-
-    def add(self, row: Any) -> None:
-        from sentinelai.platform.idempotency.models import IdempotencyKey
-
-        if isinstance(row, IdempotencyKey):
-            claim = (row.principal_id, row.idempotency_key, row.path)
-            if claim in self.rows:
-                from sqlalchemy.exc import IntegrityError
-
-                raise IntegrityError("duplicate claim", None, Exception("uq_idempotency_claim"))
-            self.rows[claim] = row
-            self._pending.append(claim)
-
-    async def flush(self) -> None:
-        return None
-
-    async def delete(self, row: Any) -> None:
-        claim = (row.principal_id, row.idempotency_key, row.path)
-        self.rows.pop(claim, None)
-        if claim in self._pending:
-            self._pending.remove(claim)
-
-    async def execute(self, statement: Any) -> Any:
-        return _Result(self, statement)
-
-    def begin_nested(self) -> _Savepoint:
-        return _Savepoint()
-
-    async def commit(self) -> None:
-        self.commits += 1
-        self._pending.clear()
-
-    async def rollback(self) -> None:
-        for claim in self._pending:
-            self.rows.pop(claim, None)
-        self._pending.clear()
-
-
-class _Savepoint:
-    async def __aenter__(self) -> _Savepoint:
-        return self
-
-    async def __aexit__(self, *exc: object) -> bool:
-        return False
-
-
-class _Result:
-    def __init__(self, session: _IdempotencySession, statement: Any) -> None:
-        self._session = session
-        self._statement = statement
-
-    def scalar_one_or_none(self) -> Any:
-        found: dict[str, Any] = {}
-        clauses = getattr(self._statement, "whereclause", None)
-        for clause in getattr(clauses, "clauses", []):
-            left, right = getattr(clause, "left", None), getattr(clause, "right", None)
-            if left is not None and right is not None and hasattr(right, "value"):
-                found[left.name] = right.value
-        key = (found.get("principal_id"), found.get("idempotency_key"), found.get("path"))
-        if None in key:
-            return None
-        return self._session.rows.get(key)  # type: ignore[arg-type]
-
-
-def _app(service: _StubService, actor: CurrentUser, store: _IdempotencySession) -> Any:
+def _app(service: _StubService, actor: CurrentUser, store: IdempotencySession) -> Any:
     from sentinelai.platform.db.session import get_session
 
     app = create_app()
@@ -223,8 +146,8 @@ def service() -> _StubService:
 
 
 @pytest.fixture
-def store() -> _IdempotencySession:
-    return _IdempotencySession()
+def store() -> IdempotencySession:
+    return IdempotencySession()
 
 
 async def _client(app: Any) -> AsyncClient:
@@ -246,7 +169,7 @@ def _finding_body(source_id: UUID) -> dict[str, Any]:
 
 # --- the connector push -----------------------------------------------------
 async def test_a_connector_can_push_a_finding(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     async with await _client(_app(service, _INVESTIGATOR, store)) as client:
         response = await client.post(
@@ -261,7 +184,7 @@ async def test_a_connector_can_push_a_finding(
 
 
 async def test_a_retried_push_replays_and_does_not_re_execute(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """Wave 3.2's store, on the endpoint §4.3 marks "Yes (key)".
 
@@ -283,7 +206,7 @@ async def test_a_retried_push_replays_and_does_not_re_execute(
 
 
 async def test_the_same_key_with_a_different_payload_is_a_conflict(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """api-design.md §2.9: `409 IDEMPOTENCY_KEY_CONFLICT`. A connector reusing one key across two
     different findings is the bug the store exists to catch."""
@@ -306,7 +229,7 @@ async def test_the_same_key_with_a_different_payload_is_a_conflict(
 
 
 async def test_two_findings_without_keys_both_land(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """No key means no deduplication — the guard is a no-op without the header, so nothing changes
     for a connector that does not send one."""
@@ -321,7 +244,7 @@ async def test_two_findings_without_keys_both_land(
 
 # --- publishing -------------------------------------------------------------
 async def test_publishing_returns_the_evidence_id(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """§4.3's response body carries `finding_id`, `evidence_id` and `status: "published"` — the
     synchronous outcome that makes this a call into `ingestion` rather than an outbox hand-off."""
@@ -335,9 +258,7 @@ async def test_publishing_returns_the_evidence_id(
     assert body["finding_id"]
 
 
-async def test_a_system_actor_may_publish(
-    service: _StubService, store: _IdempotencySession
-) -> None:
+async def test_a_system_actor_may_publish(service: _StubService, store: IdempotencySession) -> None:
     """§4.3 grants publish to `investigator` **or** `system`: an automated connector pipeline
     publishes its own findings without a human in the loop."""
     async with await _client(_app(service, _SYSTEM, store)) as client:
@@ -364,7 +285,7 @@ async def test_a_system_actor_may_publish(
 )
 async def test_rbac_matches_the_documented_roles(
     service: _StubService,
-    store: _IdempotencySession,
+    store: IdempotencySession,
     method: str,
     path: str,
     actor: CurrentUser,
@@ -384,7 +305,7 @@ async def test_rbac_matches_the_documented_roles(
 
 # --- ETag -------------------------------------------------------------------
 async def test_updating_a_source_requires_a_matching_if_match(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """§4.3 marks the source PATCH "No (ETag)" — optimistic concurrency rather than an idempotency
     key, because two operators editing one feed's reliability must not silently overwrite each
@@ -407,7 +328,7 @@ async def test_updating_a_source_requires_a_matching_if_match(
 
 
 async def test_the_source_patch_requires_if_match_at_all(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """The header is declared required, so omitting it is a 400 rather than an unguarded write."""
     async with await _client(_app(service, _ADMIN, store)) as client:

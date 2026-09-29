@@ -103,6 +103,40 @@ class TestIntegrityHash:
             with pytest.raises(ValidationFailedError):
                 IntegrityHash("SHA-256", digest)
 
+    def test_parse_is_the_exact_inverse_of_str(self) -> None:
+        """The round trip is the contract: whatever `__str__` writes, `parse` must read back.
+
+        Two places that write a format and one that reads it is how a format drifts, which is why
+        both live on this value object rather than in the module that needed the parse
+        (`forensics.artifacts.acquisition_hash` — §3.3 gives it no algorithm column).
+        """
+        original = IntegrityHash("SHA-512", "b" * 128)
+
+        assert IntegrityHash.parse(str(original)) == original
+
+    def test_parse_requires_the_algorithm_to_be_stated(self) -> None:
+        """A bare digest cannot be read: 64 hex characters are a SHA-256 *or* a SHA-3-256, and
+        guessing puts the wrong label on an evidentiary integrity field — where the label is what a
+        verifier trusts, so the hash would then verify against nothing forever."""
+        with assert_rejects("integrity_hash", "ALGORITHM"):
+            IntegrityHash.parse("a" * 64)
+
+    def test_parse_accepts_the_algorithm_in_any_case(self) -> None:
+        """`sha-256` and `SHA-256` are one algorithm; a tool's casing is not a failure."""
+        assert IntegrityHash.parse(f"sha-256:{'a' * 64}").algorithm == "SHA-256"
+
+    def test_parse_does_not_downcase_the_digest(self) -> None:
+        """A digest is lowercase hex by rule. Silently down-casing would hide a tool emitting upper
+        case, and the next tool to read that column would disagree about what it holds."""
+        with assert_rejects("integrity_hash", "lowercase"):
+            IntegrityHash.parse(f"SHA-256:{'A' * 64}")
+
+    def test_parse_reports_the_field_the_caller_named(self) -> None:
+        """So an examiner is told `acquisition_hash` is wrong, not a field name from another
+        module's vocabulary."""
+        with assert_rejects("acquisition_hash", "mislabelled"):
+            IntegrityHash.parse(f"SHA-512:{'a' * 64}", field="acquisition_hash")
+
     def test_a_digest_whose_length_disagrees_with_its_label_is_refused(self) -> None:
         """The check a hand-rolled validator usually omits.
 

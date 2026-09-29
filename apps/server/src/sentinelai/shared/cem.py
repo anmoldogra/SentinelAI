@@ -54,6 +54,12 @@ _DIGEST_HEX_LENGTHS: Final[dict[str, int]] = {
     "SHA-512": 128,
 }
 
+# Case-insensitive lookup for :meth:`IntegrityHash.parse`. Derived from the set above rather than
+# written out, so a new permitted algorithm cannot be accepted by one and rejected by the other.
+_ALGORITHM_BY_CASEFOLD: Final[dict[str, str]] = {
+    name.casefold(): name for name in INTEGRITY_ALGORITHMS
+}
+
 # CEM §4's custody event-type enum.
 CUSTODY_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
@@ -138,6 +144,42 @@ class IntegrityHash:
                 f"{self.algorithm} produces {expected} hex characters, got {len(self.digest)} — "
                 "a digest whose length disagrees with its label is mislabelled, not truncated",
             )
+
+    @classmethod
+    def parse(cls, value: str, *, field: str = "integrity_hash") -> IntegrityHash:
+        """Parse the ``ALGORITHM:digest`` form :meth:`__str__` produces. The exact inverse.
+
+        Exists because some records carry a digest in **one** column and still have to state which
+        algorithm produced it — `forensics.artifacts.acquisition_hash` is the case that needed it
+        (`database-design.md` §3.3 gives it no algorithm column, and a 64-character digest is a
+        SHA-256 *or* a SHA-3-256, so length cannot answer it). A self-describing value keeps the
+        label attached to the digest instead of inferring one, and inferring the wrong label on an
+        evidentiary integrity field would make the hash verify against nothing forever.
+
+        Lives here rather than in the module that needed it because the format is this value
+        object's own rendering: two places that both know how to write it and only one that knows
+        how to read it is how a format drifts.
+
+        The algorithm is matched case-insensitively (`sha-256` is the same algorithm as `SHA-256`)
+        and normalized to CEM §13's spelling; the digest is not, because a digest is lowercase hex
+        by rule and silently down-casing a caller's value would hide a tool emitting upper case.
+        """
+        algorithm, separator, digest = value.partition(":")
+        if not separator:
+            raise _reject(
+                field,
+                "must be '<ALGORITHM>:<hexdigest>' so the digest states which algorithm produced "
+                f"it; permitted algorithms: {sorted(INTEGRITY_ALGORITHMS)}",
+            )
+        canonical = _ALGORITHM_BY_CASEFOLD.get(algorithm.strip().casefold(), algorithm.strip())
+        try:
+            return cls(algorithm=canonical, digest=digest.strip())
+        except ValidationFailedError as exc:
+            # Re-point the 422 at the field the caller actually sent, so an examiner is told
+            # `acquisition_hash` is wrong rather than a field name from ingestion's vocabulary.
+            raise ValidationFailedError(
+                [{"field": field, "message": detail["message"]} for detail in exc.details]
+            ) from exc
 
     def matches(self, other: IntegrityHash) -> bool:
         """Whether two hashes assert the same thing.

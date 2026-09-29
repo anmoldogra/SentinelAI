@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import Depends
+from sqlalchemy import Select, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinelai.modules.forensics.models import Artifact
@@ -24,13 +26,39 @@ class ArtifactRepository:
         self._session = session
 
     async def get_by_id(self, artifact_id: UUID) -> Artifact | None:
-        raise NotImplementedError
+        result = await self._session.execute(
+            select(Artifact).where(Artifact.artifact_id == artifact_id)
+        )
+        return result.scalar_one_or_none()
 
     async def add(self, artifact: Artifact) -> None:
-        raise NotImplementedError
+        self._session.add(artifact)
+        await self._session.flush()
 
-    async def list_(self, *, limit: int, cursor: str | None) -> Sequence[Artifact]:
-        raise NotImplementedError
+    def _page(self, *, limit: int, after: tuple[datetime, UUID] | None) -> Select[tuple[Artifact]]:
+        stmt = select(Artifact)
+        if after is not None:
+            collected_at, artifact_id = after
+            # Row-value comparison, so the composite key acts as one cursor rather than two
+            # independent conditions — "strictly after this (timestamp, id) pair".
+            stmt = stmt.where(
+                tuple_(Artifact.collected_at, Artifact.artifact_id) > (collected_at, artifact_id)
+            )
+        return stmt.order_by(Artifact.collected_at.asc(), Artifact.artifact_id.asc()).limit(limit)
+
+    async def list_(
+        self, *, limit: int, after: tuple[datetime, UUID] | None = None
+    ) -> Sequence[Artifact]:
+        """One page of artifacts, oldest first.
+
+        Ascending for the reason `osint` gives for findings: an examiner works a backlog forward,
+        and with newest-first every poll changes what "page 2" holds. ``collected_at`` is the
+        acquisition time an examiner recognises, with ``artifact_id`` breaking ties — two artifacts
+        pulled from one device in the same acquisition share a timestamp, so the id is not
+        decoration.
+        """
+        result = await self._session.execute(self._page(limit=limit, after=after))
+        return result.scalars().all()
 
 
 class ForensicsUnitOfWork(UnitOfWork):

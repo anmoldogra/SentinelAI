@@ -32,7 +32,7 @@ from sentinelai.platform.auth.dependencies import CurrentUser, get_current_user
 from sentinelai.platform.crypto import get_kms
 from sentinelai.platform.db.session import get_session
 from sentinelai.platform.idempotency.guard import HEADER_NAME, REPLAY_HEADER
-from sentinelai.platform.idempotency.models import IdempotencyKey
+from tests.fixtures.idempotency import IdempotencySession
 from tests.fixtures.kms import kms_for_tests
 
 _KEY = "ti-idem-key-000000001"
@@ -136,81 +136,7 @@ class _StubService:
         self._count("sync_feed")
 
 
-class _IdempotencySession:
-    """The slice of ``AsyncSession`` the idempotency repository uses, honouring rollback.
-
-    Rollback matters: the claim shares the request's transaction, so "a failed submission leaves its
-    key reusable" is a property of ROLLBACK, and a fake that kept the row would assert the opposite
-    of production.
-    """
-
-    def __init__(self) -> None:
-        self.rows: dict[tuple[UUID, str, str], Any] = {}
-        self._pending: list[tuple[UUID, str, str]] = []
-        self.commits = 0
-
-    def add(self, row: Any) -> None:
-        if isinstance(row, IdempotencyKey):
-            claim = (row.principal_id, row.idempotency_key, row.path)
-            if claim in self.rows:
-                from sqlalchemy.exc import IntegrityError
-
-                raise IntegrityError("duplicate claim", None, Exception("uq_idempotency_claim"))
-            self.rows[claim] = row
-            self._pending.append(claim)
-
-    async def flush(self) -> None:
-        return None
-
-    async def delete(self, row: Any) -> None:
-        claim = (row.principal_id, row.idempotency_key, row.path)
-        self.rows.pop(claim, None)
-        if claim in self._pending:
-            self._pending.remove(claim)
-
-    async def execute(self, statement: Any) -> Any:
-        return _Result(self, statement)
-
-    def begin_nested(self) -> _Savepoint:
-        return _Savepoint()
-
-    async def commit(self) -> None:
-        self.commits += 1
-        self._pending.clear()
-
-    async def rollback(self) -> None:
-        for claim in self._pending:
-            self.rows.pop(claim, None)
-        self._pending.clear()
-
-
-class _Savepoint:
-    async def __aenter__(self) -> _Savepoint:
-        return self
-
-    async def __aexit__(self, *exc: object) -> bool:
-        return False
-
-
-class _Result:
-    def __init__(self, session: _IdempotencySession, statement: Any) -> None:
-        self._session = session
-        self._statement = statement
-
-    def scalar_one_or_none(self) -> Any:
-        found: dict[str, Any] = {}
-        clauses = getattr(self._statement, "whereclause", None)
-        for clause in getattr(clauses, "clauses", []):
-            left, right = getattr(clause, "left", None), getattr(clause, "right", None)
-            if left is not None and right is not None and hasattr(right, "value"):
-                found[left.name] = right.value
-        key = (found.get("principal_id"), found.get("idempotency_key"), found.get("path"))
-        if None in key:
-            return None
-        return self._session.rows.get(key)  # type: ignore[arg-type]
-
-
-def _app(service: _StubService, actor: CurrentUser, store: _IdempotencySession) -> Any:
+def _app(service: _StubService, actor: CurrentUser, store: IdempotencySession) -> Any:
     app = create_app()
     app.dependency_overrides[get_current_user] = lambda: actor
     app.dependency_overrides[get_kms] = lambda: kms_for_tests()
@@ -225,8 +151,8 @@ def service() -> _StubService:
 
 
 @pytest.fixture
-def store() -> _IdempotencySession:
-    return _IdempotencySession()
+def store() -> IdempotencySession:
+    return IdempotencySession()
 
 
 async def _client(app: Any) -> AsyncClient:
@@ -238,7 +164,7 @@ _IOC_BODY = {"indicator_type": "hash_sha256", "value": _SHA256}
 
 # --- IOC registration -------------------------------------------------------
 async def test_registering_an_ioc_returns_the_documented_shape(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """§4.4: "Full IOC object, including `ioc_id`, `evidence_id: null` (not yet published)"."""
     async with await _client(_app(service, _INVESTIGATOR, store)) as client:
@@ -252,7 +178,7 @@ async def test_registering_an_ioc_returns_the_documented_shape(
 
 
 async def test_a_retried_ioc_submission_replays_and_does_not_re_register(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """§4.4 marks this endpoint "Idempotency: `Idempotency-Key` required". A feed retrying after a
     timeout must not register the same indicator twice — which would then match the same evidence
@@ -272,7 +198,7 @@ async def test_a_retried_ioc_submission_replays_and_does_not_re_register(
 
 
 async def test_the_same_key_with_a_different_indicator_is_a_conflict(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """§2.9: `409 IDEMPOTENCY_KEY_CONFLICT`. A feed reusing one key across two indicators is the
     bug the store exists to catch."""
@@ -290,7 +216,7 @@ async def test_the_same_key_with_a_different_indicator_is_a_conflict(
 
 
 async def test_a_threat_actor_creation_is_idempotent_too(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """§4.4 marks `POST /threat-actors` "Yes (key)" as well."""
     body = {"name": "APT-Example", "aliases": ["Group X"]}
@@ -307,7 +233,7 @@ async def test_a_threat_actor_creation_is_idempotent_too(
 
 
 async def test_adding_a_feed_is_idempotent(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     body = {"feed_name": "vendor-x", "protocol": "taxii2"}
     async with await _client(_app(service, _ADMIN, store)) as client:
@@ -323,7 +249,7 @@ async def test_adding_a_feed_is_idempotent(
 
 
 async def test_a_duplicate_feed_sync_replays_rather_than_enqueuing_twice(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """§4.4 marks the sync trigger "Idempotent? Yes".
 
@@ -342,7 +268,7 @@ async def test_a_duplicate_feed_sync_replays_rather_than_enqueuing_twice(
 
 
 async def test_two_submissions_without_keys_both_land(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """No key means no deduplication — the guard is a no-op without the header."""
     async with await _client(_app(service, _SYSTEM, store)) as client:
@@ -355,7 +281,7 @@ async def test_two_submissions_without_keys_both_land(
 
 # --- reads ------------------------------------------------------------------
 async def test_listing_matches_returns_the_documented_fields(
-    service: _StubService, store: _IdempotencySession
+    service: _StubService, store: IdempotencySession
 ) -> None:
     """§4.4: `{ match_id, evidence_id, matched_at, confidence }` — what an analyst needs to see
     where an indicator has turned up."""
@@ -394,7 +320,7 @@ async def test_listing_matches_returns_the_documented_fields(
 )
 async def test_rbac_matches_the_documented_roles(
     service: _StubService,
-    store: _IdempotencySession,
+    store: IdempotencySession,
     method: str,
     path: str,
     actor: CurrentUser,
