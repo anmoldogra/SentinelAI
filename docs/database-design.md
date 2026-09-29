@@ -298,6 +298,26 @@ under CEM §13, in a record an analyst reviews and a court may read.
 | | `notification_id` | uuid | FK → `notifications` | |
 | | `channel`, `delivery_status`, `attempted_at`, `delivered_at` | mixed | mixed | |
 
+**`uq_notification_dedupe`** — unique `(recipient_user_id, source_module, source_reference_id,
+md5(message))` on `notifications`. This is the business idempotency key
+`event-driven-architecture.md` §25.9 calls "the tightest idempotency key in the catalog, since a
+replayed event must never re-send an email the analyst already received" — enforced here rather than
+only checked in the service, because a read-then-write check cannot survive two dispatcher workers
+handling two different events that describe the same fact.
+
+`md5(message)` is the last key element because §25.9's keys are **not uniform**:
+`case.status_changed`'s is `(recipient_user_id, source_reference_id, new_status)`, and a case
+legitimately notifies its investigator once per transition — so the triple alone would collapse every
+transition after the first. The dispatcher composes each message as a pure function of exactly its
+key fields, which carries `new_status` for that handler and changes nothing for the three whose key
+has no extra discriminator. The digest is a **length bound, not a security control**: a btree entry
+is capped near 2704 bytes and `message` has no documented length limit, so indexing the raw text
+would turn a long message into a failed insert rather than a deduplicated one.
+
+`source_module`/`source_reference_id` are nullable and Postgres treats each NULL as distinct in a
+unique index, so a notification describing no upstream fact has no business key and is never
+deduplicated — the correct answer for such a row.
+
 Every schema in Sections 3.3–3.6 also owns its own `outbox_events` table (`event_id` PK, `event_type`, `payload` jsonb, `dispatch_status`, `occurred_at`, `dispatched_at`) — deliberately duplicated per schema rather than centralized (Section 2). This is a compact summary; `docs/event-driven-architecture.md` §9 is the authoritative full envelope (adds `event_version`, `aggregate_type`, `aggregate_id`, `correlation_id`, `causation_id`, `trace_id`, `actor_type`/`actor_ref`, `attempt_count`, `last_error`) and §17 defines the companion `inbox_events` table every consuming module also owns.
 
 ### 3.7 `investigation_read` — the case-graph projection (ADR-0013)

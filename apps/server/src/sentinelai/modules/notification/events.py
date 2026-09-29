@@ -4,6 +4,26 @@ Terminal consumer: reacts to upstream facts by creating + dispatching notificati
 Published: delivery-outcome facts (ops/metrics use). Every handler performs the
 Inbox claim before any side effect; the service enforces the catalog's per-handler
 business-idempotency key so a replay never re-sends a delivered message.
+
+**Four subscriptions, and a fifth that §25 disagrees with itself about.** §25.9's Consumed table
+lists exactly the four registered below. §25.8's *publisher* table, however, names `notification` as
+the
+consumer of `investigation.correlation_run_completed` / `_failed` — and §25.9 has no row for either,
+so there is no documented handler action, no idempotency key and no retry policy to implement
+against.
+
+**No handler is registered for them, deliberately.** Writing one would mean inventing all three of
+those, and §23 explicitly permits the absence: "the dispatcher itself must never crash on an event
+type it has no registered handler for" — so both events publish, relay, find no handler, and are
+marked
+processed without incident. The gap is recorded here and in `docs/implementation-log.md` (IC-047,
+IC-048) rather than closed by guessing which half of §25 is right; §25.9's own "at a glance" count
+(`notification` consumes 3) already disagrees with the four rows it lists, so that table needs a
+documentation pass regardless.
+
+The practical consequence, stated plainly: **a correlation run that fails alerts nobody.** An
+analyst learns of it by polling `GET /correlation-runs/{run_id}`. Per-finding notifications are
+unaffected — those ride `investigation.correlation_generated`, which is handled below.
 """
 
 from __future__ import annotations
@@ -28,6 +48,11 @@ EVENT_CASE_REPORT_GENERATED = "case.report_generated"
 EVENT_EVIDENCE_SCANNED = "evidence.scanned"
 
 _CRITICAL_FAST = RetryPolicy(max_attempts=10)
+
+# Named for the docstring's sake rather than registered: `investigation.correlation_run_completed`
+# and `_failed` are published (§25.8) and consumed by nothing (§25.9 lists no row). Left as a
+# comment rather than a constant, so nothing looks half-wired.
+
 _HANDLER_EVIDENCE_SCANNED = "notification.on_evidence_scanned"
 _HANDLER_CORRELATION_GENERATED = "notification.on_correlation_generated"
 _HANDLER_CASE_STATUS_CHANGED = "notification.on_case_status_changed"

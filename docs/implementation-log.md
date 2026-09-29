@@ -4358,3 +4358,210 @@ seed-producing path — recorded in ADR-0013 since IC-043 and unchanged here.
 **`notification`'s service and repository (4 stubs each) are the remaining `NotImplementedError`s**,
 and they are the natural next Phase 3 increment: the run now announces findings that nothing yet
 turns into an alert.
+
+---
+
+## 2026-09-29 — IC-048: notification completed — the last stubs, and §25.9's key enforced
+
+**Type:** the last `NotImplementedError`s in any module's service or repository. One migration
+(`202609290006_notif_dedupe`), no new ADR.
+
+### The premise needed correcting first: the dispatch path was already built
+
+The increment was framed as "implement the dispatching logic for `on_correlation_generated`,
+`on_case_status_changed` and `on_case_report_generated`" and "ensure the handlers claim the inbox and
+route their payloads to the service layer". **All four consumers, their inbox claims, the shared
+`_create_and_dispatch` core and all four `dispatch_for_*` methods already existed and were
+registered** — built with the module's original scaffold and covered by
+`test_notification_consumers.py` and `test_notification_scan_consumer.py`.
+
+The eight stubs were somewhere else entirely: the **operator surface** behind `api-design.md` §4.9's
+five endpoints. `NotificationRuleRepository.get_by_id`/`add`/`list_`,
+`DeliveryRepository.list_for_notification`, and `NotificationService.redeliver`/`list_rules`/
+`create_rule`/`update_rule`. Every one of them serves an admin over HTTP, which is why the shape of
+this increment is authorization and audit rather than event plumbing.
+
+### The idempotency requirement was a check, not a constraint
+
+§25.9 calls `(recipient_user_id, source_module, source_reference_id)` **"the tightest idempotency key
+in the catalog, since a replayed event must never re-send an email the analyst already received"**.
+What existed was `exists_for_source` — a read-then-write in the service. That is correct under
+sequential delivery and **wrong under concurrency**: two dispatcher workers handling two *different*
+events that describe one fact (a replayed upstream publication, one finding announced twice) can both
+find nothing and both insert, and the analyst gets the message twice. Precisely the outcome the
+catalog forbids, in the one place it says so most emphatically.
+
+`uq_notification_dedupe` closes it. The check stays — it keeps the common case cheap and lets the
+service answer "already delivered" without an exception — and the index makes the race impossible.
+Same division of labour as `uq_entity_mention_pair` (IC-043) and `uq_social_account_platform_handle`
+(IC-046).
+
+**The key could not be the documented triple, and that is the interesting part.** §25.9's four keys
+are not uniform: `case.status_changed`'s is `(recipient_user_id, source_reference_id, new_status)`. A
+case legitimately notifies its investigator on every transition, so a unique index on the triple alone
+would have reported "under_review" and then silenced "closed" forever — a worse bug than the one being
+fixed, and one that would have looked like the notification system working. So the index is on
+`(recipient_user_id, source_module, source_reference_id, md5(message))`: the dispatcher composes each
+message as a pure function of exactly its own key fields, which carries `new_status` for that handler
+and changes nothing for the three whose keys have no extra discriminator.
+
+`md5` is a **length bound, not a security control**, and the migration says so in those words. A btree
+entry is capped near 2704 bytes and `message` has no documented length limit, so indexing the raw text
+would turn a long message into a failed insert — a lost notification and a dead-lettered handler —
+rather than a deduplicated one. A collision would suppress one duplicate notification; nothing
+security-relevant rides on it, and the signed, hash-chained audit surfaces (security-architecture §22)
+are elsewhere.
+
+Nullability works out correctly with no extra effort: Postgres treats each NULL as distinct in a
+unique index, so a notification with no `source_module`/`source_reference_id` has no business key and
+is never deduplicated. That is the right answer for a row describing no upstream fact, and it is
+asserted rather than assumed.
+
+### `trigger_event_type` resolves a documented conflict against the document that says it
+
+api-design.md §8 says `trigger_event_type` "must be one of the event names catalogued in
+`system-design.md` §6". **§6 is the wrong list, by its own admission.** Its table is labelled "names
+are illustrative of the convention ... not a final schema"; it omits `evidence.scanned` and
+`case.report_generated`, which are two of the four events this module actually consumes; and it
+attributes `investigation.finding_reviewed` to `case-management`. `CLAUDE.md` makes
+`event-driven-architecture.md` authoritative for the event catalog, so `TRIGGER_EVENT_TYPES` mirrors
+§25's complete published inventory — 28 types across §25.1–§25.9 — and a unit test pins the count plus
+the three entries a wrong source would get wrong.
+
+Validated at all because the failure mode is **silence**: a rule naming an event nobody publishes never
+fires, and the admin who configured the alert would discover that only from the alert never arriving.
+A 422, per §2.4's split — the request is well-formed and fails a domain rule.
+
+`channel` is deliberately **not** validated. No document defines a channel vocabulary (§3.6 types it as
+free text) and only the logging adapter exists, so a check would either reject `email` — which an admin
+may legitimately pre-configure for an adapter that is coming — or invent a list. The same
+silent-dead-rule risk applies to a channel with no adapter; recorded below rather than guessed at.
+
+### The audit decision, and why the KMS is optional on the class but required by `_audit`
+
+Rule CRUD and redelivery are audited. `api-design.md` §8 says the rule endpoints "follow standard
+conventions" and specifies no audit requirement, but the argument is not convention — it is
+`notification_rules.target_role_or_user`, the column that decides **who gets told**, and `is_active`,
+which decides whether anyone does. An insider who deactivates the rule that would have alerted a
+supervisor, or repoints it at themselves, is suppressing oversight, and security-architecture §22's
+threat model names "a malicious or coerced insider (investigator, admin)" explicitly.
+
+That created a real structural problem. `record_audit_event` needs a `KeyManagementService` to sign the
+entry (ADR-0003 §1), and **the event dispatcher has no KMS to give**: `uow_factory(session)` takes a
+session only, and the dispatcher attaches a *signer* to the outbox afterwards rather than a KMS. So the
+same service class is constructed two ways, and only one of them can audit.
+
+Resolved by making `kms` optional on the constructor and **required by `_audit`**, which raises a named
+`RuntimeError` when it is absent. §22 requires that there be "no alternate route that produces an
+unaudited side effect" — so the dispatcher's KMS-less construction must not be a back door into an
+audited method, and failing closed is what guarantees that without threading a KMS through a handler
+that has no use for one. Both halves are tested: an audited method without a KMS raises, and the
+dispatch path works with exactly what the dispatcher supplies.
+
+A no-op update is audited too. An admin who sent a PATCH with a valid `If-Match` acted on that rule,
+and an oversight review asking "who touched the alerting configuration" wants that, not only the diffs
+that happened to be non-empty.
+
+### Redelivery adds an attempt, never a notification
+
+`POST /notifications/{id}/redeliver` re-sends the stored message and records a new
+`notification_deliveries` row against the **same** notification. That distinction is what keeps the
+endpoint from being a way around §25.9: however many times an admin retries, the analyst's inbox holds
+one entry for the fact. Asserted directly, because the obvious wrong implementation — re-running
+dispatch — would have created a second notification and quietly defeated the key this increment spent
+a migration enforcing.
+
+It returns **409 when the latest attempt already succeeded**. §4.9 defines the endpoint as retrying a
+*failed* delivery, and re-sending a delivered one is exactly the duplicate §25.9 exists to prevent; an
+admin who genuinely wants that is looking at the row. A notification with **no** recorded attempt is
+retryable — that is what a delivery row lost to a rolled-back transaction looks like, and an analyst
+holding an undelivered notification is the case the endpoint is for.
+
+Synchronous, despite the route's `202`. §4.9 documents no job and the sender is in-process, so the
+attempt has been made by the time the response is written; the body carries the real
+`delivery_status` rather than a bare "accepted", because saying only "accepted" would hide a second
+failure from the operator who just retried it.
+
+`_attempt_delivery` was extracted from `_create_and_dispatch` so first dispatch and retry share one
+path. A retry must produce the same kind of delivery row and the same §25.9 outcome event as the
+original attempt, and two copies of that logic would eventually disagree about one of them.
+
+### Two documented behaviours that were missing, now implemented
+
+* **§8's `read` filter on `GET /notifications`** was documented as a query parameter and not
+  implemented. It is the filter an analyst actually works from — "what is waiting for me" is
+  `read=false` — and it is expressed against `read_at`, because that column *is* the read state and a
+  separate flag could drift from it. Applied inside the keyset query rather than after it, so paging a
+  filtered list cannot skip rows.
+* **The `ETag` on the rule PATCH response.** §2.6 requires `If-Match` on a PATCH of a mutable resource
+  and §8 documents no single-rule `GET`, so before this a client had no in-contract way to obtain the
+  value its own `If-Match` needed. The PATCH response now carries the new ETag, which makes a second
+  change possible. The first one still has to come from somewhere — recorded below. `osint`'s source
+  CRUD has the identical hole.
+
+### The §25 discrepancy, respected rather than resolved
+
+§25.8's publisher table names `notification` as the consumer of
+`investigation.correlation_run_completed` / `_failed`; §25.9's Consumed table has **no row for
+either**, so there is no documented handler action, idempotency key or retry policy to implement
+against. No handler was registered. §23 permits the absence explicitly — "the dispatcher itself must
+never crash on an event type it has no registered handler for" — and an integration test pins it as
+behaviour: the event relays cleanly, is marked dispatched, and nobody is told. A future increment that
+resolves the documentation will make that test fail, which is the right way to find out.
+
+Stated plainly, because it is a real operational consequence: **a correlation run that fails alerts
+nobody.** An analyst learns of it by polling `GET /correlation-runs/{run_id}`. Per-finding
+notifications are unaffected — those ride `investigation.correlation_generated`, which is handled.
+
+§25.9's own "at a glance" count (`notification` consumes 3) still disagrees with the four rows it
+lists, so that table needs a documentation pass regardless.
+
+### Tests
+
+**41 new** — 23 unit on the operator surface, 18 against real Postgres.
+
+The Postgres file proves what only a real database can: **both layers of §25.9's idempotency**
+separately (the Inbox claim against the same event redelivered; the business key against two distinct
+events describing one fact — with an assertion that both events really were relayed, so the test cannot
+pass vacuously), the **unique index refusing the duplicate the check could race**, the wider
+`case.status_changed` key still discriminating between two transitions of one case while collapsing the
+same transition twice, a NULL-source notification correctly *not* deduplicated, and the admin surface
+over HTTP including a 412 on a stale ETag leaving the rule untouched.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (247 source files), import-linter (2/2 kept). Unit +
+integration **1817 passed / 1 skipped** (the skip is the Vault contract test, which needs a Vault
+this machine does not run); platform coverage **95.42%** against the 90% floor. Migration round-trip
+green including the new migration.
+
+### Carried forward
+
+**No dispatch path reads `notification_rules`.** Every consumer writes `rule_id=None` and composes its
+message from the event, and §25.9's consumer table specifies those handler actions directly — it does
+not say "consult the rules". So the rule table is now fully manageable configuration that **influences
+nothing**: an admin can create a rule targeting a colleague and no notification will ever be routed by
+it. Wiring a rule engine would change documented handler behaviour in §25.9 and needs its own decision;
+implementing the CRUD §4.9 documents without pretending the engine exists is the honest half.
+
+**A rule may name a channel with no adapter** (above) — the same silent-dead-rule failure the
+`trigger_event_type` check prevents, left open because no document defines the vocabulary.
+
+**The first ETag for a rule is unobtainable through the documented API.** §8 defines no single-rule
+`GET`; the PATCH response carries the new value, but a client that has only ever listed rules cannot
+make its first `If-Match`. Either a `GET /notification-rules/{rule_id}` or an ETag on the list belongs
+in api-design.md; `osint` has the same gap.
+
+**Notification content is logged in full.** `LoggingNotificationSender` writes the body to the
+structured log, and the bodies name case, relationship and evidence ids. That is fine for Phase 1's
+in-app delivery and is called out in the sender's own docstring, but it is a review item before a real
+channel adapter is switched on.
+
+**`notification` still publishes without `causation_id`.** `notification.dispatched` and
+`delivery_failed` thread the `correlation_id` but name no parent event, so §11's causal chain stops one
+hop short of the delivery. Recorded since IC-043 and unchanged here.
+
+**Every `NotImplementedError` in every module's service and repository is now gone.** What remains
+elsewhere is deliberate and named: `ArtifactParserNotConfigured` (`forensics/jobs.py`),
+`FeedTransportNotConfigured` (`threat_intel/jobs.py`), and `platform/auth/dependencies.py`'s port
+default that the composition root overrides.

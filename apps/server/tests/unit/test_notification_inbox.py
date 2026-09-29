@@ -42,8 +42,15 @@ class _FakeNotificationRepo:
         limit: int,
         cursor_created_at: datetime | None,
         cursor_notification_id: UUID | None,
+        read: bool | None = None,
     ) -> list[Notification]:
         rows = [n for n in self.items if n.recipient_user_id == recipient_user_id]
+        # §8's `read` filter, expressed against `read_at` exactly as the real query is — a fake that
+        # tracked a separate flag could pass while the SQL predicate was wrong.
+        if read is True:
+            rows = [n for n in rows if n.read_at is not None]
+        elif read is False:
+            rows = [n for n in rows if n.read_at is None]
         if cursor_created_at is not None and cursor_notification_id is not None:
             rows = [
                 n

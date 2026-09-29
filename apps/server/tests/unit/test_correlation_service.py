@@ -492,9 +492,9 @@ async def test_progress_and_checkpoints_land_per_batch(inv_uow) -> None:
 async def test_a_retry_resumes_the_runs_count_rather_than_restarting_it(inv_uow) -> None:
     """**The regression this exists for.** `findings_generated_count` is the run's cumulative total
     and survives a failed attempt, while convergence means the retry re-derives those findings and
-    creates nothing. A counter starting at zero would hand `record_progress` a number below the row's
-    and the monotonic invariant would raise — failing every retry, permanently, on exactly the runs
-    that got furthest before breaking.
+    creates nothing. A counter starting at zero would hand `record_progress` a number below the
+    row's and the monotonic invariant would raise — failing every retry, permanently, on exactly the
+    runs that got furthest before breaking.
     """
     case_id = uuid4()
     run = _run(case_id)

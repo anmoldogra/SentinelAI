@@ -256,9 +256,7 @@ class CorrelationService:
             )
             # The row's own count, not zero: on a retry of a run whose case was deleted after it
             # had already produced findings, reporting zero would contradict the row a poller reads.
-            return RunOutcome(
-                run_id, run.case_id, run.findings_generated_count, 0, cancelled=False
-            )
+            return RunOutcome(run_id, run.case_id, run.findings_generated_count, 0, cancelled=False)
 
         # The case's links are re-read here, not taken from the trigger: a run queued behind a
         # backlog may start minutes later, and evidence linked in the meantime belongs in the pass.

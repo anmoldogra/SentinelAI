@@ -1,8 +1,11 @@
 """notification persistence + Unit of Work (guide Part 3). Persistence only.
 
-Only the members the ``evidence.scanned`` consumer path needs are implemented; the
-notification-inbox and rule-management reads that serve ``router.py`` are still deferred
-(``NotImplementedError``) — see the module's phase notes.
+Three stores: the rule table (bounded admin configuration), the recipient's notification inbox
+(append-heavy, keyset-paginated), and the per-notification delivery attempts.
+
+``list_for_recipient`` is scoped to ``recipient_user_id`` **in SQL**, so no service mistake can
+expose one analyst's inbox to another. ``exists_for_source`` is the read half of §25.9's business
+idempotency key; ``uq_notification_dedupe`` is the half that survives a race.
 """
 
 from __future__ import annotations
@@ -82,6 +85,7 @@ class NotificationRepository:
         limit: int,
         cursor_created_at: datetime | None,
         cursor_notification_id: UUID | None,
+        read: bool | None = None,
     ) -> Sequence[Notification]:
         """The recipient's notifications, newest first, keyset-paginated (api-design.md §2.5).
 
@@ -93,8 +97,17 @@ class NotificationRepository:
 
         The cursor arrives already decoded — opaque-cursor codec is application logic and stays
         in the service, matching every other list repository in the codebase.
+
+        ``read`` is §8's documented boolean filter, expressed against ``read_at`` because that
+        column
+        *is* the read state — there is no separate flag to drift from it. ``None`` means no filter,
+        which is what an absent query parameter means.
         """
         stmt = select(Notification).where(Notification.recipient_user_id == recipient_user_id)
+        if read is True:
+            stmt = stmt.where(Notification.read_at.is_not(None))
+        elif read is False:
+            stmt = stmt.where(Notification.read_at.is_(None))
         if cursor_created_at is not None and cursor_notification_id is not None:
             stmt = stmt.where(
                 tuple_(Notification.created_at, Notification.notification_id)
@@ -111,13 +124,36 @@ class NotificationRuleRepository:
         self._session = session
 
     async def get_by_id(self, rule_id: UUID) -> NotificationRule | None:
-        raise NotImplementedError
+        result = await self._session.execute(
+            select(NotificationRule).where(NotificationRule.rule_id == rule_id)
+        )
+        return result.scalar_one_or_none()
 
     async def add(self, rule: NotificationRule) -> None:
-        raise NotImplementedError
+        self._session.add(rule)
+        await self._session.flush()
 
     async def list_(self) -> Sequence[NotificationRule]:
-        raise NotImplementedError
+        """Every rule, active and inactive, ordered by name.
+
+        **Unpaginated on purpose.** `database-design.md` §7 classes `notification_rules` as
+        reference/config data and `frontend-architecture.md` §21 puts it with the "small, bounded
+        lists" that get page numbers rather than cursors — an operator configures a handful of
+        rules,
+        not a stream of them. `api-design.md` §4.9 gives the endpoint no `cursor`/`limit`, so adding
+        pagination here would be inventing contract.
+
+        Inactive rules are included because §7's lifecycle for config data is an `is_active` flag
+        rather than deletion: a deactivated rule is still configuration an admin must be able to see
+        and re-enable, and hiding it would make the flag look like a delete.
+
+        Ordered by ``(name, rule_id)`` — name because that is what an operator scans, ``rule_id`` to
+        break ties so two rules sharing a name do not swap places between reads.
+        """
+        result = await self._session.execute(
+            select(NotificationRule).order_by(NotificationRule.name, NotificationRule.rule_id)
+        )
+        return result.scalars().all()
 
 
 class DeliveryRepository:
@@ -129,7 +165,25 @@ class DeliveryRepository:
         await self._session.flush()
 
     async def list_for_notification(self, notification_id: UUID) -> Sequence[NotificationDelivery]:
-        raise NotImplementedError
+        """Every delivery attempt for one notification, **most recent attempt first**.
+
+        Newest-first because the only caller asks a question about the latest attempt — "is there a
+        failure to retry" (`api-design.md` §4.9's redeliver endpoint) — and a chronological list
+        would make that the last row rather than the first.
+
+        ``attempted_at`` is nullable in §3.6, so ``delivery_id`` breaks the tie and keeps the order
+        total; ``nulls_last`` puts an attempt with no recorded time behind ones that have it rather
+        than letting it masquerade as the newest.
+        """
+        result = await self._session.execute(
+            select(NotificationDelivery)
+            .where(NotificationDelivery.notification_id == notification_id)
+            .order_by(
+                NotificationDelivery.attempted_at.desc().nulls_last(),
+                NotificationDelivery.delivery_id.desc(),
+            )
+        )
+        return result.scalars().all()
 
 
 class NotificationUnitOfWork(UnitOfWork):

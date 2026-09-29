@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, ForeignKey, String, Text
+from sqlalchemy import Boolean, ForeignKey, Index, String, Text, text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -36,8 +36,31 @@ class NotificationRule(Base):
 
 
 class Notification(Base):
+    """One notification bound for one recipient.
+
+    Mirrors `202609290006_notif_dedupe`. The unique index is declared here too so `create_all` in
+    tests reproduces the real constraint — a suite whose schema lacked it would pass while
+    production depended on it, and this is the constraint §25.9 calls the tightest key in the
+    catalog.
+
+    ``md5(message)`` is the last key element because §25.9's keys are not uniform:
+    `case.status_changed`'s carries ``new_status``, which the service encodes in the message it
+    composes as a pure function of exactly its key fields. See the migration for why the digest is a
+    length bound rather than anything security-relevant.
+    """
+
     __tablename__ = "notifications"
-    __table_args__ = ({"schema": _SCHEMA},)
+    __table_args__ = (
+        Index(
+            "uq_notification_dedupe",
+            "recipient_user_id",
+            "source_module",
+            "source_reference_id",
+            text("md5(message)"),
+            unique=True,
+        ),
+        {"schema": _SCHEMA},
+    )
 
     notification_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True), primary_key=True, default=uuid4

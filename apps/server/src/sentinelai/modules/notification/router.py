@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request, status
+from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 
 from sentinelai.modules.notification.repository import (
     NotificationUnitOfWork,
@@ -21,7 +21,11 @@ from sentinelai.modules.notification.schemas import (
     NotificationRuleRead,
     NotificationRuleUpdate,
 )
-from sentinelai.modules.notification.service import NotificationService, get_notification_service
+from sentinelai.modules.notification.service import (
+    NotificationService,
+    get_notification_service,
+    rule_etag,
+)
 from sentinelai.platform.auth.dependencies import CurrentUser, get_current_user, require_role
 from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.platform.idempotency import enforce_idempotency
@@ -49,11 +53,17 @@ def _meta(request: Request) -> Meta:
 @router.get("/notifications", response_model=ListEnvelope[NotificationRead])
 async def list_notifications(
     request: Request,
+    read: bool | None = Query(default=None, description="Filter by read state."),
     page: PageParams = Depends(page_params),
     current_user: CurrentUser = Depends(get_current_user),
     service: NotificationService = Depends(get_notification_service),
 ) -> ListEnvelope[NotificationRead]:
-    items, next_cursor, has_more = await service.list_notifications(current_user, page)
+    """The caller's own notifications, newest first (§8).
+
+    ``read`` is §8's documented filter; omitted means both. The recipient is never a parameter — it
+    is always the authenticated caller.
+    """
+    items, next_cursor, has_more = await service.list_notifications(current_user, page, read=read)
     return ListEnvelope(
         data=[NotificationRead.model_validate(i) for i in items],
         pagination=Pagination(next_cursor=next_cursor, has_more=has_more, limit=page.limit),
@@ -80,8 +90,18 @@ async def redeliver_notification(
     current_user: CurrentUser = Depends(require_role("admin")),
     service: NotificationService = Depends(get_notification_service),
 ) -> Envelope[dict[str, str]]:
-    await service.redeliver(notification_id, current_user, request.state.correlation_id)
-    return Envelope(data={"status": "accepted"}, meta=_meta(request))
+    """Retry a failed delivery (§4.9). Admin-only, audited.
+
+    `202` with the attempt's real outcome rather than a bare "accepted": the sender is in-process
+    and §4.9 documents no job, so by the time this responds the attempt has been made and recorded.
+    Saying
+    only "accepted" would hide a second failure from the operator who just retried it.
+    """
+    delivery = await service.redeliver(notification_id, current_user, request.state.correlation_id)
+    return Envelope(
+        data={"status": "accepted", "delivery_status": delivery.delivery_status},
+        meta=_meta(request),
+    )
 
 
 @router.get("/notification-rules", response_model=ListEnvelope[NotificationRuleRead])
@@ -118,9 +138,20 @@ async def update_rule(
     rule_id: UUID,
     payload: NotificationRuleUpdate,
     request: Request,
+    response: Response,
     if_match: str = Header(..., alias="If-Match"),
     current_user: CurrentUser = Depends(require_role("admin")),
     service: NotificationService = Depends(get_notification_service),
 ) -> Envelope[NotificationRuleRead]:
+    """Update or deactivate a rule (§4.9), guarded by ``If-Match`` (§2.6).
+
+    The response carries the **new** ``ETag`` so a client can make a second change without
+    re-reading. §2.6 asks for an ETag on every GET of a mutable resource, and §8 documents no
+    single-rule GET — so without this a client has no in-contract way to obtain the value a later
+    `If-Match` needs. Noted
+    as a contract gap in the implementation log rather than closed by inventing an endpoint;
+    `osint`'s source CRUD has the same hole.
+    """
     rule = await service.update_rule(rule_id, payload, current_user, if_match)
+    response.headers["ETag"] = rule_etag(rule)
     return Envelope(data=NotificationRuleRead.model_validate(rule), meta=_meta(request))
