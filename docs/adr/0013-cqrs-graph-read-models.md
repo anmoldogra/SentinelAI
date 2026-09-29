@@ -65,7 +65,7 @@ stays open: if a real deployment shows a *bounded* subgraph (a few thousand node
 latency, that is new evidence and this decision should be revisited. The numbers above are not that
 evidence.
 
-## Implementation note (2026-09-30, Wave 4.1)
+## Implementation note (2026-09-29, Wave 4.1)
 
 ### The projection closes a deferral that had nothing to do with performance
 

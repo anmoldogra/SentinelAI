@@ -2873,7 +2873,7 @@ observability, and DR/backup with independent integrity attestation.
 
 ---
 
-## 2026-09-30 — IC-040: Wave 4.1 CQRS graph read models (ADR-0013); `get_case_graph` unblocked
+## 2026-09-29 — IC-040: Wave 4.1 CQRS graph read models (ADR-0013); `get_case_graph` unblocked
 
 **Type:** The first read/write split in the codebase. One new schema, one migration, two projectors,
 one endpoint that had raised `NotImplementedError` since Phase 8. Resolves the roadmap's
