@@ -285,6 +285,29 @@ class MinioObjectStorage:
             return False
         return True
 
+    async def list_prefix(self, bucket: str, prefix: str) -> AsyncIterator[str]:
+        """Paginate ``ListObjectsV2`` and yield keys. See the port for why this exists.
+
+        Paginated rather than a single call: ``ListObjectsV2`` caps a response at 1000 keys and
+        signals more with ``IsTruncated``, so a bucket holding a decade of four-hourly anchors —
+        roughly 22000 objects per ledger — would silently return its first thousand. A truncated
+        listing is the one failure mode this method must not have, because a missing key reads as a
+        missing anchor and would report an intact archive as incomplete.
+        """
+        with _mapped(bucket):
+            async with self._client() as s3:
+                token: str | None = None
+                while True:
+                    kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+                    if token is not None:
+                        kwargs["ContinuationToken"] = token
+                    page = await s3.list_objects_v2(**kwargs)
+                    for item in page.get("Contents", ()):
+                        yield str(item["Key"])
+                    if not page.get("IsTruncated"):
+                        return
+                    token = page.get("NextContinuationToken")
+
     async def copy_object(
         self, source_bucket: str, source_key: str, dest_bucket: str, dest_key: str
     ) -> None:

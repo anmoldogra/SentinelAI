@@ -4725,3 +4725,215 @@ multi-agency intelligence-sharing requirement will need its own increment.
 
 **Wave 4.2 closes without touching Wave 4.4.** DR/backup with independent integrity attestation
 remains the open Wave 4 item alongside Wave 4.3's unbuilt alerting half.
+
+---
+
+## 2026-09-29 — IC-050: Wave 4.4 — independent attestation; the anchors are read from WORM at last
+
+**Type:** a real gap in a subsystem whose ADR said it was finished. No migration, no endpoint, no
+event, no schema change. One new `platform` module, one new CLI, one port method, 53 new tests.
+
+### The gap: every verifier read its anchors from the database it was auditing
+
+ADR-0003 §3's whole argument for external anchoring is that "the commitment lives outside the database
+the attacker controls", and the ADR's status table said **"Every part of this ADR is now built."** Both
+statements were true of the *construction*. Neither was true of the *check*: `LedgerVerifier` takes
+`AnchorView` records, and every caller built them from `read_anchor_views` — that is
+`platform.ledger_anchors`, a table inside the database under audit.
+
+That is sound against the attack §3 was written for, and `test_ledger_anchoring_db.py` proves it:
+delete ledger rows, leave the anchor rows, and the recomputed Merkle root no longer matches. **It
+cannot see the attacker, or the restore, that removes both.**
+
+`deployment-architecture.md` Part 14 had already written down the consequence as a requirement:
+
+> after any restore of a database containing `platform.audit_log` or
+> `ingestion.evidence_custody_events`, re-verification against the external anchors is mandatory
+> before the system is returned to service. **The anchors live in the WORM anchor bucket, not in the
+> database, so they survive the restore** and will report exactly which committed entries are now
+> missing.
+
+Nothing implemented that sentence. A point-in-time restore rolls the ledger and `ledger_anchors` back
+together, and what comes up is internally flawless — every hash recomputes, every signature verifies,
+every anchor it still remembers reconciles perfectly. A real, complete, self-consistent ledger. Just
+an older one, and nothing inside it knows.
+
+This is the increment's central finding and it was found by reading Part 14 against the code, not by a
+test failing.
+
+### What was already built, and is not rebuilt here
+
+The prompt asked for a verification tool and an automated DR check. Much of both existed:
+
+* **The verification engine** (`platform/crypto/verification.py`, Wave 1.4) — three independent
+  layers, three states, pure. Reused unchanged.
+* **The scheduled re-verification job** (`modules/ingestion/integrity_jobs.py`, hourly arq) with
+  Prometheus metrics and a `CRITICAL` log line as its alarm. Untouched.
+* **The anchor cutter**, the WORM readiness probe, RFC 3161 timestamping, the self-describing anchor
+  document. All in place.
+
+So the work was not "build a verifier". It was: **change where a verifier gets the commitments it
+trusts**, and put that on a command an auditor can run against a restored database with no API server.
+
+### `platform/crypto/attestation.py` — inverting the trust direction
+
+Lists the anchor bucket, parses every published document (the exact inverse of `anchor_document`),
+verifies each one's own Ed25519 envelope, and adapts it to `AnchorView` so **the bucket's anchors go
+through the existing `LedgerVerifier`**. One implementation of the Merkle and range logic, reached
+from the online endpoint and from here; a second copy would eventually disagree with the first about
+what counts as intact.
+
+The database's `ledger_anchors` table becomes a cross-check rather than the source of truth, and the
+comparison is field by field so a report says *what* changed — a narrowed `entry_count` and a
+substituted `merkle_root` lead an operator to different conclusions. `signature_envelope` is compared
+too, because a row carrying a different envelope from the published one is a replay or a fabrication
+and is otherwise invisible when every other field agrees.
+
+**The distinction that took the most care.** An anchor in WORM with no database row is *not* evidence
+of tampering. `LedgerAnchorService.publish` writes the object **before** the row, deliberately, and
+its own docstring calls the resulting orphan "recoverable ... a reconciliation pass can find it" — so
+an orphan object is an interrupted cut. Reporting it `failed` would alarm on every killed worker;
+reporting it clean would hide the restore. It is `partial`, and it becomes `failed` when the same
+anchor's committed range is *also* missing from the chain. That combination is the restore signature,
+and it is why both questions are answered by one report instead of by two tools.
+
+Severities mirror the ledger engine's, deliberately: `ANCHOR_OBJECT_MISSING` is a **failure** because
+under COMPLIANCE-mode Object Lock the object should have been undeletable, so its absence means either
+the lock was never real (Part 14 warns that a replica which drops retention is a copy an insider can
+edit) or something with bucket administration removed it. `ANCHOR_DOCUMENT_UNKNOWN_VERSION` is a
+**partial**, for the same reason `UNKNOWN_PREIMAGE_VERSION` is: guessing a future field layout would
+produce a mismatch and report a valid anchor as forged.
+
+The parser is strict field by field, including rejecting `entry_count=True` — `isinstance(True, int)`
+is true in Python, so that guard is load-bearing rather than defensive. A lenient parser would let a
+partly-corrupt archive read as a valid commitment.
+
+### `cli/attest.py` — the tool an auditor runs
+
+`python -m sentinelai.cli.attest verify [--ledger] [--json] [--strict]`. No API server, no worker, no
+HTTP. Three dependencies, all read-only: `DATABASE_URL` pointed at the database under examination,
+read access to the anchor bucket, and **verify** access to the KMS key.
+
+That last one cannot be wished away and is stated in the docstring: a hash proves nothing about
+authorship, so a tool that skipped signature verification would report a rewritten ledger as intact.
+It never uses a private key.
+
+**It writes no audit entry**, and that is a decision rather than an omission. An audit write appends
+to one of the two ledgers under examination — taking the chain lock, consuming a KMS *signing*
+operation, mutating the evidence. An examiner's read must not alter the thing being examined, and the
+caller here may be someone outside the organisation. The same reasoning `reverify_custody_chain`
+records for the scheduled job applies with more force.
+
+**Exit codes are the contract**, because a CronJob reads nothing else: `0` verified, `2` **failed**,
+`1` could not be completed. The third is deliberately distinct from the second — "we could not check"
+and "the ledger is broken" are opposite conclusions, and conflating them trains an operator to ignore
+the one that matters. `partial` exits `0` unless `--strict`, because pre-Wave-1.2 rows carry no
+signature and never can, so strict-by-default would make the nightly check permanently red on history
+no remedy can repair, and a permanently-red check is one nobody reads.
+
+Custody needed one structural decision: **the custody ledger is not one chain.** Every evidence item's
+chain starts at the all-zero sentinel, so walking the global order for link continuity would report a
+break at every item boundary. Anchors, however, are cut over the *global* order because
+`ledger_anchors` has no column scoping a range to one item. So the anchor layer runs once over the
+whole ledger and entry-level checks run per chain, and the two phases are merged. Getting that
+backwards produces a false tampering verdict on every evidence item as soon as a second one is
+anchored.
+
+### `ObjectStorage.list_prefix` — the one port addition
+
+Attestation has to discover what the **bucket** holds, not what the database admits to. Every other
+read path in this platform already knows its key because a row supplied it — precisely the dependency
+an attestation must not have, since a restore leaves a database that can only enumerate the anchors it
+still remembers, and the objects it has forgotten are the proof of what is missing.
+
+Paginated over `ListObjectsV2`'s 1000-key cap. A truncated listing is the one failure this method must
+not have: a missing key reads as a missing anchor, which would report an intact archive as incomplete.
+`FakeObjectStorage` gained the same method, returning keys **sorted** rather than in insertion order,
+so attestation cannot come to depend on an order S3 does not preserve.
+
+### `scripts/verify_restored_database.sh`, and a documented script that did not exist
+
+Part 14's CronJob named `command: ["/scripts/restore_and_verify.sh"]`. No such file existed. Rather
+than create a file whose name promises a restore it does not perform, the script is
+`verify_restored_database.sh` and Part 14 was updated to match, with the split stated: **the restore is
+CloudNativePG's** (a `Cluster` with `bootstrap.recovery`, reconciled by ArgoCD, because Mandatory Rule
+1 forbids imperative changes against a real environment even for a drill), and this script is the half
+that asks whether what came back is intact. Part 14 also gained the `env` block the job actually needs.
+
+### Tests — 53 new (41 unit, 12 against real Postgres)
+
+The integration file's centrepiece, `test_the_dr_scenario_the_database_only_path_cannot_see`, performs
+the restore — deleting the ledger tail *and* its anchor row — and then asserts **both** halves:
+
+1. the **database-sourced** verification reports `verified`, and
+2. the **WORM-sourced** attestation reports `failed`, with `ANCHOR_RANGE_MISSING` on the chain and
+   `ANCHOR_MISSING_FROM_DATABASE` on the archive.
+
+Without the first assertion the test would not demonstrate that the gap was real. It also asserts the
+*earlier* anchor still reconciles, because a report that failed everything would be useless for
+deciding which cases are affected.
+
+The rest: an intact database verifying with non-vacuity assertions (an attestation that read no
+anchors would also say "verified"); proof that the anchors checked came from the bucket, by deleting
+every anchor row and showing one anchor still gets checked; a historical `UPDATE` caught by the hash
+layer; the same edit *with the digest recomputed* caught only by the signature, with an assertion that
+the hash layer saw nothing — so the test cannot pass for the wrong reason; an edited anchor row caught
+by the published copy; a deleted WORM object; an orphan object reported `partial`; a corrupted object
+reported without denying a verdict on the others; a forged anchor written into the bucket failing its
+signature; and an unanchored ledger *not* failing, so a fresh install does not look tampered with.
+
+The unit file covers the reconciliation logic with no bucket and no KMS, including that a document
+absent from the signature map **fails closed** — a missing verdict and a positive one must never be
+the same thing — and that `anchor_prefix` still matches what `anchor_object_key` produces, because a
+drifted prefix would list nothing and an empty listing reads as "this ledger has no anchors" and
+passes.
+
+`sentinelai.cli` was added to the import-linter contract as a sibling of `sentinelai.entrypoints`. It
+was previously absent, so its boundaries were unenforced rather than legal-by-design; the CLI imports
+`modules.ingestion`, which is correct for an entrypoint and is now checked.
+
+### Carried forward
+
+**The online endpoint and the scheduled job still read `ledger_anchors`.** That is correct for both —
+they run inside a live deployment whose database has not been restored under them, and listing an
+object store does not belong on an API request path. But it means the *routine* hourly check would
+still miss a restore; the WORM-sourced check runs when an operator or a CronJob runs it. Wiring the
+scheduled job to alternate into a WORM-sourced pass is a decision about job cost, not a bug.
+
+**The restore drill itself is not built.** This increment verifies a restored database; nothing
+automates producing one. That is CloudNativePG plus ArgoCD manifests, and `infra/` currently holds no
+Kubernetes manifests at all — so Part 14's CronJob is documented and unprovisioned, as are every other
+manifest in that document.
+
+**The integration coverage is the audit ledger's.** The custody ledger shares the identical anchor
+table, verifier, and attestation code, and the CLI covers both — but the end-to-end DR scenario is
+exercised against `platform.audit_log` only, because seeding custody requires the ingestion schema and
+real evidence rows. The shared logic is covered; the custody wiring rests on `test_verification_db.py`.
+
+**Entry-level coverage is bounded on both ledgers**, unchanged from Wave 1.4: 5,000 recent audit
+entries and 250 recently-active custody chains by default, both overridable. The anchor layer is
+complete regardless, which is the layer that detects truncation. A full entry-level sweep of a
+multi-million-row audit ledger would need streaming rather than a list, and no deployment has one yet.
+
+**A failed attestation alerts nobody by itself.** The CLI's exit code is the signal, so an alarm
+depends on something watching it — the CronJob's failure, or an operator reading the output. Unlike the
+scheduled job, this tool publishes no Prometheus metric; adding one would mean a CLI that writes to a
+metrics endpoint, which an auditor running it on a laptop should not do.
+
+**`cli/attest.py` is not measured by the coverage gate**, which scopes `--cov` to `sentinelai.platform`.
+Its logic is exercised — `attest_ledger` is what `test_attestation_db.py` calls, which is why every
+dependency is an argument rather than a `settings` lookup — but argument parsing and the two output
+formatters are covered only by the smoke run recorded below. `platform/crypto/attestation.py` itself is
+at **100%**.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (249 source files), import-linter **2/2 kept** with `sentinelai.cli`
+now inside the contract. Full `pytest`: **1877 passed, 2 skipped**. The CI coverage gate
+(`tests/unit tests/integration` minus migrations): **1870 passed, 1 skipped, 95.21%** against the 90
+floor — down from 95.42% because `attestation.py` adds 175 measured statements to `platform` and the
+denominator grew; the module's own coverage is 100%. Migration round-trip green (no new migration).
+
+Smoke-tested as a process, not only through its functions: `python -m sentinelai.cli.attest verify`
+against the dev stack exits **1** with `BucketNotFound` — the anchor bucket does not exist locally, and
+"could not check" is the right verdict and the right exit code for that.

@@ -171,7 +171,10 @@ root_package = "sentinelai"
 name = "Module dependency DAG (database-design.md section 5)"
 type = "layers"
 layers = [
-    "sentinelai.entrypoints",
+    # `cli` is a process entrypoint like the other two — an operator or auditor runs it directly —
+    # so it shares the top layer. Sibling, not stacked: neither imports the other, and a CLI that
+    # reached into the HTTP app (or vice versa) would be a boundary violation worth failing on.
+    "sentinelai.entrypoints : sentinelai.cli",
     "sentinelai.modules.notification",
     "sentinelai.modules.investigation",
     "sentinelai.modules.case_management : sentinelai.modules.social_media : sentinelai.modules.forensics : sentinelai.modules.threat_intel : sentinelai.modules.osint",

@@ -651,8 +651,17 @@ spec:
           containers:
             - name: restore-drill
               image: harbor.internal/sentinelai/ops-tools:1.4.2
-              command: ["/scripts/restore_and_verify.sh"]
+              command: ["/scripts/verify_restored_database.sh"]
+              env:
+                - name: DATABASE_URL          # the restored instance; read-only creds suffice
+                  valueFrom: { secretKeyRef: { name: restore-drill-db, key: DATABASE_URL } }
+                - name: STORAGE_ANCHOR_BUCKET
+                  value: sentinelai-anchors
 ```
+
+**The restore and the verification are two different things, and only the second is this script.** The restore itself is CloudNativePG's — a `Cluster` with a `bootstrap.recovery` stanza, reconciled by ArgoCD from Git, because Mandatory Rule 1 forbids imperative changes against a real environment even for a drill. `apps/server/scripts/verify_restored_database.sh` is the half that answers *"and is what came back intact?"*: it runs `python -m sentinelai.cli.attest verify --json` against whatever `DATABASE_URL` points at, and its exit code is the alarm — `0` verified, `2` **failed** (committed evidence missing or altered; an evidentiary incident per §48, not a restore defect), `1` the check could not be completed. The last of those is deliberately a different signal from the second: "we could not check" and "the ledger is broken" are opposite conclusions.
+
+The tool reads anchors from the WORM bucket rather than from `platform.ledger_anchors`, which is what makes it able to answer the question this section asks — a restored database's own anchor rows rolled back with the ledger and agree with it perfectly (ADR-0003's 2026-09-29 amendment). It is read-only throughout and writes no audit entry: an examiner's read must not alter the thing being examined.
 
 A backup that has never been restored is, per `database-design.md` §12, unverified — this job exists specifically so that claim is never true in practice.
 

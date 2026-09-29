@@ -211,6 +211,51 @@ def custody_preimage_fields(
     }
 
 
+def custody_entry_views(events: Sequence[EvidenceCustodyEvent]) -> list[LedgerEntryView]:
+    """Rebuild one custody chain's verification views, in the order given.
+
+    Public because ``ingestion`` owns ``evidence_custody_events`` and is therefore the only place
+    that can be trusted to keep the preimage field set in step with the table's schema
+    (:class:`~sentinelai.platform.crypto.verification.LedgerEntryView` says as much). Two callers
+    need it: :meth:`EvidenceService.reverify_custody_chain`, and the independent attestation CLI,
+    which verifies a restored database without going through a service at all.
+
+    The order is the caller's and is never sorted here — for a custody chain the order *is* part of
+    what is being verified, so sorting would repair the tampering the caller wants detected.
+    """
+    return [
+        LedgerEntryView(
+            sequence=event.sequence_number,
+            entry_hash=event.entry_hash,
+            prev_hash=event.prev_event_hash,
+            hash_algo=event.hash_algo,
+            preimage_version=event.preimage_version,
+            # Rebuilt with the same function the writer used, and only when the row claims
+            # a preimage version: a NULL marks a pre-Wave-1.2 row hashed over an incomplete
+            # field set; a complete preimage for it would report honest history as forged.
+            preimage_fields=(
+                custody_preimage_fields(
+                    prev_hash=event.prev_event_hash,
+                    custody_event_id=event.custody_event_id,
+                    evidence_id=event.evidence_id,
+                    sequence_number=event.sequence_number,
+                    event_type=event.event_type,
+                    occurred_at=event.occurred_at,
+                    actor_user_id=event.actor_user_id,
+                    actor_role=event.actor_role,
+                    authority_ref=event.authority_ref,
+                    notes=event.notes,
+                    integrity_hash_at_event=event.integrity_hash_at_event,
+                )
+                if event.preimage_version is not None
+                else None
+            ),
+            signature_envelope=event.signature,
+        )
+        for event in events
+    ]
+
+
 def _custody_entry_hash(
     *,
     prev_hash: str,
@@ -802,37 +847,7 @@ class EvidenceService:
         Read-only: verification alters nothing.
         """
         events = await self._uow.custody.list_for_evidence(evidence_id)
-        entries = [
-            LedgerEntryView(
-                sequence=event.sequence_number,
-                entry_hash=event.entry_hash,
-                prev_hash=event.prev_event_hash,
-                hash_algo=event.hash_algo,
-                preimage_version=event.preimage_version,
-                # Rebuilt with the same function the writer used, and only when the row claims
-                # a preimage version: a NULL marks a pre-Wave-1.2 row hashed over an incomplete
-                # field set; a complete preimage for it would report honest history as forged.
-                preimage_fields=(
-                    custody_preimage_fields(
-                        prev_hash=event.prev_event_hash,
-                        custody_event_id=event.custody_event_id,
-                        evidence_id=event.evidence_id,
-                        sequence_number=event.sequence_number,
-                        event_type=event.event_type,
-                        occurred_at=event.occurred_at,
-                        actor_user_id=event.actor_user_id,
-                        actor_role=event.actor_role,
-                        authority_ref=event.authority_ref,
-                        notes=event.notes,
-                        integrity_hash_at_event=event.integrity_hash_at_event,
-                    )
-                    if event.preimage_version is not None
-                    else None
-                ),
-                signature_envelope=event.signature,
-            )
-            for event in events
-        ]
+        entries = custody_entry_views(events)
         return await LedgerVerifier(
             self._signer,
             # Wave 1.3c: needed to verify any RFC 3161 token an anchor carries. Empty when
@@ -1205,6 +1220,7 @@ __all__ = [
     "VALID_CATEGORIES",
     "EvidenceContent",
     "EvidenceService",
+    "custody_entry_views",
     "get_evidence_service",
     "read_evidence_attributes",
     "read_evidence_content",

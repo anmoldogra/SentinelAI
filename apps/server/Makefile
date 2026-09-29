@@ -90,6 +90,9 @@ create-admin: ## Create the local admin user + role grant (idempotent; needs `ma
 dev-token: ## Mint a bearer token for the admin user, for apps/web/.env.local (non-production)
 	$(PY) -m sentinelai.cli.admin dev-token --email $(ADMIN_EMAIL)
 
+attest: ## Verify the evidentiary ledgers against the WORM anchors (read-only; run after any restore)
+	$(PY) -m sentinelai.cli.attest verify
+
 compose-up: ## Start the full dev stack (postgres, redis, api, worker, web on :5173)
 	docker compose -f docker-compose.dev.yml up -d --build
 

@@ -99,6 +99,17 @@ class FakeObjectStorage:
     async def exists(self, bucket: str, key: str) -> bool:
         return (bucket, key) in self._objects
 
+    async def list_prefix(self, bucket: str, prefix: str) -> AsyncIterator[str]:
+        """Keys under ``prefix``, sorted — the real adapter's lexicographic ``ListObjectsV2`` order.
+
+        Sorted rather than dict-insertion order so a test that writes anchors out of chronological
+        sequence still sees what the real bucket would return, and so attestation cannot come to
+        depend on insertion order that S3 does not preserve.
+        """
+        for stored_bucket, key in sorted(self._objects):
+            if stored_bucket == bucket and key.startswith(prefix):
+                yield key
+
     async def copy_object(
         self, source_bucket: str, source_key: str, dest_bucket: str, dest_key: str
     ) -> None:

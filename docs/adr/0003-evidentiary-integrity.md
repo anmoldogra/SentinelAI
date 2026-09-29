@@ -48,8 +48,9 @@ acceptance:
 | §3 External anchoring — **RFC-3161 timestamp** | 1.3c | **Built** — `platform/crypto/tsa.py`: DER `TimeStampReq`, full CMS `SignedData` verification (digest, nonce, signed attributes, signer signature, timestamping EKU, validity-at-genTime, chain to configured anchors). Tokens are requested over each Merkle root, persisted in `tsa_token_ref` and in the WORM document, and re-verified by the Verification Engine. Disabled by default; **refused outright in air-gapped/classified profiles** |
 | §6 Verification Engine — **online report** | 1.4 | **Built** — `platform/crypto/verification.py` (pure, three-layer, three-state) behind `GET /api/v1/evidence/{id}/verify`; api-design.md §5.1. Proven against real tampering on a live database in `test_verification_db.py` |
 | §6 Verification Engine — **scheduled re-verification** | 1.4 | **Built** — `modules/ingestion/integrity_jobs.py`, an hourly arq cron job over the audit ledger and the most recently active custody chains. Alarms via Prometheus metrics + a `CRITICAL` log line; **not** via the notification module (see the amendment below) |
+| §3/§6 Verification Engine — **independent attestation** | 4.4 | **Built** — `platform/crypto/attestation.py` + `cli/attest.py`. Anchors are read from the **WORM bucket**, not from `platform.ledger_anchors`, and the database's anchor table becomes a cross-check. This is what closes the restore case `deployment-architecture.md` Part 14 requires be checked; see the 2026-09-29 amendment for why the earlier paths could not. Read-only, runs with no API server, proven against a simulated point-in-time restore in `test_attestation_db.py` |
 
-**Every part of this ADR is now built.** As of Wave 1.4 the guarantees are not merely constructed but *checked* — an endpoint reports on any chain on demand, and a scheduled job re-verifies both ledgers and alarms on a break. Wave 1.3c closes the last residual, backdating, with RFC 3161 timestamping. The one remaining limitation is deliberate and documented below: air-gapped deployments cannot reach a TSA at all, so they retain the backdating residual by design, and no deployment gets revocation checking.
+**Every part of this ADR is now built, and Wave 4.4 corrected one thing about *where* the check gets its evidence** — until then every verification path read anchors from `platform.ledger_anchors`, a table inside the database under audit, which cannot detect a restore that rolls the ledger and its anchor rows back together (2026-09-29 amendment). As of Wave 1.4 the guarantees are not merely constructed but *checked* — an endpoint reports on any chain on demand, and a scheduled job re-verifies both ledgers and alarms on a break. Wave 1.3c closes the last residual, backdating, with RFC 3161 timestamping. The one remaining limitation is deliberate and documented below: air-gapped deployments cannot reach a TSA at all, so they retain the backdating residual by design, and no deployment gets revocation checking.
 
 **Context §1's "unkeyed" half and Context §2 are now closed; "unanchored" is not.** A complete
 preimage binds every field of an entry to its hash, catching an attacker who edits one row and
@@ -330,6 +331,46 @@ and its proof of time. Base64 because the column is `Text` (§5) and changing an
 column type is a migration this does not need. The same token is also written into the WORM anchor
 document, so an auditor holding only the object and the public keys can answer "when was this
 committed?" without the database — the database being the thing under suspicion.
+
+## Amendment (2026-09-29) — attestation reads anchors from WORM, not from the database
+
+§3's argument for anchoring is that "the commitment lives outside the database the attacker
+controls". Every verification path built before Wave 4.4 read those commitments from
+`platform.ledger_anchors` — **a table inside the database being audited**. That is sound against the
+attack §3 was written for, and `test_ledger_anchoring_db.py` proves it: delete ledger rows, leave
+the anchor rows, and the recomputed root no longer matches.
+
+**It cannot detect the attacker, or the restore, that removes both.** `deployment-architecture.md`
+Part 14 already stated the consequence as a requirement — "the anchors live in the WORM anchor
+bucket, not in the database, so they survive the restore" — and nothing implemented that sentence. A
+point-in-time restore rolls the ledger and `ledger_anchors` back together, leaving a database that is
+internally flawless: every hash recomputes, every signature verifies, every anchor it still remembers
+reconciles. It is a real, complete, self-consistent ledger. It is just an older one, and nothing
+inside it knows.
+
+Wave 4.4 inverts the trust direction. `platform/crypto/attestation.py` lists the anchor bucket, parses
+each published document (the inverse of `anchor_document`), verifies its own signature, and hands the
+**bucket's** anchors to the existing `LedgerVerifier` — one implementation of the Merkle and range
+logic, reached from the online endpoint and from the attestation tool alike. The database's anchor
+table becomes a cross-check rather than the source of truth.
+
+**Three things this amendment does not change.** The online endpoint (`GET
+/api/v1/evidence/{id}/verify`) and the scheduled job still read `ledger_anchors`, which is correct for
+them: both run inside a live deployment where the database has not been restored under them, and the
+per-request cost of listing an object store does not belong on an API path. The signed-field set is
+untouched. And no schema changes — an anchor's WORM document already carried everything needed, by
+design.
+
+**One distinction is load-bearing and easy to get wrong.** An anchor present in WORM and absent from
+the database is *not*, on its own, evidence of tampering: `LedgerAnchorService.publish` writes the
+object before the row precisely so a crash between them is recoverable, so an orphan object is an
+interrupted cut. It is reported `partial`. It becomes `failed` when that anchor's committed range is
+also missing from the chain — which is the restore signature, and the reason both questions are asked
+of one report instead of by two tools.
+
+**Object storage gained one capability**: `ObjectStorage.list_prefix`. Attestation has to discover
+what the *bucket* holds, not what the database admits to, and every other read path in the platform
+already knows its key because a row supplied it — exactly the dependency an attestation must not have.
 
 ## Consequences
 

@@ -142,6 +142,24 @@ class ObjectStorage(Protocol):
         """Return whether ``bucket/key`` exists, without transferring the object's bytes."""
         ...
 
+    def list_prefix(self, bucket: str, prefix: str) -> AsyncIterator[str]:
+        """Yield every key under ``prefix``, paginating internally (ADR-0003 §3).
+
+        Exists for one caller and one reason: independent attestation
+        (:mod:`sentinelai.platform.crypto.attestation`) has to discover the anchors the *bucket*
+        holds, not the ones the database admits to. Every other read path in this platform already
+        knows the key it wants, because a database row told it — which is exactly the dependency an
+        attestation must not have. A restore or a hostile ``DELETE`` that removes anchor rows leaves
+        a database that can only enumerate the anchors it still remembers, and the objects it has
+        forgotten are the proof of what is missing.
+
+        Keys arrive in the provider's lexicographic order, which for
+        :func:`~sentinelai.platform.crypto.anchoring.anchor_object_key` is chronological by the date
+        prefix. Callers must not depend on that for correctness — each anchor is verified
+        independently — but it makes a listing readable to an auditor working through a timeline.
+        """
+        ...
+
     async def copy_object(
         self, source_bucket: str, source_key: str, dest_bucket: str, dest_key: str
     ) -> None:
