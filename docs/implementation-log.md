@@ -3919,3 +3919,156 @@ fix in its service and router, deliberately not bundled into another module's in
 event, and `ingestion` writes `ingested`. A forensic acquisition arguably happened at `collected_at`,
 before the platform saw it — representing that faithfully is a custody-model question for
 `ingestion`, not something to decide inside a connector.
+
+---
+
+## 2026-09-29 — IC-046: social_media — the last connector, and Phase 2 closes
+
+**Type:** the fourth and final domain-producer module. `social_media` was a signature-only scaffold
+like the three before it. Two migrations, no new ADR — the shape was settled by `osint` in IC-041 and
+this module follows it.
+
+### The rule this module exists to get right: legal authority is stated, never assumed
+
+CEM §13 lists `social_media_intelligence` among the categories requiring
+`classification.legal_authority_ref`. The sentinel `public_source_no_authority_required` **is** a
+permitted value — a public post genuinely needs no warrant — which makes the tempting shortcut an
+`osint`-style default. That shortcut is the one mistake in this module that could damage a
+prosecution rather than merely produce a bad record.
+
+Social media spans a public tweet and a direct message obtained under a production order, and nothing
+in the content distinguishes them. The platform cannot tell, so the **capture** must say. An absent
+`legal_authority_ref` is a `422`, and the sentinel is accepted only when a connector states it — with
+a test on each half, so neither a later "just default it" nor a later "require a real warrant number"
+can quietly break lawful capture in one direction or the other.
+
+This is also where the four connectors visibly differ rather than repeat: `osint` asserts the
+sentinel because OSINT is public *by definition* (§13's own wording); `forensics` refuses any default
+because a device extraction can never be a public source; `social_media` demands a decision because
+it is genuinely both. Same rule, three correct and different answers.
+
+### An `ingestion` migration shipped with a `social_media` increment
+
+`ingest_evidence` refuses a `(schema_version, category, artifact_type)` triple that is not in
+`attribute_schema_registry` (CEM §13), and `202608300002_ingestion_seed` registered **none** for
+`social_media_intelligence` — its baseline covered the formats the first connectors emitted. So
+before this increment the publish path could not succeed for any content kind. That is not a gap to
+carry forward the way `forensics`' fourteen unregistered kinds are: `forensics` had two working
+triples and a demonstrably functional path, whereas this module would have shipped a publish endpoint
+that could never return 200.
+
+`202609290003_ingest_seed_social` registers CEM §6's six `social_media_intelligence` types. It lives
+in **`ingestion`'s** Alembic chain because the registry is `ingestion`'s table — a module may not
+migrate another's schema (§5) — and the ArgoCD PreSync job applies `ingestion` before the domain
+modules, so the rows exist by the time a connector can call. It reuses `202608300002`'s uuid5
+namespace so a triple's id is derivable from its name in either migration, and a unit test reads the
+migration's own list to assert it matches `CONTENT_KINDS`: a kind this module accepts but the
+registry does not know would fail at publish time, far from the edit that caused it.
+
+### Accounts converge rather than duplicate, and the database enforces it
+
+`social_accounts_observed` is a **set of accounts observed** — its name and its
+`first_observed_at`/`last_observed_at` columns both say so. §3.3 modelled no constraint, so nothing
+stopped two rows describing `@handle` on one platform, which would split its observation window and
+let a monitoring query miss content depending on which row it found.
+
+`register_account` now converges on `(platform, handle)` and refreshes `last_observed_at`, and
+`uq_social_account_platform_handle` makes that safe when two registrations race — both can find
+nothing, and only one insert succeeds. Convergence rather than a `409` because a caller asking to
+monitor an already-monitored account has its intent satisfied; answering with an error would make a
+client treat a no-op as a failure. The refresh is what makes it meaningful rather than a silent
+nothing.
+
+**The same handle on a different platform is a different account.** Treating `@suspect_01` on X and
+on Telegram as one person is an entity-resolution judgement for an analyst (CEM §10), not something a
+uniqueness rule should decide for them — so the index is on the pair, and a test pins it.
+
+`account_registered` is published **only for a genuinely new account**: §25.6's trigger is "New
+account added for monitoring", and announcing a refresh would make a consumer counting monitored
+accounts wrong.
+
+### Capture does not enrol
+
+A connector watching a hashtag or a thread legitimately captures content from handles nobody
+registered. Refusing those captures would lose evidence to a bookkeeping gap; auto-registering their
+authors would let surveillance expand itself without a person deciding. So the capture is kept, the
+handle is **not** added to the monitoring list, and the mapping records the weaker provenance that
+results: `collector_id` is the monitored account's id when there is one, and the handle otherwise.
+That difference is evidential rather than cosmetic — one answer points at a monitoring configuration
+an analyst set up, the other at a string the platform observed — so it is asserted in both directions
+rather than left implicit.
+
+The RBAC split says the same thing in the auth layer, and §4.6 already drew it: registering an
+account is `investigator, admin` (deciding *who* to monitor is supervisory, with civil-liberties
+weight), while capturing content is `investigator, system` (a connector pushes content all day, and
+is the one actor that must not be able to enrol new targets).
+
+### The fourth resolution of the same catalog conflict
+
+§25.6 triggers `content_captured` on "Connector or manual entry captures content"; api-design.md §4.6
+says "Events Published: none at this step" for `POST /content`. `CLAUDE.md` makes
+`event-driven-architecture.md` authoritative for the event catalog, so the event fires on capture.
+
+That is the **fourth** time this exact conflict has appeared — `osint.finding_captured` (IC-041),
+`threat_intel.ioc_registered` (IC-042), `forensics.artifact_registered` (IC-045), and now this one —
+and each has been resolved the same way, so the platform has one rule about which document wins
+rather than four. The pattern is consistent enough to be worth stating plainly: **api-design.md's
+"Events Published" column is unreliable for the domain-producer POSTs and §25 is not.** A future
+documentation pass should reconcile the column; four independent increments agreeing is evidence
+about the column, not about the events.
+
+Publication publishes nothing new. §25.6 defines two events and neither is triggered by publishing;
+the canonical fact is `evidence.ingested`, which `ingestion` emits on its own and which §25.6 itself
+names as how social content "reaches `investigation`". A third event would be an invention.
+
+### Phase 2 is complete
+
+`docs/roadmap.md`'s Phase 2 exit criterion is "evidence from at least two distinct domains can be
+ingested into the same case". Four domains now publish into the canonical model through
+`ingestion.public`: `osint` (IC-041), `threat_intel` (IC-042), `forensics` (IC-045) and
+`social_media`. **All four domain-producer modules are built** — no `NotImplementedError` remains in
+any of their services or repositories.
+
+Stubs do remain elsewhere, and this entry is not claiming otherwise: `notification`'s service and
+repository (4 each) and `investigation`'s correlation job are Phase 3 work, not Phase 2's.
+
+**What Phase 2 did not deliver, stated plainly**, because the roadmap's own bullets name some of it:
+
+* **No automated connectors.** Every one of the four is a *push* surface — an analyst or an external
+  integration posts to it. `osint`'s polling loop, `threat_intel`'s STIX/TAXII transport and a social
+  platform's streaming API are all unbuilt, so the roadmap's "first OSINT source connector(s)" and
+  "first platform connector" exist as endpoints rather than as running collectors.
+* **No forensic artifact parser** (IC-045) — the roadmap's forensics bullet says "parser", and what
+  shipped is intake and normalization.
+* **CEM §9's mapping-profile store still does not exist.** All four modules map a fixed envelope out
+  of their rich-record JSONB column and reject what is missing, which is the least wrong option §9
+  leaves available. It is now four modules' worth of evidence that the profile store is the real
+  missing piece, not a per-module inconvenience.
+
+### Tests
+
+**74 new** — 30 unit on the capture rules and mapping, 20 against real Postgres, 24 over HTTP.
+
+The Postgres file covers what only a real database settles: account convergence and the unique index
+holding when the check loses a race, the provenance difference between monitored and unmonitored
+handles, and rollback leaving an unauthorized capture recorded but unpublished — deliberately *kept*,
+because the content was lawfully observed and the missing field is a declaration an analyst can
+supply later.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (244 source files), import-linter (2/2 kept). Unit +
+integration **1672 passed / 1 skipped**; platform coverage **95.37%** against the 90% floor. Migration
+round-trip green including both new migrations.
+
+### Carried forward
+
+**Phase 2's gaps above** — no automated collectors, no forensic parser, no mapping-profile store.
+
+**Attribute schemas are registered but empty.** `AttributeSchemaRegistry` has only
+`(registry_id, schema_version, category, artifact_type)`; §3.2 documents `required_attributes` and
+`optional_attributes` columns that the ORM and the table do not have. So a registered triple proves
+the *pair* is known and validates nothing about `attributes` themselves — recorded since IC-041 and
+now load-bearing for four modules.
+
+**`osint`'s list endpoint still returns no cursor** (IC-045), now the only connector that does not.

@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import String, Text
+from sqlalchemy import Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -31,8 +31,19 @@ class CapturedContent(Base):
 
 
 class SocialAccountObserved(Base):
+    """One social account under observation — §3.3.
+
+    Mirrors `202609290005_social_account_uq`. The unique index is declared here too so `create_all`
+    in tests reproduces the real constraint: `@handle` on one platform is one account, and two rows
+    would split its observation window so a monitoring query could miss content depending on which
+    row it found.
+    """
+
     __tablename__ = "social_accounts_observed"
-    __table_args__ = ({"schema": _SCHEMA},)
+    __table_args__ = (
+        Index("uq_social_account_platform_handle", "platform", "handle", unique=True),
+        {"schema": _SCHEMA},
+    )
 
     account_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     platform: Mapped[str] = mapped_column(Text, nullable=False)

@@ -191,7 +191,7 @@ Common columns on every rich record table: `<record>_id` (PK), `evidence_id` (ap
 Additional module-specific tables:
 - `osint.osint_sources` (`source_id` PK, `name`, `connector_type`, `reliability_baseline`, `is_active`), `osint.osint_connector_state` (`state_id` PK, `source_id` FK, `cursor` jsonb, `last_polled_at`)
 - `threat_intel.threat_actor_profiles` (`threat_actor_id` PK, `name`, `aliases` text[], `description`), `threat_intel.feed_subscriptions` (`subscription_id` PK, `feed_name`, `protocol`, `is_active`, `last_synced_at`), `threat_intel.ioc_evidence_matches` (`match_id` PK, `ioc_id` FK → `iocs`, `matched_evidence_id` app-ref, `matched_at`, `confidence`)
-- `social_media.social_accounts_observed` (`account_id` PK, `platform`, `handle`, `first_observed_at`, `last_observed_at`)
+- `social_media.social_accounts_observed` (`account_id` PK, `platform`, `handle`, `first_observed_at`, `last_observed_at`) — **unique `(platform, handle)`** (`uq_social_account_platform_handle`): the table is a *set* of accounts observed, so one handle on one platform is one row. Two rows would split its observation window, and a monitoring query could then miss content depending on which it found. `register_account` converges on the pair and refreshes `last_observed_at`; the index is what makes that safe when two registrations race. The same handle on a *different* platform is a different account — treating them as one is an entity-resolution judgement for an analyst (CEM §10), not a uniqueness rule.
 
 ### 3.4 `case_management`
 

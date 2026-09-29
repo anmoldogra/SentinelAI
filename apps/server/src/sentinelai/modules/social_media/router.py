@@ -1,4 +1,4 @@
-"""social_media HTTP routes — api-design.md §5 (Social Media). Parse and delegate only."""
+"""social_media HTTP routes — api-design.md §4.6. Parse and delegate only."""
 
 from __future__ import annotations
 
@@ -69,10 +69,10 @@ async def list_content(
     current_user: CurrentUser = Depends(require_role("investigator")),
     service: SocialMediaService = Depends(get_social_media_service),
 ) -> ListEnvelope[ContentRead]:
-    items = await service.list_content(current_user, page)
+    items, next_cursor, has_more = await service.list_content(current_user, page)
     return ListEnvelope(
         data=[ContentRead.model_validate(i) for i in items],
-        pagination=Pagination(next_cursor=None, has_more=False, limit=page.limit),
+        pagination=Pagination(next_cursor=next_cursor, has_more=has_more, limit=page.limit),
         meta=_meta(request),
     )
 

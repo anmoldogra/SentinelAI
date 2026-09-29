@@ -1,4 +1,4 @@
-"""social_media Pydantic schemas — api-design.md §5 (Social Media)."""
+"""social_media Pydantic schemas — api-design.md §4.6."""
 
 from __future__ import annotations
 
@@ -25,9 +25,17 @@ class AccountRead(BaseModel):
 
 
 class ContentCreate(BaseModel):
-    platform: str = Field(min_length=1)
-    account_handle: str = Field(min_length=1)
-    content_kind: str = Field(min_length=1)
+    """§4.6's body: ``{ platform, account_handle, content_kind, raw_attributes, captured_at }``.
+
+    ``raw_attributes`` is the capture's CEM envelope, the same role `osint`'s column of that name
+    plays and `forensics` had to press `device_info` into — see
+    `SocialMediaService`'s module docstring.
+    """
+
+    platform: str = Field(min_length=1, max_length=100)
+    account_handle: str = Field(min_length=1, max_length=200)
+    content_kind: str = Field(min_length=1, max_length=50)
+    captured_at: datetime
     raw_attributes: dict[str, Any]
 
 
