@@ -20,7 +20,7 @@ from sentinelai.platform.auth.dependencies import CurrentUser, require_role
 from sentinelai.platform.db.transaction import TransactionalRoute, bind_session
 from sentinelai.platform.idempotency import enforce_idempotency
 from sentinelai.shared.envelope import Envelope, ListEnvelope, Meta, Pagination
-from sentinelai.shared.pagination import PageParams, page_params
+from sentinelai.shared.pagination import PageParams, encode_cursor, page_params
 
 router = APIRouter(
     prefix="/api/v1/threat-intel",
@@ -81,13 +81,23 @@ async def get_ioc(
 async def list_ioc_matches(
     ioc_id: UUID,
     request: Request,
+    page: PageParams = Depends(page_params),
     current_user: CurrentUser = Depends(require_role("investigator")),
     service: ThreatIntelService = Depends(get_threat_intel_service),
 ) -> ListEnvelope[MatchRead]:
-    items = await service.list_matches(ioc_id, current_user)
+    """Evidence this IOC has matched, newest first — api-design.md §4.4 (cursor, `matched_at`)."""
+    items = await service.list_matches(ioc_id, current_user, page)
+    # One over the limit would be the cleaner `has_more`, but the service returns exactly the page;
+    # a full page is the signal, which is why the cursor is only emitted when the page filled.
+    has_more = len(items) == page.limit
+    next_cursor = (
+        encode_cursor(items[-1].matched_at.isoformat(), items[-1].match_id)
+        if has_more and items
+        else None
+    )
     return ListEnvelope(
         data=[MatchRead.model_validate(i) for i in items],
-        pagination=Pagination(next_cursor=None, has_more=False, limit=len(items)),
+        pagination=Pagination(next_cursor=next_cursor, has_more=has_more, limit=page.limit),
         meta=_meta(request),
     )
 

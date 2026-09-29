@@ -24,9 +24,11 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from sentinelai.modules.ingestion.events import (
@@ -48,7 +50,11 @@ from sentinelai.modules.ingestion.models import (
     EvidenceCustodyEvent,
     IntakeRecord,
 )
-from sentinelai.modules.ingestion.repository import IngestionUnitOfWork, get_ingestion_uow
+from sentinelai.modules.ingestion.repository import (
+    EvidenceRepository,
+    IngestionUnitOfWork,
+    get_ingestion_uow,
+)
 from sentinelai.modules.ingestion.schemas import (
     ConnectorCreate,
     ConnectorUpdate,
@@ -1194,3 +1200,40 @@ def get_evidence_service(
 
 
 __all__ = ["CUSTODY_EVENT_TYPES", "VALID_CATEGORIES", "EvidenceService", "get_evidence_service"]
+
+
+async def read_evidence_attributes(
+    session: AsyncSession, evidence_id: UUID
+) -> dict[str, Any] | None:
+    """Cross-module hook: an evidence object's ``attributes``, or ``None`` if it is gone.
+
+    This is the "consumer that needs it fetches" path `event-driven-architecture.md` §181 specifies.
+    `evidence.ingested` deliberately carries `category`, `artifact_type` and `collected_at` but
+    **not**
+    `attributes` — they may be large or sensitive, and §21 keeps sensitive content off the bus
+    entirely. A consumer that must inspect them (today: `threat_intel`'s IOC matcher) reads them
+    here.
+
+    **A function over a session, not an ``EvidenceService`` method, and that is the point.** An
+    event
+    consumer has no KMS and no object storage — the dispatcher hands a handler a session and a
+    signed
+    outbox, nothing more — so requiring a full service would have meant constructing one with nulls
+    for dependencies this read never touches. A function that needs exactly a session and an id can
+    be
+    called from a request or a handler without either pretending to be the other.
+
+    **No ``actor``, and it is not an authorization bypass.** `EvidenceService.get_evidence` takes a
+    `CurrentUser` and never consults it; authorization is the router's, via `require_role`. This
+    exists
+    so a consumer does not have to fabricate a principal, which would be a lie in every audit path
+    it
+    reached.
+
+    Returns ``None`` rather than raising for a missing row: a consumer is reacting to an event whose
+    subject may since have been removed, and absence is an answer, not a failure.
+    """
+    evidence = await EvidenceRepository(session).get_by_id(evidence_id)
+    if evidence is None:
+        return None
+    return evidence.attributes

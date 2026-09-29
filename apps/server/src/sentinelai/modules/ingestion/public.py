@@ -1,8 +1,10 @@
 """ingestion public interface — the ONLY symbols other modules may import.
 
-``EvidenceService.exists`` is the cross-module hook other modules use (e.g.
-``case_management`` validating an ``evidence_id`` at link time) — always via this
-interface, never by importing ingestion's repository or querying its tables (§5).
+``EvidenceService.exists`` and ``read_evidence_attributes`` are the cross-module read hooks other
+modules use — ``case_management`` validating an ``evidence_id`` at link time, and
+``threat_intel``'s IOC matcher reading the attributes that `event-driven-architecture.md` §181
+deliberately keeps off the event bus. Always via this interface, never by importing ingestion's
+repository or querying its tables (§5).
 
 ``EvidenceCreate`` and ``get_evidence_service`` are exported for the **domain-producer** modules
 (`osint`, `threat_intel`, `forensics`, `social_media`): `database-design.md` §3.3 gives each of them
@@ -20,6 +22,16 @@ that module to this one's composition, which is the coupling `public.py` exists 
 from __future__ import annotations
 
 from sentinelai.modules.ingestion.schemas import EvidenceCreate, EvidenceRead
-from sentinelai.modules.ingestion.service import EvidenceService, get_evidence_service
+from sentinelai.modules.ingestion.service import (
+    EvidenceService,
+    get_evidence_service,
+    read_evidence_attributes,
+)
 
-__all__ = ["EvidenceCreate", "EvidenceRead", "EvidenceService", "get_evidence_service"]
+__all__ = [
+    "EvidenceCreate",
+    "EvidenceRead",
+    "EvidenceService",
+    "get_evidence_service",
+    "read_evidence_attributes",
+]

@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import ARRAY, Boolean, ForeignKey, Numeric, String, Text
+from sqlalchemy import ARRAY, Boolean, ForeignKey, Index, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -61,8 +61,18 @@ class FeedSubscription(Base):
 
 
 class IocEvidenceMatch(Base):
+    """One sighting of an IOC in one piece of evidence.
+
+    Mirrors `202609290011_ti_match_uq`. Declared here so `create_all` in tests reproduces the real
+    constraint: event-driven §25.4 requires "never create a duplicate match row for the same pair",
+    and a test suite whose schema lacked the index would pass while production relied on it.
+    """
+
     __tablename__ = "ioc_evidence_matches"
-    __table_args__ = ({"schema": _SCHEMA},)
+    __table_args__ = (
+        Index("uq_ioc_evidence_match_pair", "ioc_id", "matched_evidence_id", unique=True),
+        {"schema": _SCHEMA},
+    )
 
     match_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     ioc_id: Mapped[UUID] = mapped_column(

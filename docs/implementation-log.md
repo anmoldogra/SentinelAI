@@ -3171,3 +3171,159 @@ nothing schedules one, so findings arrive only by push.
 
 Next: `threat_intel`'s intake is the natural sibling increment, and the IOC-matching path that feeds
 `threat_intel.ioc_matched` is the first genuinely cross-domain correlation work.
+
+---
+
+## 2026-09-29 — IC-042: threat_intel — IOC registration, profiling, feeds, and evidence matching
+
+**Type:** Phase 2's second connector module, and the first genuinely cross-domain correlation path in
+the platform. One migration (a unique index), one new pure module (`matching.py`), one event consumer
+that does real work. `threat_intel` was a signature-only scaffold like `osint` before it.
+
+### Two premises in the task did not survive the catalog
+
+**`threat_intel.actor_profiled` does not exist.** §25.4 lists exactly two published events for this
+module — `threat_intel.ioc_registered` and `threat_intel.ioc_matched` — and §163's compliance check
+enumerates the whole platform catalog without it. Publishing an invented event would violate
+`CLAUDE.md` rule 1, which requires a new event type be added to §25's catalog in the same change that
+introduces it in code. Creating a threat actor therefore **publishes nothing** and is audited, which
+is what api-design.md §4.4 asks for. `ioc_registered` — which the task did not mention — is published,
+because the catalog says it is.
+
+**Matching runs in one direction, not two.** The task asked to match "when new evidence is ingested or
+IOCs are registered". §25.4 documents only the first: `threat_intel` *consumes* `evidence.ingested` and
+scans the new evidence against active IOCs. Registering an IOC does not retro-scan history — no
+document specifies it, it would turn one registration into an unbounded table scan, and the wall of
+historical matches it produces is a different feature from "tell me when this indicator turns up".
+Recorded as unbuilt rather than guessed at.
+
+### A documented conflict, resolved toward the event catalog
+
+§25.4 triggers `ioc_registered` on "New IOC created". api-design.md §4.4's table for the same endpoint
+says "Events Published: **none at creation**". They cannot both hold. `CLAUDE.md` makes
+`event-driven-architecture.md` the authority for everything async including "the complete per-module
+published/consumed event catalog (Section 25)", so the event is published and the conflict is recorded
+here rather than resolved silently in whichever direction was convenient.
+
+### Matching is exact on a normalized token, and that is the whole design
+
+The tempting implementation is `ioc.value in str(attributes)`. It is wrong in the direction that
+matters: the IOC `evil.com` would "match" evidence mentioning `notevil.com` or `evil.com.br`, and an
+analyst would be told a known-malicious domain appears in a case when it does not. **A false positive
+here is not a cosmetic bug — it is an accusation in a legal record.**
+
+So `matching.py` is pure and does two things. It **normalizes at registration**: hashes and domains
+lower-case (hex and DNS are case-insensitive), IPs go through `ipaddress` so `2001:db8::0:1` and
+`2001:0db8::1` collapse to one host, URLs fold scheme and host but keep the path verbatim because a
+path *is* case-sensitive. And it **decomposes evidence into candidate tokens**, so comparison is
+equality rather than containment. A URL contributes its host as well as itself, because evidence
+recording `http://evil.com/x` should match a `domain` IOC for `evil.com` — otherwise the match would
+depend on whether the connector happened to store a hostname or a URL.
+
+Normalizing at registration rather than at match time is what makes the query cheap: the stored value
+and the evidence tokens are put in the same shape once, so matching is **one indexed `IN` against a
+token set**. The alternative — loop the IOC library and test each indicator against the evidence — gets
+slower as the threat library grows, which is exactly backwards for the thing that runs on every ingest.
+
+Hash length is validated against the declared type: a 32-character digest labelled `hash_sha256` is an
+MD5 with the wrong label, and the label decides which evidence field it is ever compared against —
+the same argument `IntegrityHash` makes in `shared/cem.py`. Tokenization is bounded in depth and
+breadth, because `attributes` is connector-supplied and this runs on every ingest.
+
+### Attributes come from `ingestion.public`, and the reader is a function
+
+§181 keeps `attributes` off the event bus deliberately — they may be large or sensitive, and §21 wants
+sensitive content off it entirely — and says "a consumer that needs it" fetches. So `ingestion.public`
+gained `read_evidence_attributes(session, evidence_id)`.
+
+**A function over a session, not an `EvidenceService` method**, and the reason is what the dispatcher
+provides: a handler gets a session and a signed outbox, nothing more. No KMS, no object storage. A
+service method would have meant constructing an `EvidenceService` with nulls for dependencies this
+read never touches. It also takes no `actor`: `EvidenceService.get_evidence` takes a `CurrentUser` and
+never consults it (authorization is the router's), so an actor-free reader is no bypass — it exists so
+a consumer does not fabricate a principal, which would be a lie in every audit path it reached.
+
+### Pair uniqueness is enforced twice, on purpose
+
+§25.4 names `(ioc_id, matched_evidence_id)` as the handler's idempotency key: "never create a duplicate
+match row for the same pair". The service checks before inserting **and** a new unique index enforces
+it. The check keeps redelivery quiet; the constraint makes two concurrent scans impossible rather than
+merely unlikely — two workers both pass the check, and only one insert can then succeed.
+
+That belt-and-suspenders is worth the migration because a duplicate match is not cosmetic: each row
+claims a known-malicious indicator appears in a specific piece of evidence, and each publishes an
+`ioc_matched` event that `investigation` consumes — so a duplicate becomes a second correlation, a
+second finding to review, and a second line in a report about one sighting.
+
+A match is deliberately **not audited**. `platform.audit_log` records what principals did, and no
+principal did this; the record of the observation is the match row plus the event, both attributable to
+the platform rather than to whoever happened to upload the evidence. The event carries
+`actor_type="system"` and no `actor_ref` for the same reason.
+
+### A circular import, fixed by following the existing convention
+
+`service.py` imported the event names from `events.py`; `events.py` needed the matcher from
+`service.py`. `threat_intel` is the first module whose service both publishes an event *and* whose
+consumer wanted that service, which is how the cycle appeared.
+
+Every other module's `events.py` imports models and repository and **never** the service — handlers
+work against the UoW directly (`case_management`, `notification`). Moving the matcher into `events.py`,
+beside the handler that calls it, removes the cycle by following that convention rather than papering
+over it with a deferred import. It also lands the matcher where it belongs: it is consumer-path logic,
+and it needs no KMS, while every method left on `ThreatIntelService` is an audited user action that
+does.
+
+### Feed sync: the trigger is real, the transport is not
+
+`sync_feed` validates the subscription, **refuses outright on a zero-egress profile**, audits the
+request, and enqueues. The refusal is the security point: a feed sync is by definition an outbound call,
+and `deployment-architecture.md` requires air-gapped and classified deployments to have "zero
+configured or observed egress paths", so enqueuing a job that would attempt one — and might succeed
+through a misconfigured proxy — is not an acceptable answer there. The worker re-checks the same
+invariant, because a job can be enqueued on one profile and run after a redeploy onto another.
+
+**The STIX/TAXII and vendor-API transport is not built**, and `jobs.py` says so rather than pretending:
+it raises a named `FeedTransportNotConfigured`. The endpoint is `202`, so a failing job dead-letters
+where an operator sees it instead of telling a caller the sync succeeded. Stamping `last_synced_at` and
+returning would have recorded a synchronization that never happened, on the column an analyst reads to
+decide whether their threat library is current — a feed that silently never updates while claiming it
+did is worse than one that visibly fails.
+
+### Tests
+
+**97 new** — 47 pure (`matching.py`), 30 against real Postgres, 20 over HTTP.
+
+The pure file is built around the cases a substring match gets wrong, because those are the ones that
+produce a false accusation. The Postgres file proves the unique index holds when the service's check
+loses a race, that a retired indicator costs nothing and matches nothing, that the same indicator in
+two evidence items is two sightings rather than one, and that the `ioc_matched` event is **verified
+under `EVENT_ROOT`** with the real signer rather than asserted non-null. The HTTP file asserts
+idempotency on a **call counter** — "a retried submission does not register twice" means the service was
+not re-entered — plus §4.4's per-endpoint RBAC, including that a feed integration running as `system`
+may register IOCs but not create threat actors.
+
+### Gates
+
+ruff (lint + format), `mypy --strict` (239 files), import-linter (2/2 kept). Full suite
+**1454 passed / 2 skipped**. Platform coverage **95.65%** against the 90% floor. Migration round-trip green
+including the new unique index.
+
+### Carried forward
+
+**No feed transport**, per above — IOCs reach the platform through `POST /threat-intel/iocs` until a
+connector increment builds one, and there is no scheduled feed poll.
+
+**No retro-scan on IOC registration.** Registering an indicator does not search existing evidence; only
+newly ingested evidence is scanned. Closing it needs a documented decision about scope and cost.
+
+**`forensics` and `social_media` are still scaffolds** — every service and repository method raises
+`NotImplementedError`, exactly as `osint` and `threat_intel` did.
+
+**No IOC → evidence publication.** `iocs.evidence_id` exists and stays null: §3.3 allows an IOC to be
+published into the CEM as its own evidence object, and no endpoint does that. Matching relates an IOC
+to *other* evidence, which is a different relationship.
+
+`threat_intel.ioc_matched` now flows to `investigation`, whose handler is still a deferred no-op — so
+the matches are recorded and announced but do not yet become graph edges. That handler is the next
+increment, and it is what would put non-seed edges into the Wave 4.1 projection and finally make
+`depth` mean something.
