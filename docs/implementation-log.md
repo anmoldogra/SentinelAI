@@ -4565,3 +4565,163 @@ hop short of the delivery. Recorded since IC-043 and unchanged here.
 elsewhere is deliberate and named: `ArtifactParserNotConfigured` (`forensics/jobs.py`),
 `FeedTransportNotConfigured` (`threat_intel/jobs.py`), and `platform/auth/dependencies.py`'s port
 default that the composition root overrides.
+
+---
+
+## 2026-09-29 — IC-049: Wave 4.2 — ADR-0014 decided; tenancy is a deployment boundary, not a column
+
+**Type:** a decision increment. No migration, no endpoint, no event, no schema change — one ADR
+driven from `Proposed` to `Accepted`, the registers that carried it closed, and the invariant pinned
+by a test. Four new tests.
+
+### The increment was requested as an implementation, and the gate for it was unmet
+
+Wave 4.2 arrived scoped as a build: inject tenant context into the connection lifecycle via
+`set_config('app.current_tenant', ...)`, add `tenant_id` columns across all domain and platform
+tables, resolve the tenant in middleware, make the dispatcher tenant-aware, and mark ADR-0014
+Accepted. Its first task was to "confirm the decided isolation strategy". **There was no decided
+strategy to confirm**, and three separate gates said so:
+
+* **ADR-0014's own status** — `Proposed (Phase 2). Requires a product decision on which deployment
+  profiles are in scope.`
+* **`engineering-governance.md` §0's referencing rule** — "No ADR may be marked Accepted, and no
+  subsystem may enter implementation, without demonstrating conformance to the Quality Gates (§3)
+  and Definition of Done (§13)". §3's gate 4 is blunter still: "new endpoint/event/table absent from
+  its authoritative doc **fails the build**".
+* **`modernization-roadmap.md`'s Wave 4.2 row** — the Notes column read, in full, "product decision
+  on profiles first".
+
+**And the strategy requested was the one the draft had rejected.** ADR-0014's decision §2 chose
+schema-per-tenant explicitly "over shared-table row-level `tenant_id`"; RLS appeared once, as
+"defense-in-depth **if** a shared tier is ever introduced". Meanwhile decision §1 — the *primary*
+supported model — was physical isolation per agency, which needs no application code at all.
+
+**The field did not exist to add.** `database-design.md`, `api-design.md`,
+`event-driven-architecture.md` and `canonical-evidence-model.md` contain **zero** occurrences of
+"tenant" between them. Adding `tenant_id` "across all domain and platform tables" plus a request
+header plus an envelope field would have been `CLAUDE.md` rule 1 at the largest scale the repository
+admits — an invented field on every table in the system.
+
+So the increment stopped before any code and put the product decision to the product owner, which is
+what ADR-0014 said the blocker was. **The decision: physical isolation per agency, no shared tier.**
+
+### What ADR-0014 now decides
+
+Rewritten in place — permitted because the draft was never Accepted (ADR-0001: "ADRs are immutable
+*once accepted*"), and recorded as such in the ADR so the rewrite is not mistaken for an edit to a
+live decision.
+
+1. **Physical/deployment isolation per agency is the supported model.** Own database cluster, own
+   KMS root key (ADR-0009), own storage and buckets (ADR-0008), own network zone.
+2. **No shared-infrastructure tier.** The "Future SaaS" profile is out of scope; introducing one
+   takes a superseding ADR that first amends the three authoritative documents.
+3. **The reserved `tenant_id` context stays `None`** — permanently, not pending a phase.
+4. **Cross-agency sharing stays explicit, audited and event-mediated** — unchanged from the draft,
+   still unimplemented, but the shape is now fixed so "let both agencies read one table" is off the
+   table before anyone proposes it under schedule pressure.
+
+**The ADR is satisfied by building nothing, and that is the finding rather than a deferral.**
+Isolation is delivered by the deployment boundary, so the correct amount of application code is
+zero. The increment's constraint — enforce isolation below the application layer, never with a
+`WHERE` clause — is satisfied *maximally* by this decision: there is no predicate to get wrong
+because there is no second tenant in the database to filter out.
+
+### Why the rejected option is weaker than it looks, in this codebase specifically
+
+Recorded in the ADR's "Alternatives considered" rather than left as a matter of taste, because the
+request was reasonable on its face and the objections are concrete:
+
+* **One pooled engine, one application role.** `platform/db/privileges.py` grants to
+  `sentinel_app`/`sentinel_append`. A `set_config('app.current_tenant', ...)` GUC therefore lives on
+  a connection that **outlives the request that set it**, so correctness depends on a
+  reset-on-checkin hook invisible at every call site and silently disclosive if it regresses. RLS
+  also does not apply to a table owner and is waived for `BYPASSRLS`, so the guarantee rests on role
+  hygiene no test here would notice breaking.
+* **The ADR-0006 dispatcher has no tenant to bind.** It polls outbox tables on a lease with no user,
+  no request and no session, so it would need a bypass role — and a bypass role reaching every
+  module's outbox is precisely what makes RLS ceremonial.
+* **It contradicts the evidentiary model.** Under a shared table, two agencies' entries interleave
+  in one ADR-0003 hash chain, so extracting one agency's verifiable custody record for court means
+  producing a structure whose integrity proof depends on rows belonging to an unrelated agency.
+  Physical isolation makes a deployment's ledger a complete, self-contained evidentiary artifact.
+* **The customer base will not accept it** — §40's own words, that logical isolation "asks
+  government/intelligence customers to trust a shared-infrastructure boundary many will not accept
+  by policy". A control the buyer's policy forbids them to rely on is not a cheaper control.
+
+Schema-per-tenant is recorded as the **least-bad shared model** if §2 is ever revisited, so a future
+ADR starts from the better alternative rather than re-deriving it.
+
+### The invariant is pinned, because a decision to build nothing can only regress by someone building
+
+`tests/architecture/test_tenant_isolation.py` — the same static-scan pattern as
+`test_transaction_boundaries.py` (ADR-0005), and for the same reason.
+
+* No source file outside `platform/config.py` may reference `tenant_id`. The regex matches the
+  identifier, not prose, so a comment discussing cross-tenant risk is welcome and a reference to the
+  symbol is a failure.
+* No migration may introduce `ROW LEVEL SECURITY` or `current_tenant` — the two shapes a shared tier
+  takes at the database layer.
+* Both scans carry a non-vacuity guard (247 source files, 47 migrations today), and both failure
+  messages name this ADR and the superseding-ADR requirement.
+
+Verified by injecting each violation and confirming the assertions fire with the exact file and line,
+then reverting. **The test is not a prohibition on multi-tenancy** — RLS remains ADR-0014's own
+defence-in-depth choice *if* a shared tier is ever decided. It is the mechanism that makes such a
+tier arrive as a reviewed decision instead of a merged pull request, and a superseding ADR deletes
+this file as part of the same change.
+
+### The ContextVar is kept, not deleted
+
+It is dead by construction now, which is an argument for removing it. It stays because
+`backend-implementation-guide.md` Part 8 documents it, and because a named, tested, permanently-inert
+seam tells the next reader that single-tenancy is a **recorded decision with an ADR number**, not an
+unfinished feature someone forgot. Its comment previously read "ALWAYS None **until** the Phase 4
+multi-tenancy ADR" — that sentence was true when written and is now false, and leaving it would have
+been an open invitation to finish the job.
+
+### Integration tests were requested and are not applicable by construction
+
+The increment asked for tests proving Tenant A's data is invisible to Tenant B at the database layer.
+Under this decision that proof is an **infrastructure** test — two deployments, neither able to reach
+the other's database — against `deployment-architecture.md` Part 22, not a pytest against one
+Postgres. A pytest asserting that a single-tenant system does not leak between tenants it does not
+have would pass vacuously and prove nothing, so none was written. Recorded in the ADR's Quality Gates
+table as gate 6 rather than left as a silent omission.
+
+### Documentation
+
+ADR-0014 rewritten with the mandatory template sections governance §2 requires and the draft lacked
+— Criticality Tier (**Tier 0**, an authorization and, via ADR-0009, cryptographic boundary), Quality
+Gates checklist, Threat Model, Alternatives considered, Migration/rollback, Supersedes/Superseded-by,
+Traceability, Review sign-offs.
+
+Sign-offs are recorded honestly rather than ceremonially: governance requires an **independent
+adversarial audit** for a Tier 0 verdict and none was performed. It is deliberately not blocking,
+because the decision's effect is to *decline to build* the attack surface an audit would examine —
+but the obligation is written into the ADR as mandatory for any superseding ADR that introduces a
+shared tier, rather than left to memory.
+
+Fourteen register entries closed across six documents, all of which carried this as open:
+`architecture.md`'s Open Questions; `security-architecture.md` §40 (heading and TOC entry lose
+"(Future)"), §51 and §52; `engineering-roadmap.md`'s Part 8 workstream, M4 checklist, §40 phase
+mapping, technical-debt register and **two** open-ADR register rows; `modernization-roadmap.md`'s
+Wave 4.2 row; and `backend-implementation-guide.md` Part 8's "Tenant Context".
+
+### Carried forward
+
+**Isolation now depends on deployment discipline, and that is a real transfer of risk.** The
+guarantee moved out of the application and into `deployment-architecture.md`'s Mandatory Rules —
+GitOps-only changes, default-deny `NetworkPolicy` per namespace, per-tenant secrets from Vault.
+Those rules were already mandatory; this ADR makes them load-bearing for confidentiality. Accepted as
+a residual in writing, in the ADR's threat model.
+
+**Per-agency operational cost is linear and unpaid so far.** N agencies is N deployments, N upgrade
+windows, N restore drills. Nothing in the repository automates that today, and no Part 22 profile has
+been stood up twice to find out what breaks.
+
+**§4's cross-agency sharing flow does not exist.** The ADR fixes its shape — explicit, audited,
+event-mediated, never a shared table — but no export/import path is built, and the first real
+multi-agency intelligence-sharing requirement will need its own increment.
+
+**Wave 4.2 closes without touching Wave 4.4.** DR/backup with independent integrity attestation
+remains the open Wave 4 item alongside Wave 4.3's unbuilt alerting half.

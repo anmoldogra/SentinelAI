@@ -633,7 +633,9 @@ This is `security-architecture.md` §6's authorization flow diagram, implemented
 
 ## Tenant Context
 
-Phase 1 is single-tenant (`security-architecture.md` §40 is future work) — no `tenant_id` filtering exists yet. A `tenant_id: ContextVar[UUID | None]` is reserved in `platform/config.py`, currently always `None`, so the extension point exists without speculative implementation ahead of the Phase 4 ADR that section requires.
+SentinelAI is single-tenant per deployment — **permanently, by decision**: ADR-0014 (Accepted 2026-09-29) adopts physical/deployment isolation per agency and declines a shared-infrastructure tier. There is therefore no `tenant_id` filtering anywhere, and there is no phase in which it arrives.
+
+A `tenant_id: ContextVar[UUID | None]` remains reserved in `platform/config.py` and is **always `None`**. Nothing sets it and nothing reads it; `tests/architecture/test_tenant_isolation.py` fails the build if any source file outside that declaration references it, or if any migration introduces row-level security or a `current_tenant` setting. It is kept rather than deleted so the next reader can see that single-tenancy is a recorded decision with a named ADR, not an unfinished feature — a shared tier requires a superseding ADR, which would amend `database-design.md`, `api-design.md` and `event-driven-architecture.md` before any code.
 
 ---
 

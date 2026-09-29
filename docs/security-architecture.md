@@ -49,7 +49,7 @@ Fifty-three sections, organized into seven parts:
 | 10 | [API Security](#10-api-security) | 37 | [Output Encoding](#37-output-encoding) |
 | 11 | [Service-to-Service Authentication](#11-service-to-service-authentication) | 38 | [Data Classification](#38-data-classification) |
 | 12 | [Secrets Management](#12-secrets-management) | 39 | [Legal Hold Protection](#39-legal-hold-protection) |
-| 13 | [Key Management](#13-key-management) | 40 | [Tenant Isolation (Future)](#40-tenant-isolation-future) |
+| 13 | [Key Management](#13-key-management) | 40 | [Tenant Isolation](#40-tenant-isolation) |
 | 14 | [Encryption Standards](#14-encryption-standards) | 41 | [Air-Gapped Deployment Security](#41-air-gapped-deployment-security) |
 | 15 | [Data-at-Rest](#15-data-at-rest) | 42 | [Supply Chain Security](#42-supply-chain-security) |
 | 16 | [Data-in-Transit](#16-data-in-transit) | 43 | [Dependency Scanning](#43-dependency-scanning) |
@@ -631,14 +631,16 @@ Consolidates `database-design.md` §7/§8/§12 and CEM's `retention.legal_hold` 
 - The hold **overrides normal retention/archival schedules** (`database-design.md` §7, `event-driven-architecture.md` §20) and **overrides backup rotation** (`database-design.md` §12) — a held item cannot silently age out of any retention window anywhere in the system.
 - Changing hold status is itself a privileged, audited action, requiring a `supervisor`/`admin`/`compliance`-equivalent role — never available to the same role that could also delete the underlying evidence, per §21's separation-of-duties principle.
 
-## 40. Tenant Isolation (Future)
+## 40. Tenant Isolation
 
-Phase 1 is deliberately single-tenant (`architecture.md`); this section defines the target architecture for PRD Phase 4's multi-tenancy requirement, not a Phase 1 build item. Two models, with a recommendation specific to this customer base:
+> **Decided — ADR-0014 (Accepted, 2026-09-29).** The recommendation below is now the decision: **physical/deployment isolation per agency is the only supported tenancy model**, and there is no shared-infrastructure tier. The platform is single-tenant per deployment permanently, not pending a phase. Logical isolation is retained below as the rejected alternative, because a superseding ADR that ever reopens this must answer why it was rejected. The reserved `tenant_id` context stays `None`, enforced by `tests/architecture/test_tenant_isolation.py`.
+
+This section states the two models and the recommendation ADR-0014 adopted. Two models, with a recommendation specific to this customer base:
 
 - **Logical isolation** (shared schema, `tenant_id` column on every table, enforced via row-level policy): lower operational cost, but asks government/intelligence customers to trust a shared-infrastructure boundary many will not accept by policy.
 - **Physical isolation** (dedicated database/deployment per tenant): stronger guarantee, matches how this customer segment typically procures software, and avoids the entire class of cross-tenant-leak risk logical isolation carries.
 
-**Recommendation:** physical/dedicated-deployment tenancy as the default for this platform, given the sensitivity of the data and the customer base — shared-schema multi-tenancy, if ever offered, should be an explicit, separately-evaluated option for the enterprise-security segment only, never the default. This is flagged as requiring a formal ADR (§51) before any Phase 4 multi-tenancy work begins.
+**Recommendation:** physical/dedicated-deployment tenancy as the default for this platform, given the sensitivity of the data and the customer base — shared-schema multi-tenancy, if ever offered, should be an explicit, separately-evaluated option for the enterprise-security segment only, never the default. **That ADR now exists: ADR-0014, Accepted 2026-09-29**, adopting this recommendation in full and declining the shared tier outright — so a shared-schema offering is not a Phase 4 work item but a superseding-ADR question.
 
 ```mermaid
 flowchart TB
@@ -801,7 +803,7 @@ Decisions in this document that require a formally recorded ADR (`docs/adr/`, pe
 - KMS/HSM product selection (§13)
 - Digital signature key custody model (§20)
 - Object Lock/WORM adoption and specific object storage product (§26)
-- Tenant isolation model (§40) — required before any Phase 4 multi-tenancy work
+- ~~Tenant isolation model (§40)~~ — **Accepted: ADR-0014** (physical isolation per agency; no shared tier)
 
 ## 52. Open Security Questions
 
@@ -813,7 +815,7 @@ Consolidated from every "flagged as open" item above:
 - Secrets manager and KMS/HSM product selection (§12, §13)
 - Digital signature adoption and key custody model (§20)
 - Object Lock/WORM specific adoption (§26)
-- Tenant isolation model for Phase 4 (§40)
+- ~~Tenant isolation model for Phase 4 (§40)~~ — **Closed by ADR-0014**; SR-7 is satisfied by having no multi-tenant deployment to isolate, and SR-8 by having no cross-agency corpus
 - Formal, staffed incident-response roles/on-call — currently aspirational given team size (§48)
 
 ## Security Controls Across a Single Workflow

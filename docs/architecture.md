@@ -85,7 +85,7 @@ Deferred items are still provisioned (commented out) in `docker-compose.yml` so 
 ## Open Questions
 
 - **`apps/server` language/framework** (blocking Phase 1): needs an ADR before module implementation starts — affects how module-boundary enforcement (rule 1 in `apps/server/README.md`) gets tooled (e.g. a dependency-boundary lint rule).
-- Multi-tenancy model: single-tenant deployments vs. shared platform with tenant isolation?
+- ~~Multi-tenancy model: single-tenant deployments vs. shared platform with tenant isolation?~~ **Resolved by ADR-0014 (Accepted, 2026-09-29):** physical/deployment isolation per agency is the only supported model — own database cluster, own KMS root key, own storage, own network zone. There is no shared-infrastructure tier, and introducing one requires a superseding ADR.
 - AI model strategy: hosted LLM API vs. self-hosted models, and how that choice interacts with handling sensitive evidence.
 - Identity/auth strategy for `apps/server/entrypoints/http` (see roadmap Phase 1).
 - Secrets management: `.env.example` conventions are enough for scaffold-stage local dev, but production needs a real secrets manager (Vault, cloud-native equivalent) — decide alongside `infra/terraform`.

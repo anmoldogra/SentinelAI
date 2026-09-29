@@ -341,7 +341,10 @@ def get_settings() -> Settings:
 
 settings: Settings = get_settings()
 
-# Reserved single-tenant context (security-architecture.md §40, guide Part 8
-# "Tenant Context"). Phase 1 is single-tenant: this is ALWAYS None until the
-# Phase 4 multi-tenancy ADR. The extension point exists without speculative impl.
+# Reserved single-tenant context (ADR-0014, security-architecture.md §40, guide
+# Part 8 "Tenant Context"). **ADR-0014 is Accepted: this is permanently None.**
+# SentinelAI isolates by deployment — one agency, one database cluster, one KMS
+# root key, one network zone — so there is no tenant to bind and no shared tier.
+# Nothing sets it and nothing reads it; tests/architecture/test_tenant_isolation.py
+# fails the build if that changes. A shared tier needs a superseding ADR first.
 tenant_id: ContextVar[UUID | None] = ContextVar("tenant_id", default=None)

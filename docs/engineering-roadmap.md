@@ -251,7 +251,7 @@ Scope per `roadmap.md`: multi-tenancy, fine-grained RBAC/audit export, report ge
 
 | Workstream | Key deliverables | Priority | Owner |
 |---|---|---|---|
-| Tenant isolation ADR + implementation | `security-architecture.md` §40 | P1 | Platform, Security |
+| ~~Tenant isolation ADR + implementation~~ **Done — ADR-0014 Accepted**; the "implementation" is the deployment boundary (Part 22 profiles), not application code | `security-architecture.md` §40, ADR-0014 | P1 | Platform, Security |
 | Audit log export | `GET /admin/audit-log` full implementation | P1 | Backend |
 | Report generation | Async job, PDF/document rendering, `packages/sdk` | P1 | Backend, Frontend |
 | Full HA/DR deployment | `deployment-architecture.md` Parts 13–14 exercised in a real environment | P0 | DevOps |
@@ -265,7 +265,7 @@ Scope per `roadmap.md`: multi-tenancy, fine-grained RBAC/audit export, report ge
 | A real DR-site failover drill completed (XL-tier profiles) | `deployment-architecture.md` Part 14 |
 | Every Part 24 checklist in `deployment-architecture.md` passing | `deployment-architecture.md` Part 24 |
 | Every Part 53 checklist item in `security-architecture.md` passing | `security-architecture.md` §53 |
-| Tenant isolation ADR recorded, whichever way it resolves | `security-architecture.md` §40, Part 29 |
+| ✅ Tenant isolation ADR recorded, whichever way it resolves — **ADR-0014 Accepted 2026-09-29: physical isolation, no shared tier** | `security-architecture.md` §40, Part 29 |
 | `packages/sdk` published with documentation | `frontend-architecture.md` §21, Part 24 |
 | Service extraction readiness review | Confirm whether Phase 5 (`roadmap.md`) is actually triggered yet — not assumed | P2 | Platform |
 
@@ -961,7 +961,7 @@ Case creation, manual evidence entry (schema-driven), evidence linking, relation
 | §24–26 (Upload, malware scanning, object storage security) | 1 |
 | §27–37 (Injection prevention, headers, CSP, browser security) | 1–2 |
 | §38–39 (Classification, legal hold) | 1 |
-| §40 (Tenant isolation) | 4, conditional |
+| §40 (Tenant isolation) | **Decided — ADR-0014**; no build item, isolation is the deployment boundary |
 | §41 (Air-gapped deployment security) | 2+, only if targeted |
 | §42–47 (Supply chain, CI/CD, secret rotation) | 1 |
 | §48–49 (Incident response, monitoring) | 1 (structure), ongoing (maturity) |
@@ -1082,7 +1082,7 @@ Seeded with every deliberate deferral already named across the architecture seri
 | Item | Introduced by | Impact | Planned resolution |
 |---|---|---|---|
 | In-process event bus (no durable broker) | `event-driven-architecture.md` §2 (Phase 1 choice) | No cross-process event durability yet | Phase 3+/5, Redpanda (`deployment-architecture.md` Part 9) |
-| Single-tenant only | `architecture.md`, `security-architecture.md` §40 | No SaaS/shared-infra offering | Phase 4 ADR, evaluated not assumed |
+| Single-tenant only | `architecture.md`, `security-architecture.md` §40 | No SaaS/shared-infra offering | **Resolved — ADR-0014 Accepted**: evaluated, and adopted deliberately. Now a permanent scope boundary, not a deferral |
 | No field-level encryption beyond table/volume-level | `security-architecture.md` §15 | Reduced defense-in-depth for the most sensitive field subset | Phase 4+ candidate |
 | No digital signatures on evidence hashes | `security-architecture.md` §20 | Weaker non-repudiation than the maximum available | Open — key-custody model undecided (Part 29) |
 | No service mesh | `deployment-architecture.md` §6 | No automatic mTLS between (currently nonexistent) inter-service calls | Phase 5, only if extraction actually happens |
@@ -1122,12 +1122,12 @@ The consolidated list of every "should be recorded as an ADR" flag raised across
 | Deployment tooling (K8s stack) | `system-design.md` §9 | **Resolved** by `deployment-architecture.md` — formal ADR write-up still pending | — |
 | AI model strategy (hosted vs. self-hosted) | `architecture.md`, `security-architecture.md` §52 | **Open** | Part 19 entirely, Phase 3 |
 | Secrets manager / KMS-HSM product | `security-architecture.md` §12–13, §51 | **Resolved** (Vault) by `deployment-architecture.md` — formal ADR write-up still pending | — |
-| Tenant isolation model | `security-architecture.md` §40, §51 | **Open** | Phase 4 (Part 8) |
+| Tenant isolation model | `security-architecture.md` §40, §51 | **Accepted** — ADR-0014 (2026-09-29): physical isolation per agency, no shared tier | — |
 | Digital signature key custody model | `security-architecture.md` §20, §51 | **Open** | Optional — no current blocker |
 | Object Lock/WORM specific adoption | `security-architecture.md` §26, §51 | **Resolved** direction (S3 Object Lock/equivalent) by `deployment-architecture.md`'s storage architecture — final product confirmation pending | — |
 | Monorepo build/test orchestration across polyglot services | `architecture.md` Open Questions | **Superseded** — single-language (Python+TS) stack decided, orchestration now a straightforward CI concern, not a cross-language one | — |
 | Release/versioning strategy per service | `architecture.md` Open Questions | **Open**, low urgency pre-extraction | Phase 5 only |
-| Multi-tenancy model, if ever adopted (logical vs. physical) | `security-architecture.md` §40 | **Open**, recommendation stated (physical/dedicated by default) but not formally decided | Phase 4 (Part 8) |
+| Multi-tenancy model, if ever adopted (logical vs. physical) | `security-architecture.md` §40 | **Accepted** — ADR-0014 formally decided physical/dedicated; logical isolation rejected, and reopening it needs a superseding ADR | — |
 | Background job framework (arq) | `backend-implementation-guide.md` Part 12 | **Resolved** — formal ADR write-up still pending | — |
 | Container registry, image signing product (Harbor, cosign) | `deployment-architecture.md` Part 5 | **Resolved** — formal ADR write-up still pending | — |
 | GitOps controller (ArgoCD) | `deployment-architecture.md` Part 18 | **Resolved** — formal ADR write-up still pending | — |
